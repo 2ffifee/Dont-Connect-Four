@@ -17,4 +17,20 @@ src/connect4_mcts/   kod projektu
 tests/               testy automatyczne
 ```
 
-Folder `docs/` jest ignorowany przez git i przechowuje lokalne materialy projektowe.
+
+## Przygotowanie srodowiska
+
+Windows PowerShell:
+
+```powershell
+.\scripts\setup.ps1
+```
+
+Linux/macOS:
+
+```bash
+chmod +x scripts/setup.sh
+./scripts/setup.sh
+```
+
+Skrypty tworza lokalne srodowisko `.venv`, aktualizuja `pip` i instaluja projekt z zaleznosciami developerskimi.
