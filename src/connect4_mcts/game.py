@@ -30,6 +30,10 @@ class GameStatus(Enum):
     FINISHED = "finished"
 
 
+class IllegalMoveError(ValueError):
+    """Raised when a move cannot be applied to the current board."""
+
+
 @dataclass(frozen=True, slots=True)
 class Move:
     move_type: MoveType
@@ -59,6 +63,42 @@ class GameState:
     def new(cls, first_player: Player = Player.RED) -> "GameState":
         return cls(board=empty_board(), current_player=first_player)
 
+    def is_column_full(self, column: int) -> bool:
+        self._validate_column(column)
+        return self.board[0][column] is not None
+
+    def legal_moves(self) -> tuple[Move, ...]:
+        if self.status is GameStatus.FINISHED:
+            return ()
+
+        moves: list[Move] = []
+        for column in range(COLUMNS):
+            if not self.is_column_full(column):
+                moves.append(Move(MoveType.DROP, column))
+                moves.append(Move(MoveType.PUSH, column))
+        return tuple(moves)
+
+    def is_legal_move(self, move: Move) -> bool:
+        return move in self.legal_moves()
+
+    def apply_move(self, move: Move) -> "GameState":
+        if not self.is_legal_move(move):
+            raise IllegalMoveError(f"illegal move: {move.move_type.value} in column {move.column}")
+
+        if move.move_type is MoveType.DROP:
+            next_board = self._apply_drop(move.column)
+        elif move.move_type is MoveType.PUSH:
+            next_board = self._apply_push(move.column)
+        else:
+            raise IllegalMoveError(f"unsupported move type: {move.move_type}")
+
+        return GameState(
+            board=next_board,
+            current_player=self.current_player.opponent,
+            status=self.status,
+            move_count=self.move_count + 1,
+        )
+
     def __post_init__(self) -> None:
         if len(self.board) != ROWS:
             raise ValueError(f"board must have {ROWS} rows")
@@ -79,3 +119,32 @@ class GameState:
 
         if not isinstance(self.status, GameStatus):
             raise ValueError("status must be a GameStatus")
+
+    def _apply_drop(self, column: int) -> Board:
+        rows = [list(row) for row in self.board]
+
+        for row_index in range(ROWS - 1, -1, -1):
+            if rows[row_index][column] is None:
+                rows[row_index][column] = self.current_player
+                return _freeze_board(rows)
+
+        raise IllegalMoveError(f"column {column} is full")
+
+    def _apply_push(self, column: int) -> Board:
+        rows = [list(row) for row in self.board]
+
+        # A push inserts a token from the bottom, moving existing tokens upward.
+        for row_index in range(ROWS - 1):
+            rows[row_index][column] = rows[row_index + 1][column]
+        rows[ROWS - 1][column] = self.current_player
+
+        return _freeze_board(rows)
+
+    @staticmethod
+    def _validate_column(column: int) -> None:
+        if not 0 <= column < COLUMNS:
+            raise ValueError(f"column must be between 0 and {COLUMNS - 1}")
+
+
+def _freeze_board(rows: list[list[Cell]]) -> Board:
+    return tuple(tuple(row) for row in rows)
