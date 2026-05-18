@@ -81,6 +81,22 @@ class GameState:
     def is_legal_move(self, move: Move) -> bool:
         return move in self.legal_moves()
 
+    def count_lines(self, player: Player) -> int:
+        if not isinstance(player, Player):
+            raise ValueError("player must be a Player")
+
+        count = 0
+        for row in range(ROWS):
+            for column in range(COLUMNS):
+                count += self._count_lines_from_cell(player, row, column)
+        return count
+
+    def line_counts(self) -> dict[Player, int]:
+        return {
+            Player.RED: self.count_lines(Player.RED),
+            Player.YELLOW: self.count_lines(Player.YELLOW),
+        }
+
     def apply_move(self, move: Move) -> "GameState":
         if not self.is_legal_move(move):
             raise IllegalMoveError(f"illegal move: {move.move_type.value} in column {move.column}")
@@ -144,6 +160,18 @@ class GameState:
     def _validate_column(column: int) -> None:
         if not 0 <= column < COLUMNS:
             raise ValueError(f"column must be between 0 and {COLUMNS - 1}")
+
+    def _count_lines_from_cell(self, player: Player, row: int, column: int) -> int:
+        directions = ((0, 1), (1, 0), (1, 1), (1, -1))
+        return sum(1 for row_step, column_step in directions if self._has_line(player, row, column, row_step, column_step))
+
+    def _has_line(self, player: Player, row: int, column: int, row_step: int, column_step: int) -> bool:
+        end_row = row + row_step * 3
+        end_column = column + column_step * 3
+        if not (0 <= end_row < ROWS and 0 <= end_column < COLUMNS):
+            return False
+
+        return all(self.board[row + row_step * offset][column + column_step * offset] is player for offset in range(4))
 
 
 def _freeze_board(rows: list[list[Cell]]) -> Board:

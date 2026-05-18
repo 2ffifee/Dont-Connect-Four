@@ -119,3 +119,101 @@ def test_finished_game_has_no_legal_moves() -> None:
     state = GameState(board=empty_board(), status=GameStatus.FINISHED)
 
     assert state.legal_moves() == ()
+
+
+def test_count_lines_returns_zero_on_empty_board() -> None:
+    state = GameState.new()
+
+    assert state.count_lines(Player.RED) == 0
+    assert state.count_lines(Player.YELLOW) == 0
+    assert state.line_counts() == {Player.RED: 0, Player.YELLOW: 0}
+
+
+def test_count_lines_detects_horizontal_line() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "RRRR....",
+    )
+
+    assert GameState(board=board).count_lines(Player.RED) == 1
+
+
+def test_count_lines_detects_vertical_line() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        "Y.......",
+        "Y.......",
+        "Y.......",
+        "Y.......",
+    )
+
+    assert GameState(board=board).count_lines(Player.YELLOW) == 1
+
+
+def test_count_lines_detects_diagonal_down_right_line() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        ".R......",
+        "..R.....",
+        "...R....",
+        "....R...",
+    )
+
+    assert GameState(board=board).count_lines(Player.RED) == 1
+
+
+def test_count_lines_detects_diagonal_down_left_line() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        "....Y...",
+        "...Y....",
+        "..Y.....",
+        ".Y......",
+    )
+
+    assert GameState(board=board).count_lines(Player.YELLOW) == 1
+
+
+def test_count_lines_counts_overlapping_lines() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "RRRRR...",
+    )
+
+    assert GameState(board=board).count_lines(Player.RED) == 2
+
+
+def test_line_counts_include_both_players() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        "Y.......",
+        "Y.......",
+        "Y.......",
+        "YRRRR...",
+    )
+
+    assert GameState(board=board).line_counts() == {
+        Player.RED: 1,
+        Player.YELLOW: 1,
+    }
+
+
+def board_from_rows(*rows: str):
+    player_by_symbol = {
+        ".": None,
+        "R": Player.RED,
+        "Y": Player.YELLOW,
+    }
+    return tuple(tuple(player_by_symbol[symbol] for symbol in row) for row in rows)
