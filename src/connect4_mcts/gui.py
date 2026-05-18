@@ -60,7 +60,7 @@ class BoardLayout:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Play modified Connect4 against a random agent.")
+    parser = argparse.ArgumentParser(description="Play Don't Connect 4 against a random agent.")
     parser.add_argument("--seed", type=int, default=None, help="Seed for the random player.")
     parser.add_argument("--human", choices=("red", "yellow"), default="red", help="Human player color.")
     args = parser.parse_args(argv)
@@ -73,7 +73,7 @@ class HumanVsRandomGui:
     def __init__(self, human: Player = Player.RED, seed: int | None = None) -> None:
         pygame.init()
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Modified Connect4")
+        pygame.display.set_caption("Don't Connect 4")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Segoe UI", 24)
         self.small_font = pygame.font.SysFont("Segoe UI", 18)
@@ -172,7 +172,7 @@ class HumanVsRandomGui:
         self._draw_footer()
 
     def _draw_header(self) -> None:
-        title = self.large_font.render("Modified Connect4", True, TEXT)
+        title = self.large_font.render("Don't Connect 4", True, TEXT)
         self.screen.blit(title, (BOARD_LEFT, 26))
 
         status = self.font.render(gui_status_message(self.state, self.human), True, TEXT)
