@@ -15,6 +15,7 @@ from connect4_mcts.game import (
     empty_board,
 )
 from connect4_mcts.players import Agent, MoveSelectionError, RandomPlayer
+from connect4_mcts.runner import GameRunnerError, MoveRecord, PlayedGame, play_game
 
 __all__ = [
     "Agent",
@@ -23,13 +24,17 @@ __all__ = [
     "Cell",
     "GameState",
     "GameResult",
+    "GameRunnerError",
     "GameStatus",
     "IllegalMoveError",
     "Move",
     "MoveSelectionError",
+    "MoveRecord",
     "MoveType",
     "Player",
     "ROWS",
     "RandomPlayer",
+    "PlayedGame",
     "empty_board",
+    "play_game",
 ]
