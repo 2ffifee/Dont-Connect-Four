@@ -1,0 +1,10 @@
+[project]
+name = "connect4-mcts"
+version = "0.1.0"
+description = "MCTS/UCT agents for a modified Connect4 game."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
