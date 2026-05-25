@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from connect4_mcts.game import COLUMNS, ROWS, GameState, Player
+from connect4_mcts.game import COLUMNS, ROWS, GameState, GameStatus, Player
 
 
 TERMINAL_SCORE = 1_000_000
@@ -21,8 +21,22 @@ def evaluate_position(state: GameState, player: Player) -> int:
     if state.result is not None:
         return _terminal_score(state, player)
 
+    if state.status is GameStatus.FAIR_TURN:
+        return _fair_turn_score(state, player)
+
     opponent = player.opponent
     return _potential_line_score(state, opponent) - _potential_line_score(state, player)
+
+
+def _fair_turn_score(state: GameState, player: Player) -> int:
+    legal_moves = state.legal_moves()
+    if not legal_moves:
+        return 0
+
+    scores = [evaluate_position(state.apply_move(move), player) for move in legal_moves]
+    if state.current_player is player:
+        return max(scores)
+    return min(scores)
 
 
 def _terminal_score(state: GameState, player: Player) -> int:

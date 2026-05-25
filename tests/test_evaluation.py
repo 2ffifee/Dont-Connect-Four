@@ -1,7 +1,7 @@
 import pytest
 
 from connect4_mcts.evaluation import evaluate_position
-from connect4_mcts.game import COLUMNS, ROWS, GameResult, GameState, GameStatus, Player
+from connect4_mcts.game import COLUMNS, ROWS, GameResult, GameState, GameStatus, Move, MoveType, Player
 
 
 def test_terminal_win_is_scored_positive_for_winner() -> None:
@@ -49,6 +49,28 @@ def test_terminal_score_uses_line_count_margin() -> None:
 
     assert evaluate_position(larger_win, Player.RED) > evaluate_position(narrow_win, Player.RED)
     assert evaluate_position(larger_win, Player.YELLOW) < evaluate_position(narrow_win, Player.YELLOW)
+
+
+def test_fair_turn_score_resolves_required_response() -> None:
+    state = GameState(
+        board=board_from_rows(
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+            "RRR.YYY.",
+        ),
+        current_player=Player.RED,
+        first_player=Player.RED,
+    )
+
+    fair_turn = state.apply_move(Move(MoveType.DROP, 3))
+
+    assert fair_turn.status is GameStatus.FAIR_TURN
+    assert fair_turn.result is None
+    assert evaluate_position(fair_turn, Player.RED) < 0
+    assert evaluate_position(fair_turn, Player.YELLOW) > 0
 
 
 def test_own_three_token_window_is_worse_than_empty_position() -> None:
