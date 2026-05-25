@@ -11,9 +11,8 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import pygame
 
-from connect4_mcts.cli import AGENT_CHOICES, create_agent, format_agent_name
 from connect4_mcts.game import COLUMNS, ROWS, GameResult, GameState, GameStatus, IllegalMoveError, Move, MoveType, Player
-from connect4_mcts.players import Agent
+from connect4_mcts.players import AGENT_CHOICES, Agent, AgentName, create_agent, format_agent_name
 
 
 CELL_SIZE = 72
@@ -43,7 +42,6 @@ WHITE = (255, 255, 255)
 ERROR = (171, 39, 50)
 
 ScreenMode = str
-AgentName = str
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,11 +6,7 @@ import argparse
 from collections.abc import Sequence
 
 from connect4_mcts.game import COLUMNS, ROWS, GameResult, GameState, GameStatus, IllegalMoveError, Move, MoveType, Player
-from connect4_mcts.players import Agent, MinimaxPlayer, RandomPlayer
-
-
-AgentName = str
-AGENT_CHOICES = ("random", "minimax")
+from connect4_mcts.players import AGENT_CHOICES, Agent, AgentName, create_agent, format_agent_name
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -90,22 +86,6 @@ def run_demo(
     print(render_board(state))
     print(result_message(state.result))
     return state
-
-
-def create_agent(agent_name: AgentName, seed: int | None = None, depth: int = 3) -> Agent:
-    if agent_name == "random":
-        return RandomPlayer(seed=seed)
-    if agent_name == "minimax":
-        return MinimaxPlayer(depth=depth)
-    raise ValueError(f"unknown agent: {agent_name}")
-
-
-def format_agent_name(agent_name: AgentName) -> str:
-    if agent_name == "random":
-        return "Random"
-    if agent_name == "minimax":
-        return "Minimax"
-    return agent_name
 
 
 def prompt_for_move(state: GameState) -> Move:
