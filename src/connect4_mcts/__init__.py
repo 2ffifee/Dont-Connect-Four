@@ -14,7 +14,7 @@ from connect4_mcts.game import (
     Player,
     empty_board,
 )
-from connect4_mcts.players import Agent, MoveSelectionError, RandomPlayer
+from connect4_mcts.players import Agent, MinimaxPlayer, MoveSelectionError, RandomPlayer
 from connect4_mcts.runner import GameRunnerError, MoveRecord, PlayedGame, play_game
 
 __all__ = [
@@ -27,6 +27,7 @@ __all__ = [
     "GameRunnerError",
     "GameStatus",
     "IllegalMoveError",
+    "MinimaxPlayer",
     "Move",
     "MoveSelectionError",
     "MoveRecord",

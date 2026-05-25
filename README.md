@@ -68,22 +68,41 @@ python -m pytest
 
 ## Uruchamianie CLI
 
+Dostepni gracze:
+
+- `random` - wybiera losowy legalny ruch,
+- `minimax` - uzywa heurystyki pozycyjnej oraz minimax z alpha-beta pruning.
+
+Parametr `--depth` steruje glebokoscia przeszukiwania minimaxa. Wieksza wartosc zwykle oznacza silniejsza gre, ale istotnie zwieksza czas decyzji. Na start praktyczne sa wartosci `2` lub `3`.
+
 Gra czlowiek kontra losowy agent:
 
 ```bash
 python -m connect4_mcts.cli --seed 1
 ```
 
-Gra jako zolty, czyli random zaczyna jako czerwony:
+Gra czlowiek kontra minimax:
 
 ```bash
-python -m connect4_mcts.cli --human yellow --seed 1
+python -m connect4_mcts.cli --agent minimax --depth 3
+```
+
+Gra jako zolty, czyli agent zaczyna jako czerwony:
+
+```bash
+python -m connect4_mcts.cli --human yellow --agent minimax --depth 3 --seed 1
 ```
 
 Demo random kontra random:
 
 ```bash
 python -m connect4_mcts.cli --demo --seed 1
+```
+
+Demo minimax kontra random:
+
+```bash
+python -m connect4_mcts.cli --demo --red minimax --yellow random --depth 3 --seed 1
 ```
 
 Sterowanie w CLI:
@@ -95,22 +114,53 @@ Sterowanie w CLI:
 
 ## Uruchamianie GUI
 
-Gra czlowiek kontra losowy agent:
+GUI uruchamia ekran wyboru ustawien. W aplikacji mozna wybrac:
+
+- kolor czlowieka: `Red` albo `Yellow`,
+- przeciwnika: `Random` albo `Minimax`,
+- glebokosc minimaxa.
+
+Start z domyslnymi ustawieniami:
 
 ```bash
-python -m connect4_mcts.gui --seed 1
+python -m connect4_mcts.gui
 ```
 
-Gra jako zolty:
+Start z wybranym przeciwnikiem i kolorem:
 
 ```bash
-python -m connect4_mcts.gui --human yellow --seed 1
+python -m connect4_mcts.gui --agent minimax --human yellow --depth 3 --seed 1
 ```
 
 Sterowanie w GUI:
 
 - klikniecie kolumny wykonuje ruch,
 - przyciski `Drop` i `Push` wybieraja typ ruchu,
+- `Menu` wraca do wyboru przeciwnika i koloru,
 - `Space` przelacza `drop/push`,
 - `R` resetuje partie,
 - `Esc` zamyka okno.
+
+## Symulacje wielu gier
+
+Modul eksperymentow pozwala uruchamiac serie gier agent-agent i szybko porownac wyniki:
+
+```bash
+python -m connect4_mcts.experiments --red minimax --yellow random --games 100 --depth 3 --seed 1 --swap-sides
+```
+
+Najwazniejsze opcje:
+
+- `--red random|minimax` - agent grajacy jako czerwony w pierwszej grze,
+- `--yellow random|minimax` - agent grajacy jako zolty w pierwszej grze,
+- `--games N` - liczba partii,
+- `--seed N` - bazowe ziarno losowosci,
+- `--depth N` - glebokosc minimaxa,
+- `--swap-sides` - zamienia strony co druga partie; przy parzystej liczbie gier kazdy agent gra tyle samo razy jako czerwony i zolty.
+
+Wynik zawiera:
+
+- liczbe zwyciestw i win rate kazdego agenta,
+- liczbe remisow i draw rate,
+- srednia liczbe ruchow na partie,
+- sredni czas decyzji kazdego agenta.

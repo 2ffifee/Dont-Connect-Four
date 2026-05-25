@@ -1,4 +1,4 @@
-"""Simple command line interface for playing against a random agent."""
+"""Simple command line interface for playing against an agent."""
 
 from __future__ import annotations
 
@@ -6,26 +6,39 @@ import argparse
 from collections.abc import Sequence
 
 from connect4_mcts.game import COLUMNS, ROWS, GameResult, GameState, GameStatus, IllegalMoveError, Move, MoveType, Player
-from connect4_mcts.players import RandomPlayer
+from connect4_mcts.players import AGENT_CHOICES, Agent, AgentName, create_agent, format_agent_name
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Play modified Connect4 in the terminal.")
     parser.add_argument("--seed", type=int, default=None, help="Seed for the random player.")
     parser.add_argument("--human", choices=("red", "yellow"), default="red", help="Human player color.")
-    parser.add_argument("--demo", action="store_true", help="Run a random-vs-random demo instead of interactive play.")
+    parser.add_argument("--agent", choices=AGENT_CHOICES, default="random", help="Agent for interactive play.")
+    parser.add_argument("--depth", type=int, default=3, help="Search depth for minimax.")
+    parser.add_argument("--demo", action="store_true", help="Run an agent-vs-agent demo instead of interactive play.")
+    parser.add_argument("--red", choices=AGENT_CHOICES, default="random", help="Red agent for demo mode.")
+    parser.add_argument("--yellow", choices=AGENT_CHOICES, default="random", help="Yellow agent for demo mode.")
     args = parser.parse_args(argv)
 
     if args.demo:
-        run_random_demo(seed=args.seed)
+        run_demo(red_agent=args.red, yellow_agent=args.yellow, seed=args.seed, depth=args.depth)
     else:
-        run_human_vs_random(human=Player(args.human), seed=args.seed)
+        run_human_vs_agent(human=Player(args.human), agent_name=args.agent, seed=args.seed, depth=args.depth)
     return 0
 
 
 def run_human_vs_random(human: Player = Player.RED, seed: int | None = None) -> GameState:
+    return run_human_vs_agent(human=human, agent_name="random", seed=seed)
+
+
+def run_human_vs_agent(
+    human: Player = Player.RED,
+    agent_name: AgentName = "random",
+    seed: int | None = None,
+    depth: int = 3,
+) -> GameState:
     state = GameState.new(first_player=Player.RED)
-    random_player = RandomPlayer(seed=seed)
+    agent = create_agent(agent_name, seed=seed, depth=depth)
 
     print("Commands: d <column> for drop, p <column> for push, q to quit.")
     print("Columns are numbered from 1 to 8.")
@@ -38,8 +51,8 @@ def run_human_vs_random(human: Player = Player.RED, seed: int | None = None) -> 
         if state.current_player is human:
             move = prompt_for_move(state)
         else:
-            move = random_player.choose_move(state)
-            print(f"Random plays: {format_move(move)}")
+            move = agent.choose_move(state)
+            print(f"{format_agent_name(agent_name)} plays: {format_move(move)}")
 
         state = state.apply_move(move)
 
@@ -50,9 +63,18 @@ def run_human_vs_random(human: Player = Player.RED, seed: int | None = None) -> 
 
 
 def run_random_demo(seed: int | None = None) -> GameState:
+    return run_demo(red_agent="random", yellow_agent="random", seed=seed)
+
+
+def run_demo(
+    red_agent: AgentName = "random",
+    yellow_agent: AgentName = "random",
+    seed: int | None = None,
+    depth: int = 3,
+) -> GameState:
     state = GameState.new(first_player=Player.RED)
-    red = RandomPlayer(seed=seed)
-    yellow = RandomPlayer(seed=None if seed is None else seed + 1)
+    red = create_agent(red_agent, seed=seed, depth=depth)
+    yellow = create_agent(yellow_agent, seed=None if seed is None else seed + 1, depth=depth)
 
     while state.status is not GameStatus.FINISHED:
         player = red if state.current_player is Player.RED else yellow
