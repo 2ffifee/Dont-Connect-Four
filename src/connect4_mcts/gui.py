@@ -18,14 +18,20 @@ from connect4_mcts.players import AGENT_CHOICES, Agent, AgentName, create_agent,
 CELL_SIZE = 72
 BOARD_WIDTH = COLUMNS * CELL_SIZE
 BOARD_HEIGHT = ROWS * CELL_SIZE
-WINDOW_WIDTH = 760
-WINDOW_HEIGHT = 680
+WINDOW_WIDTH = 960
+WINDOW_HEIGHT = 760
 BOARD_LEFT = (WINDOW_WIDTH - BOARD_WIDTH) // 2
 BOARD_TOP = 118
+MARGIN = 24
+TOP_BAR_HEIGHT = 104
+FOOTER_RESERVE = 76
+MIN_CELL_SIZE = 28
 BUTTON_WIDTH = 96
 BUTTON_HEIGHT = 38
+BUTTON_GAP = 8
 SETUP_BUTTON_WIDTH = 132
 SETUP_BUTTON_HEIGHT = 42
+SETUP_BUTTON_GAP = 16
 
 BACKGROUND = (245, 247, 250)
 BOARD_COLOR = (30, 91, 168)
@@ -69,6 +75,9 @@ class GuiConfig:
     agent_name: AgentName = "random"
     seed: int | None = None
     depth: int = 3
+    two_player: bool = False
+    loaded_agent: Agent | None = None
+    loaded_label: str | None = None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -77,11 +86,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--human", choices=("red", "yellow"), default="red", help="Human player color.")
     parser.add_argument("--agent", choices=AGENT_CHOICES, default="random", help="Initial opponent selection.")
     parser.add_argument("--depth", type=int, default=3, help="Search depth for minimax.")
+    parser.add_argument("--two-player", action="store_true", help="Start in local two-player mode.")
+    parser.add_argument("--load", default=None, help="Path to a pickled trained player to use as opponent.")
     args = parser.parse_args(argv)
 
-    HumanVsAgentGui(
-        config=GuiConfig(human=Player(args.human), agent_name=args.agent, seed=args.seed, depth=args.depth)
-    ).run()
+    config = GuiConfig(
+        human=Player(args.human),
+        agent_name=args.agent,
+        seed=args.seed,
+        depth=args.depth,
+        two_player=args.two_player,
+    )
+    if args.load:
+        from connect4_mcts.training import load_player
+
+        config.loaded_agent = load_player(args.load)
+        config.loaded_label = os.path.basename(args.load)
+        config.agent_name = "loaded"
+
+    HumanVsAgentGui(config=config).run()
     return 0
 
 
@@ -96,19 +119,21 @@ class HumanVsRandomGui:
 class HumanVsAgentGui:
     def __init__(self, config: GuiConfig | None = None) -> None:
         pygame.init()
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        self.width = WINDOW_WIDTH
+        self.height = WINDOW_HEIGHT
+        self.screen = pygame.display.set_mode((self.width, self.height), pygame.RESIZABLE)
         pygame.display.set_caption("Don't Connect 4")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Segoe UI", 24)
         self.small_font = pygame.font.SysFont("Segoe UI", 18)
         self.large_font = pygame.font.SysFont("Segoe UI", 30, bold=True)
-        self.layout = BoardLayout()
         self.config = config or GuiConfig()
         self.mode: ScreenMode = "setup"
         self.state = GameState.new(first_player=Player.RED)
-        self.agent: Agent = create_agent(self.config.agent_name, seed=self.config.seed, depth=self.config.depth)
+        self.agent: Agent = self._make_agent()
         self.selected_move_type = MoveType.DROP
         self.message = ""
+        self.layout = self._compute_board_layout()
 
     def run(self) -> None:
         running = True
@@ -116,6 +141,8 @@ class HumanVsAgentGui:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    self._handle_resize(event.w, event.h)
                 elif event.type == pygame.KEYDOWN:
                     self._handle_key(event.key)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -126,6 +153,18 @@ class HumanVsAgentGui:
             self.clock.tick(60)
 
         pygame.quit()
+
+    def _handle_resize(self, width: int, height: int) -> None:
+        # SDL2/pygame 2 resizes the display surface automatically. Calling
+        # set_mode() here would re-request the size every event and fight the
+        # window manager (notably on Wayland/Hyprland), so we only refresh our
+        # cached surface and recompute the layout.
+        self.width = max(1, width)
+        self.height = max(1, height)
+        surface = pygame.display.get_surface()
+        if surface is not None:
+            self.screen = surface
+        self.layout = self._compute_board_layout()
 
     def _handle_key(self, key: int) -> None:
         if key == pygame.K_ESCAPE:
@@ -159,7 +198,7 @@ class HumanVsAgentGui:
 
         if self.state.status is GameStatus.FINISHED:
             return
-        if self.state.current_player is not self.config.human:
+        if not self.config.two_player and self.state.current_player is not self.config.human:
             return
 
         column = column_from_position(position, self.layout)
@@ -174,6 +213,9 @@ class HumanVsAgentGui:
     def _apply_human_move(self, move: Move) -> None:
         self.state = self.state.apply_move(move)
         self.message = ""
+
+        if self.config.two_player:
+            return
 
         if self.state.status is not GameStatus.FINISHED and self.state.current_player is not self.config.human:
             self._refresh_display()
@@ -196,37 +238,81 @@ class HumanVsAgentGui:
 
     def _start_game(self) -> None:
         self.state = GameState.new(first_player=Player.RED)
-        self.agent = create_agent(self.config.agent_name, seed=self.config.seed, depth=self.config.depth)
+        self.agent = self._make_agent()
         self.selected_move_type = MoveType.DROP
         self.mode = "game"
         self.message = ""
-        if self.state.current_player is not self.config.human:
+        self.layout = self._compute_board_layout()
+        if not self.config.two_player and self.state.current_player is not self.config.human:
             self._play_agent_turn()
 
+    def _make_agent(self) -> Agent:
+        if self.config.agent_name == "loaded" and self.config.loaded_agent is not None:
+            return self.config.loaded_agent
+        return create_agent(self.config.agent_name, seed=self.config.seed, depth=self.config.depth)
+
+    def _load_player_from_file(self) -> None:
+        path = _prompt_player_file()
+        if not path:
+            self.message = "Load cancelled (or no file dialog)"
+            return
+
+        from connect4_mcts.training import load_player
+
+        try:
+            agent = load_player(path)
+        except Exception:  # noqa: BLE001 - surface any load failure to the user
+            self.message = "Failed to load player"
+            return
+
+        self.config.loaded_agent = agent
+        self.config.loaded_label = os.path.basename(path)
+        self.config.agent_name = "loaded"
+        self.message = ""
+
     def _handle_setup_click(self, position: tuple[int, int]) -> None:
-        if self._human_red_button_rect().collidepoint(position):
+        rects = self._setup_rects()
+        if rects["mode_single"].collidepoint(position):
+            self.config.two_player = False
+            return
+        if rects["mode_multiplayer"].collidepoint(position):
+            self.config.two_player = True
+            return
+        if rects["human_red"].collidepoint(position):
             self.config.human = Player.RED
             return
-        if self._human_yellow_button_rect().collidepoint(position):
+        if rects["human_yellow"].collidepoint(position):
             self.config.human = Player.YELLOW
             return
-        if self._agent_random_button_rect().collidepoint(position):
+        if rects["agent_random"].collidepoint(position):
             self.config.agent_name = "random"
             return
-        if self._agent_minimax_button_rect().collidepoint(position):
+        if rects["agent_minimax"].collidepoint(position):
             self.config.agent_name = "minimax"
             return
-        if self._depth_minus_button_rect().collidepoint(position):
+        if rects["load"].collidepoint(position):
+            self._load_player_from_file()
+            return
+        if rects["depth_minus"].collidepoint(position):
             self.config.depth = max(1, self.config.depth - 1)
             return
-        if self._depth_plus_button_rect().collidepoint(position):
+        if rects["depth_plus"].collidepoint(position):
             self.config.depth += 1
             return
-        if self._start_button_rect().collidepoint(position):
+        if rects["start"].collidepoint(position):
             self._start_game()
 
     def _toggle_move_type(self) -> None:
         self.selected_move_type = MoveType.PUSH if self.selected_move_type is MoveType.DROP else MoveType.DROP
+
+    def _compute_board_layout(self) -> BoardLayout:
+        available_width = self.width - 2 * MARGIN
+        available_height = self.height - TOP_BAR_HEIGHT - FOOTER_RESERVE
+        cell_size = min(available_width // COLUMNS, available_height // ROWS)
+        cell_size = max(MIN_CELL_SIZE, cell_size)
+        board_width = cell_size * COLUMNS
+        left = (self.width - board_width) // 2
+        return BoardLayout(left=left, top=TOP_BAR_HEIGHT, cell_size=cell_size)
 
     def _draw(self) -> None:
         self.screen.fill(BACKGROUND)
@@ -241,10 +327,14 @@ class HumanVsAgentGui:
 
     def _draw_header(self) -> None:
         title = self.large_font.render("Don't Connect 4", True, TEXT)
-        self.screen.blit(title, (BOARD_LEFT, 26))
+        self.screen.blit(title, (MARGIN, 22))
 
-        status = self.font.render(gui_status_message(self.state, self.config.human, self.config.agent_name), True, TEXT)
-        self.screen.blit(status, (BOARD_LEFT, 66))
+        status = self.font.render(
+            gui_status_message(self.state, self.config.human, self.config.agent_name, self.config.two_player),
+            True,
+            TEXT,
+        )
+        self.screen.blit(status, (MARGIN, 62))
 
     def _draw_controls(self) -> None:
         self._draw_button(self._drop_button_rect(), "Drop", self.selected_move_type is MoveType.DROP)
@@ -253,31 +343,41 @@ class HumanVsAgentGui:
         self._draw_button(self._menu_button_rect(), "Menu", False)
 
     def _draw_setup(self) -> None:
+        rects = self._setup_rects()
+        center_x = self.width // 2
+
         title = self.large_font.render("Don't Connect 4", True, TEXT)
-        self.screen.blit(title, (BOARD_LEFT, 58))
+        self.screen.blit(title, title.get_rect(center=(center_x, rects["title_y"])))
 
         subtitle = self.font.render("Choose game setup", True, MUTED_TEXT)
-        self.screen.blit(subtitle, (BOARD_LEFT, 96))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(center_x, rects["subtitle_y"])))
 
-        self._draw_setup_label("Your color", 168)
-        self._draw_button(self._human_red_button_rect(), "Red", self.config.human is Player.RED)
-        self._draw_button(self._human_yellow_button_rect(), "Yellow", self.config.human is Player.YELLOW)
+        self._draw_setup_label("Mode", rects["mode_label_y"], center_x)
+        self._draw_button(rects["mode_single"], "Single", not self.config.two_player)
+        self._draw_button(rects["mode_multiplayer"], "2 Players", self.config.two_player)
 
-        self._draw_setup_label("Opponent", 256)
-        self._draw_button(self._agent_random_button_rect(), "Random", self.config.agent_name == "random")
-        self._draw_button(self._agent_minimax_button_rect(), "Minimax", self.config.agent_name == "minimax")
+        self._draw_setup_label("Your color", rects["color_label_y"], center_x)
+        self._draw_button(rects["human_red"], "Red", self.config.human is Player.RED)
+        self._draw_button(rects["human_yellow"], "Yellow", self.config.human is Player.YELLOW)
 
-        self._draw_setup_label("Minimax depth", 344)
-        self._draw_button(self._depth_minus_button_rect(), "-", False)
+        self._draw_setup_label("Opponent", rects["opponent_label_y"], center_x)
+        self._draw_button(rects["agent_random"], "Random", self.config.agent_name == "random")
+        self._draw_button(rects["agent_minimax"], "Minimax", self.config.agent_name == "minimax")
+
+        load_label = _shorten(self.config.loaded_label) if self.config.loaded_label else "Load player..."
+        self._draw_button(rects["load"], load_label, self.config.agent_name == "loaded")
+
+        self._draw_setup_label("Minimax depth", rects["depth_label_y"], center_x)
+        self._draw_button(rects["depth_minus"], "-", False)
         depth = self.font.render(str(self.config.depth), True, TEXT)
-        self.screen.blit(depth, depth.get_rect(center=(BOARD_LEFT + 92, 424)))
-        self._draw_button(self._depth_plus_button_rect(), "+", False)
+        self.screen.blit(depth, depth.get_rect(center=rects["depth_value"].center))
+        self._draw_button(rects["depth_plus"], "+", False)
 
-        self._draw_button(self._start_button_rect(), "Start", True)
+        self._draw_button(rects["start"], "Start", True)
 
-    def _draw_setup_label(self, label: str, y: int) -> None:
+    def _draw_setup_label(self, label: str, y: int, center_x: int) -> None:
         surface = self.font.render(label, True, TEXT)
-        self.screen.blit(surface, (BOARD_LEFT, y))
+        self.screen.blit(surface, surface.get_rect(center=(center_x, y)))
 
     def _draw_button(self, rect: pygame.Rect, label: str, active: bool) -> None:
         fill = BUTTON_ACTIVE if active else BUTTON
@@ -292,18 +392,19 @@ class HumanVsAgentGui:
         pygame.draw.rect(self.screen, BOARD_EDGE, board_rect.inflate(12, 12), border_radius=8)
         pygame.draw.rect(self.screen, BOARD_COLOR, board_rect, border_radius=6)
 
+        radius = self.layout.cell_size // 2 - 8
         for row_index, row in enumerate(self.state.board):
             for column_index, cell in enumerate(row):
                 center = cell_center(row_index, column_index, self.layout)
-                pygame.draw.circle(self.screen, _cell_color(cell), center, CELL_SIZE // 2 - 8)
+                pygame.draw.circle(self.screen, _cell_color(cell), center, radius)
 
         for column in range(COLUMNS):
             label = self.small_font.render(str(column + 1), True, MUTED_TEXT)
             x = self.layout.left + column * self.layout.cell_size + self.layout.cell_size // 2
-            self.screen.blit(label, label.get_rect(center=(x, self.layout.top + self.layout.height + 24)))
+            self.screen.blit(label, label.get_rect(center=(x, self.layout.top + self.layout.height + 22)))
 
     def _draw_footer(self) -> None:
-        footer_y = self.layout.top + self.layout.height + 54
+        footer_y = self.layout.top + self.layout.height + 48
         if self.state.status is GameStatus.FINISHED:
             text = result_text(self.state.result)
             color = TEXT
@@ -315,40 +416,122 @@ class HumanVsAgentGui:
             color = MUTED_TEXT
 
         footer = self.small_font.render(text, True, color)
-        self.screen.blit(footer, (BOARD_LEFT, footer_y))
+        self.screen.blit(footer, footer.get_rect(center=(self.width // 2, footer_y)))
+
+    def _control_row(self) -> tuple[int, int]:
+        total_width = 4 * BUTTON_WIDTH + 3 * BUTTON_GAP
+        left = self.width - MARGIN - total_width
+        return left, 30
 
     def _drop_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(WINDOW_WIDTH - 330, 34, BUTTON_WIDTH, BUTTON_HEIGHT)
+        left, top = self._control_row()
+        return pygame.Rect(left, top, BUTTON_WIDTH, BUTTON_HEIGHT)
 
     def _push_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(WINDOW_WIDTH - 224, 34, BUTTON_WIDTH, BUTTON_HEIGHT)
+        left, top = self._control_row()
+        return pygame.Rect(left + (BUTTON_WIDTH + BUTTON_GAP), top, BUTTON_WIDTH, BUTTON_HEIGHT)
 
     def _reset_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(WINDOW_WIDTH - 118, 34, BUTTON_WIDTH, BUTTON_HEIGHT)
+        left, top = self._control_row()
+        return pygame.Rect(left + 2 * (BUTTON_WIDTH + BUTTON_GAP), top, BUTTON_WIDTH, BUTTON_HEIGHT)
 
     def _menu_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(WINDOW_WIDTH - 118, 80, BUTTON_WIDTH, BUTTON_HEIGHT)
+        left, top = self._control_row()
+        return pygame.Rect(left + 3 * (BUTTON_WIDTH + BUTTON_GAP), top, BUTTON_WIDTH, BUTTON_HEIGHT)
 
-    def _human_red_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(BOARD_LEFT, 204, SETUP_BUTTON_WIDTH, SETUP_BUTTON_HEIGHT)
+    def _setup_rects(self) -> dict[str, object]:
+        center_x = self.width // 2
+        pair_width = 2 * SETUP_BUTTON_WIDTH + SETUP_BUTTON_GAP
+        pair_left = center_x - pair_width // 2
+        pair_right_left = pair_left + SETUP_BUTTON_WIDTH + SETUP_BUTTON_GAP
 
-    def _human_yellow_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(BOARD_LEFT + 148, 204, SETUP_BUTTON_WIDTH, SETUP_BUTTON_HEIGHT)
+        block_height = 640
+        top = max(16, (self.height - block_height) // 2)
+        label_to_button = 28
+        row_gap = 22
 
-    def _agent_random_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(BOARD_LEFT, 292, SETUP_BUTTON_WIDTH, SETUP_BUTTON_HEIGHT)
+        def pair(top_y: int) -> tuple[pygame.Rect, pygame.Rect]:
+            left_rect = pygame.Rect(pair_left, top_y, SETUP_BUTTON_WIDTH, SETUP_BUTTON_HEIGHT)
+            right_rect = pygame.Rect(pair_right_left, top_y, SETUP_BUTTON_WIDTH, SETUP_BUTTON_HEIGHT)
+            return left_rect, right_rect
 
-    def _agent_minimax_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(BOARD_LEFT + 148, 292, SETUP_BUTTON_WIDTH, SETUP_BUTTON_HEIGHT)
+        title_y = top + 16
+        subtitle_y = top + 52
 
-    def _depth_minus_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(BOARD_LEFT, 400, 54, SETUP_BUTTON_HEIGHT)
+        cursor = top + 100
+        mode_label_y = cursor
+        mode_single, mode_multiplayer = pair(cursor + label_to_button)
+        cursor += label_to_button + SETUP_BUTTON_HEIGHT + row_gap
 
-    def _depth_plus_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(BOARD_LEFT + 130, 400, 54, SETUP_BUTTON_HEIGHT)
+        color_label_y = cursor
+        human_red, human_yellow = pair(cursor + label_to_button)
+        cursor += label_to_button + SETUP_BUTTON_HEIGHT + row_gap
 
-    def _start_button_rect(self) -> pygame.Rect:
-        return pygame.Rect(BOARD_LEFT, 500, 180, 50)
+        opponent_label_y = cursor
+        agent_random, agent_minimax = pair(cursor + label_to_button)
+        cursor += label_to_button + SETUP_BUTTON_HEIGHT + 10
+        load = pygame.Rect(pair_left, cursor, pair_width, SETUP_BUTTON_HEIGHT)
+        cursor += SETUP_BUTTON_HEIGHT + row_gap
+
+        depth_label_y = cursor
+        depth_top = cursor + label_to_button
+        depth_minus = pygame.Rect(center_x - 92, depth_top, 54, SETUP_BUTTON_HEIGHT)
+        depth_value = pygame.Rect(center_x - 27, depth_top, 54, SETUP_BUTTON_HEIGHT)
+        depth_plus = pygame.Rect(center_x + 38, depth_top, 54, SETUP_BUTTON_HEIGHT)
+        cursor = depth_top + SETUP_BUTTON_HEIGHT + row_gap
+
+        start = pygame.Rect(center_x - 90, cursor, 180, 50)
+
+        return {
+            "title_y": title_y,
+            "subtitle_y": subtitle_y,
+            "mode_label_y": mode_label_y,
+            "mode_single": mode_single,
+            "mode_multiplayer": mode_multiplayer,
+            "color_label_y": color_label_y,
+            "human_red": human_red,
+            "human_yellow": human_yellow,
+            "opponent_label_y": opponent_label_y,
+            "agent_random": agent_random,
+            "agent_minimax": agent_minimax,
+            "load": load,
+            "depth_label_y": depth_label_y,
+            "depth_minus": depth_minus,
+            "depth_value": depth_value,
+            "depth_plus": depth_plus,
+            "start": start,
+        }
+
+
+def _prompt_player_file() -> str | None:
+    """Open a native file dialog to pick a pickled player.
+
+    Uses tkinter (standard library). Returns ``None`` if the user cancels or no
+    dialog backend is available, in which case ``--load`` can be used instead.
+    """
+    try:
+        import tkinter
+        from tkinter import filedialog
+    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
+        return None
+
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(
+            title="Load trained player",
+            filetypes=[("Pickled player", "*.pkl"), ("All files", "*.*")],
+        )
+        root.destroy()
+        return path or None
+    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
+        return None
+
+
+def _shorten(text: str, max_length: int = 22) -> str:
+    if len(text) <= max_length:
+        return text
+    return "..." + text[-(max_length - 3):]
 
 
 def column_from_position(position: tuple[int, int], layout: BoardLayout) -> int | None:
@@ -365,11 +548,22 @@ def cell_center(row: int, column: int, layout: BoardLayout) -> tuple[int, int]:
     )
 
 
-def gui_status_message(state: GameState, human: Player, agent_name: AgentName = "random") -> str:
+def gui_status_message(
+    state: GameState,
+    human: Player,
+    agent_name: AgentName = "random",
+    two_player: bool = False,
+) -> str:
     if state.status is GameStatus.FINISHED:
         return "Game finished"
 
-    actor = "Your turn" if state.current_player is human else f"{format_agent_name(agent_name)} turn"
+    if two_player:
+        actor = f"{state.current_player.value.capitalize()} turn"
+    elif state.current_player is human:
+        actor = "Your turn"
+    else:
+        actor = f"{format_agent_name(agent_name)} turn"
+
     if state.status is GameStatus.FAIR_TURN:
         return f"{actor} - fair turn"
     return actor
