@@ -43,9 +43,11 @@ def _terminal_score(state: GameState, player: Player) -> int:
     if state.result is None:
         raise ValueError("state must have a result")
 
-    own_lines = state.result.lines_for(player)
-    opponent_lines = state.result.lines_for(player.opponent)
-    return (opponent_lines - own_lines) * TERMINAL_SCORE
+    if state.result.winner is None:
+        return 0
+    if state.result.winner is player:
+        return TERMINAL_SCORE
+    return -TERMINAL_SCORE
 
 
 def _potential_line_score(state: GameState, player: Player) -> int:

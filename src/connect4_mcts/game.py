@@ -58,9 +58,25 @@ class GameResult:
     winner: Player | None
     red_lines: int
     yellow_lines: int
+    red_line_lengths: tuple[int, ...] = ()
+    yellow_line_lengths: tuple[int, ...] = ()
+
+    @classmethod
+    def from_board(cls, board: Board) -> "GameResult":
+        counts = _line_counts(board)
+        red_lengths = _line_lengths(board, Player.RED)
+        yellow_lengths = _line_lengths(board, Player.YELLOW)
+        return cls(
+            winner=_winner_from_counts_and_lengths(counts, red_lengths, yellow_lengths),
+            red_lines=counts[Player.RED],
+            yellow_lines=counts[Player.YELLOW],
+            red_line_lengths=tuple(red_lengths),
+            yellow_line_lengths=tuple(yellow_lengths),
+        )
 
     @classmethod
     def from_line_counts(cls, line_counts: dict[Player, int]) -> "GameResult":
+        """Legacy helper when only line counts are available (no length tie-break)."""
         red_lines = line_counts[Player.RED]
         yellow_lines = line_counts[Player.YELLOW]
 
@@ -161,6 +177,11 @@ class GameState:
     def line_counts(self) -> dict[Player, int]:
         return _line_counts(self.board)
 
+    def line_lengths(self, player: Player) -> tuple[int, ...]:
+        if not isinstance(player, Player):
+            raise ValueError("player must be a Player")
+        return tuple(_line_lengths(self.board, player))
+
     def apply_move(self, move: Move) -> "GameState":
         column = move.column
         if (
@@ -221,13 +242,19 @@ class GameState:
         affected: tuple[tuple[int, int], ...],
     ) -> tuple[GameStatus, GameResult | None]:
         if self.status is GameStatus.FAIR_TURN:
-            return GameStatus.FINISHED, GameResult.from_line_counts(_line_counts(board))
+            counts = _line_counts(board)
+            if counts[Player.RED] == counts[Player.YELLOW]:
+                return GameStatus.ONGOING, None
+            return GameStatus.FINISHED, GameResult.from_board(board)
 
         has_any_line = _line_exists_through(board, affected)
         if has_any_line and player_making_move is self.first_player:
             return GameStatus.FAIR_TURN, None
         if has_any_line or _is_board_full(board):
-            return GameStatus.FINISHED, GameResult.from_line_counts(_line_counts(board))
+            result = GameResult.from_board(board)
+            if result.winner is None and not _is_board_full(board):
+                return GameStatus.ONGOING, None
+            return GameStatus.FINISHED, result
         return GameStatus.ONGOING, None
 
     def _successor(
@@ -319,6 +346,70 @@ def _line_counts(board: Board) -> dict[Player, int]:
         Player.RED: _count_lines(board, Player.RED),
         Player.YELLOW: _count_lines(board, Player.YELLOW),
     }
+
+
+def _line_lengths(board: Board, player: Player) -> list[int]:
+    """Lengths of every completed four-in-a-row segment for ``player``, descending."""
+    lengths: list[int] = []
+    for row in range(ROWS):
+        board_row = board[row]
+        for column in range(COLUMNS):
+            if board_row[column] is not player:
+                continue
+            for row_step, column_step in _DIRECTIONS:
+                if _has_line(board, player, row, column, row_step, column_step):
+                    lengths.append(_run_length(board, player, row, column, row_step, column_step))
+    lengths.sort(reverse=True)
+    return lengths
+
+
+def _run_length(
+    board: Board,
+    player: Player,
+    row: int,
+    column: int,
+    row_step: int,
+    column_step: int,
+) -> int:
+    count = 1
+
+    r, c = row + row_step, column + column_step
+    while 0 <= r < ROWS and 0 <= c < COLUMNS and board[r][c] is player:
+        count += 1
+        r += row_step
+        c += column_step
+
+    r, c = row - row_step, column - column_step
+    while 0 <= r < ROWS and 0 <= c < COLUMNS and board[r][c] is player:
+        count += 1
+        r -= row_step
+        c -= column_step
+
+    return count
+
+
+def _winner_from_counts_and_lengths(
+    counts: dict[Player, int],
+    red_lengths: list[int],
+    yellow_lengths: list[int],
+) -> Player | None:
+    """Fewer lines wins; equal counts break ties by line lengths (longer loses)."""
+    red_count = counts[Player.RED]
+    yellow_count = counts[Player.YELLOW]
+    if red_count < yellow_count:
+        return Player.RED
+    if yellow_count < red_count:
+        return Player.YELLOW
+
+    red_sorted = sorted(red_lengths, reverse=True)
+    yellow_sorted = sorted(yellow_lengths, reverse=True)
+    # Equal line counts imply equally long length lists (one length per counted line).
+    for red_length, yellow_length in zip(red_sorted, yellow_sorted, strict=True):
+        if red_length > yellow_length:
+            return Player.YELLOW
+        if yellow_length > red_length:
+            return Player.RED
+    return None
 
 
 def _count_lines(board: Board, player: Player) -> int:

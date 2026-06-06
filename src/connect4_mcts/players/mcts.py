@@ -360,7 +360,7 @@ class MCTSPlayer:
             sim = sim.apply_move(chosen)
             steps += 1
 
-        result = sim.result if sim.result is not None else GameResult.from_line_counts(sim.line_counts())
+        result = sim.result if sim.result is not None else GameResult.from_board(sim.board)
         return result, history
 
     def _rollout_move(self, state: GameState, last_move: Move | None, legal_moves: tuple[Move, ...]) -> Move:

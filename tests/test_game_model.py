@@ -10,6 +10,8 @@ from connect4_mcts.game import (
     Move,
     MoveType,
     Player,
+    _line_lengths,
+    _winner_from_counts_and_lengths,
     empty_board,
 )
 
@@ -255,12 +257,14 @@ def test_fair_turn_move_finishes_game_and_player_with_more_lines_loses() -> None
 
     assert finished.status is GameStatus.FINISHED
     assert finished.current_player is Player.RED
-    assert finished.result == GameResult(winner=Player.YELLOW, red_lines=1, yellow_lines=0)
+    assert finished.result.winner is Player.YELLOW
+    assert finished.result.red_lines == 1
+    assert finished.result.yellow_lines == 0
     assert not finished.result.is_draw
     assert finished.result.lines_for(Player.RED) == 1
 
 
-def test_fair_turn_can_end_in_draw_when_line_counts_are_equal() -> None:
+def test_fair_turn_equal_line_counts_let_game_continue() -> None:
     state = GameState(
         board=board_from_rows(
             "........",
@@ -268,18 +272,87 @@ def test_fair_turn_can_end_in_draw_when_line_counts_are_equal() -> None:
             "........",
             "........",
             "........",
-            "RRR.YYY.",
+            "RRR.YYYY",
         ),
         current_player=Player.RED,
         first_player=Player.RED,
     )
 
     fair_turn = state.apply_move(Move(MoveType.DROP, 3))
-    finished = fair_turn.apply_move(Move(MoveType.DROP, 7))
+    assert fair_turn.status is GameStatus.FAIR_TURN
+    assert fair_turn.line_counts() == {Player.RED: 1, Player.YELLOW: 1}
 
-    assert finished.status is GameStatus.FINISHED
-    assert finished.result == GameResult(winner=None, red_lines=1, yellow_lines=1)
-    assert finished.result.is_draw
+    continued = fair_turn.apply_move(Move(MoveType.DROP, 0))
+
+    assert continued.status is GameStatus.ONGOING
+    assert continued.result is None
+
+
+def test_line_lengths_list_matches_line_count() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "RRRRR...",
+    )
+    state = GameState(board=board)
+
+    assert len(state.line_lengths(Player.RED)) == state.count_lines(Player.RED)
+
+
+def test_line_lengths_track_full_run_size() -> None:
+    board = board_from_rows(
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "RRRRR...",
+    )
+
+    assert _line_lengths(board, Player.RED) == [5, 5]
+
+
+def test_length_tiebreak_longer_line_loses_when_counts_match() -> None:
+    winner = _winner_from_counts_and_lengths(
+        {Player.RED: 3, Player.YELLOW: 3},
+        [6, 5, 5],
+        [6, 5, 4],
+    )
+
+    assert winner is Player.YELLOW
+
+
+def test_length_tiebreak_returns_none_when_all_lengths_match() -> None:
+    winner = _winner_from_counts_and_lengths(
+        {Player.RED: 2, Player.YELLOW: 2},
+        [5, 4],
+        [5, 4],
+    )
+
+    assert winner is None
+
+
+def test_game_continues_when_counts_and_lengths_fully_match_after_line() -> None:
+    state = GameState(
+        board=board_from_rows(
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+            "RRRRYYYY",
+        ),
+        current_player=Player.YELLOW,
+        first_player=Player.RED,
+    )
+
+    after = state.apply_move(Move(MoveType.DROP, 0))
+
+    assert after.status is GameStatus.ONGOING
+    assert after.result is None
 
 
 def test_second_player_line_finishes_game_without_extra_turn() -> None:
@@ -299,7 +372,9 @@ def test_second_player_line_finishes_game_without_extra_turn() -> None:
     finished = state.apply_move(Move(MoveType.DROP, 3))
 
     assert finished.status is GameStatus.FINISHED
-    assert finished.result == GameResult(winner=Player.RED, red_lines=0, yellow_lines=1)
+    assert finished.result.winner is Player.RED
+    assert finished.result.red_lines == 0
+    assert finished.result.yellow_lines == 1
 
 
 def test_finished_game_requires_result() -> None:

@@ -61,14 +61,25 @@ Moves (on a column that is not full you may choose one of two move types):
 GOAL (THIS IS INVERTED - READ TWICE):
 - Making four of YOUR OWN pieces in a row (horizontal, vertical, or diagonal) is
   BAD, not good. Connecting four does NOT win.
-- At the end, whoever has FEWER completed four-in-a-rows WINS. Whoever has MORE
-  completed lines LOSES. Equal counts is a draw.
-- Therefore you must AVOID completing your own four-in-a-rows and try to FORCE
-  the opponent into completing theirs.
+- At the end, whoever has FEWER completed lines of length 4+ WINS. Whoever has
+  MORE lines LOSES.
+- If both players have the SAME number of lines, compare the lengths of their
+  lines (each line is the full run length, e.g. 4, 5, 6...). Sort each player's
+  line lengths from longest to shortest and compare position by position (both
+  lists have the same length because the line counts match). The player with the
+  LONGER line at the first differing position LOSES. If every length matches, the
+  game continues (unless the board is full, then it is a draw).
+- Therefore you must AVOID completing your own lines and try to FORCE the
+  opponent into completing theirs, preferably short lines (length 4).
 
 Fair-turn rule:
-- If the player who moved first in the game completes a line, the second player
-  gets exactly one more move and then the game ends.
+- If the player who moved first completes a line, the second player gets exactly
+  one more move.
+- After that move: if line COUNTS are unequal, the game ends and the player with
+  fewer lines wins (using the length tie-break above when counts are equal at
+  other end-of-game checks).
+- If that move leaves EQUAL line counts for both players, the game continues
+  normally instead of ending.
 
 How to answer:
 - Choose exactly one move from the provided list of legal moves.
@@ -104,9 +115,12 @@ def render_turn(state: GameState, legal_moves: Sequence[Move], include_line_coun
 
     if include_line_counts:
         counts = state.line_counts()
+        red_lengths = state.line_lengths(Player.RED)
+        yellow_lengths = state.line_lengths(Player.YELLOW)
         parts.append(
-            f"Completed four-in-a-rows so far - RED: {counts[Player.RED]}, "
-            f"YELLOW: {counts[Player.YELLOW]} (fewer is better for you)."
+            f"Completed lines so far - RED: {counts[Player.RED]} {list(red_lengths)}, "
+            f"YELLOW: {counts[Player.YELLOW]} {list(yellow_lengths)} "
+            "(fewer lines wins; equal counts break ties by line lengths, longer loses)."
         )
 
     parts.append("")
