@@ -81,11 +81,38 @@ Fair-turn rule:
 - If that move leaves EQUAL line counts for both players, the game continues
   normally instead of ending.
 
-How to answer:
+When it is your turn:
 - Choose exactly one move from the provided list of legal moves.
 - Respond with ONLY a JSON object, no prose, in the form:
   {"move_type": "drop" | "push", "column": <integer 0-7>}
 """
+
+
+def render_rules_briefing(llm_player: Player = Player.YELLOW) -> str:
+    """Opening user message: assign color/order and ask for acknowledgment only."""
+    if llm_player is Player.YELLOW:
+        role = "YELLOW (Y), Player 2 - the SECOND player"
+        opponent = "RED (R), Player 1, who moves FIRST"
+        wait_for = "RED has played the first move"
+    else:
+        role = "RED (R), Player 1 - the FIRST player"
+        opponent = "YELLOW (Y), Player 2, who moves SECOND"
+        wait_for = "the game state for your first move"
+
+    return "\n".join(
+        [
+            f"You are {role} in this game.",
+            f"Your opponent is {opponent}.",
+            "",
+            "Read the rules in the system message carefully.",
+            "",
+            "IMPORTANT for this message only:",
+            "- Do NOT output a move.",
+            "- Do NOT reply with JSON.",
+            "- Briefly confirm that you understand the rules and that you will wait until "
+            f"{wait_for}. You will receive the board when it is your turn.",
+        ]
+    )
 
 
 def render_board(state: GameState) -> str:
@@ -257,12 +284,29 @@ class LLMPlayer:
         self.moves = 0
         self.games_played = 0
         self._conversation: list[Message] = []
+        self.rules_acknowledged = False
 
     def begin_new_game(self) -> None:
         """Start a new game: drop in-game conversation history."""
         self._conversation = []
         self.moves = 0
         self.games_played += 1
+        self.rules_acknowledged = False
+
+    def send_rules_briefing(self, llm_player: Player = Player.YELLOW) -> str:
+        """Send rules and wait for a non-move acknowledgment before the first turn.
+
+        Seeds the in-game conversation with the system rules plus a briefing that
+        tells the model its color and that it must not choose a move yet.
+        """
+        self._conversation = [{"role": "system", "content": self.system_prompt}]
+        briefing_user = {"role": "user", "content": render_rules_briefing(llm_player)}
+        self.requests += 1
+        reply = self.client.complete(self._conversation + [briefing_user]) or ""
+        self._conversation.append(briefing_user)
+        self._conversation.append({"role": "assistant", "content": reply})
+        self.rules_acknowledged = True
+        return reply
 
     def build_turn_user_message(self, state: GameState) -> Message:
         """Build the user message for the current turn."""
@@ -279,7 +323,7 @@ class LLMPlayer:
         if not self._conversation:
             self._conversation.append({"role": "system", "content": self.system_prompt})
         turn_user = self.build_turn_user_message(state)
-        return self._conversation + [turn_user]
+        return [*self._conversation, turn_user]
 
     @property
     def invalid_responses(self) -> int:

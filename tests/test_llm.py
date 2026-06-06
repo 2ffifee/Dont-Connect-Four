@@ -69,6 +69,58 @@ def test_turn_prompt_lists_legal_moves_and_board():
         assert f"{move.move_type.value} column {move.column}" in prompt
 
 
+def test_rules_briefing_asks_for_acknowledgment_not_a_move():
+    client = MockLLMClient(responses=["I understand the rules and will wait for RED."])
+    player = LLMPlayer(client)
+
+    reply = player.send_rules_briefing(Player.YELLOW)
+
+    assert reply == "I understand the rules and will wait for RED."
+    assert player.rules_acknowledged
+    assert player.moves == 0
+    assert len(client.calls) == 1
+    messages = client.calls[0]
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert "SECOND player" in messages[1]["content"]
+    assert "YELLOW" in messages[1]["content"]
+    assert "Do NOT reply with JSON" in messages[1]["content"]
+    assert player._conversation[2]["role"] == "assistant"
+
+
+def test_choose_move_after_briefing_reuses_opening_conversation():
+    client = MockLLMClient(
+        responses=[
+            "Understood, waiting for RED.",
+            '{"move_type": "drop", "column": 1}',
+        ]
+    )
+    player = LLMPlayer(client)
+    player.send_rules_briefing(Player.YELLOW)
+    state = GameState.new()
+    state = state.apply_move(Move(MoveType.DROP, 0))
+
+    move = player.choose_move(state)
+
+    assert move == Move(MoveType.DROP, 1)
+    assert len(client.calls) == 2
+    second_call = client.calls[1]
+    assert second_call[0]["role"] == "system"
+    assert second_call[1]["role"] == "user"
+    assert "SECOND player" in second_call[1]["content"]
+    assert second_call[2]["role"] == "assistant"
+    assert second_call[3]["role"] == "user"
+    assert "Legal moves:" in second_call[3]["content"]
+
+
+def test_begin_new_game_resets_rules_acknowledged():
+    client = MockLLMClient(responses=["ok"])
+    player = LLMPlayer(client)
+    player.send_rules_briefing(Player.YELLOW)
+    player.begin_new_game()
+    assert not player.rules_acknowledged
+
+
 def test_conversation_keeps_prior_moves_within_same_game():
     client = MockLLMClient(
         responses=[

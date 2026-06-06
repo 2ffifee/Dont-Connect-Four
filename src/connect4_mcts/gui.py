@@ -156,6 +156,7 @@ class HumanVsAgentGui:
         self.agent: Agent = self._make_agent()
         self.selected_move_type = MoveType.DROP
         self.message = ""
+        self.llm_awaiting_rules_ack = False
         self.layout = self._compute_board_layout()
 
     def run(self) -> None:
@@ -221,6 +222,8 @@ class HumanVsAgentGui:
 
         if self.state.status is GameStatus.FINISHED:
             return
+        if self._llm_rules_gate_active():
+            return
         if not self.config.two_player and self.state.current_player is not self.config.human:
             return
 
@@ -279,9 +282,43 @@ class HumanVsAgentGui:
         self.selected_move_type = MoveType.DROP
         self.mode = "game"
         self.message = ""
+        self.llm_awaiting_rules_ack = False
         self.layout = self._compute_board_layout()
+        if self._needs_llm_rules_briefing():
+            self.message = "Sending rules to LLM..."
+            self._refresh_display()
+            self._send_llm_rules_briefing()
+            return
         if not self.config.two_player and self.state.current_player is not self.config.human:
             self._play_agent_turn()
+
+    def _needs_llm_rules_briefing(self) -> bool:
+        return (
+            self.config.agent_name == "llm"
+            and not self.config.two_player
+            and self.config.human is Player.RED
+        )
+
+    def _llm_rules_gate_active(self) -> bool:
+        if not self._needs_llm_rules_briefing():
+            return False
+        if self.llm_awaiting_rules_ack:
+            return True
+        return not getattr(self.agent, "rules_acknowledged", True)
+
+    def _send_llm_rules_briefing(self) -> None:
+        send_briefing = getattr(self.agent, "send_rules_briefing", None)
+        if not callable(send_briefing):
+            return
+
+        self.llm_awaiting_rules_ack = True
+        try:
+            ack = send_briefing(Player.YELLOW)
+            self.message = f"LLM ready: {_shorten(ack, 72)}"
+        except Exception as exc:  # noqa: BLE001 - keep GUI responsive on LLM errors
+            self.message = f"LLM rules briefing failed ({_short_error(exc)})"
+        finally:
+            self.llm_awaiting_rules_ack = False
 
     def _make_agent(self) -> Agent:
         if self.config.agent_name == "loaded" and self.config.loaded_agent is not None:
@@ -446,11 +483,13 @@ class HumanVsAgentGui:
         title = self.large_font.render("Don't Connect 4", True, TEXT)
         self.screen.blit(title, (MARGIN, 22))
 
-        status = self.font.render(
-            gui_status_message(self.state, self.config.human, self.config.agent_name, self.config.two_player),
-            True,
-            TEXT,
-        )
+        if self._llm_rules_gate_active():
+            status_line = "Waiting for LLM to acknowledge the rules..."
+        else:
+            status_line = gui_status_message(
+                self.state, self.config.human, self.config.agent_name, self.config.two_player
+            )
+        status = self.font.render(status_line, True, TEXT)
         self.screen.blit(status, (MARGIN, 62))
 
     def _draw_controls(self) -> None:
@@ -533,6 +572,9 @@ class HumanVsAgentGui:
         if self.state.status is GameStatus.FINISHED:
             text = result_text(self.state.result)
             color = TEXT
+        elif self._llm_rules_gate_active():
+            text = "Waiting for LLM to acknowledge the rules..."
+            color = MUTED_TEXT
         elif self.message:
             text = self.message
             lowered = self.message.lower()
