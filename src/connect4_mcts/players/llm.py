@@ -310,7 +310,7 @@ class LLMPlayer:
         self._conversation = [{"role": "system", "content": self.system_prompt}]
         briefing_user = {"role": "user", "content": render_rules_briefing(llm_player)}
         self.requests += 1
-        reply = self.client.complete(self._conversation + [briefing_user], timeout=None) or ""
+        reply = self.client.complete(self._conversation + [briefing_user]) or ""
         self._conversation.append(briefing_user)
         self._conversation.append({"role": "assistant", "content": reply})
         self.rules_acknowledged = True
@@ -477,7 +477,7 @@ class OpenAIClient:
         base_url: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
-        timeout: float = 60.0,
+        timeout: float = 300.0,
     ) -> None:
         try:
             from openai import OpenAI
