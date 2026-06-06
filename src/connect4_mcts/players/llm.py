@@ -165,6 +165,21 @@ def _build_move(move_type: object, column: object) -> Move | None:
     return Move(MoveType(move_type), column)
 
 
+def create_llm_player(
+    model: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    seed: int | None = None,
+) -> LLMPlayer:
+    """Build a fresh :class:`LLMPlayer` for a single game session."""
+    return LLMPlayer(
+        OpenAIClient(model=model, api_key=api_key, base_url=base_url),
+        model_label=model,
+        seed=seed,
+    )
+
+
 class LLMPlayer:
     """Zero-shot LLM policy that implements the ``Agent`` protocol.
 
@@ -185,6 +200,12 @@ class LLMPlayer:
         Override for the rules prompt (defaults to :data:`DEFAULT_SYSTEM_PROMPT`).
     seed:
         Seed for the random fallback, for reproducibility.
+
+    Within a single game the player keeps an in-memory conversation: rules once in
+    the system message, then each turn adds the current board and the model's
+    prior replies from **this game only**. Call :meth:`begin_new_game` when a
+    game ends or resets so the next game starts without history from earlier
+    matches.
 
     The instance also records simple counters used by the experiment harness to
     compute an *illegal-move rate*: :attr:`requests`, :attr:`unparseable`,
@@ -220,6 +241,31 @@ class LLMPlayer:
         self.illegal = 0
         self.fallbacks = 0
         self.moves = 0
+        self.games_played = 0
+        self._conversation: list[Message] = []
+
+    def begin_new_game(self) -> None:
+        """Start a new game: drop in-game conversation history."""
+        self._conversation = []
+        self.moves = 0
+        self.games_played += 1
+
+    def build_turn_user_message(self, state: GameState) -> Message:
+        """Build the user message for the current turn."""
+        legal_moves = state.legal_moves()
+        if not legal_moves:
+            raise MoveSelectionError("cannot build a prompt when no legal moves are available")
+        return {
+            "role": "user",
+            "content": render_turn(state, legal_moves, self.include_line_counts),
+        }
+
+    def build_turn_messages(self, state: GameState) -> list[Message]:
+        """Build the full message list sent for ``state`` (rules + in-game history)."""
+        if not self._conversation:
+            self._conversation.append({"role": "system", "content": self.system_prompt})
+        turn_user = self.build_turn_user_message(state)
+        return self._conversation + [turn_user]
 
     @property
     def invalid_responses(self) -> int:
@@ -238,10 +284,8 @@ class LLMPlayer:
             raise MoveSelectionError("cannot choose a move when no legal moves are available")
 
         self.moves += 1
-        messages: list[Message] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": render_turn(state, legal_moves, self.include_line_counts)},
-        ]
+        turn_user = self.build_turn_user_message(state)
+        messages = self.build_turn_messages(state)
 
         for _ in range(self.max_attempts):
             self.requests += 1
@@ -252,6 +296,7 @@ class LLMPlayer:
             elif move not in legal_moves:
                 self.illegal += 1
             else:
+                self._record_turn(turn_user, reply)
                 return move
 
             messages.append({"role": "assistant", "content": reply})
@@ -262,7 +307,19 @@ class LLMPlayer:
             raise MoveSelectionError(
                 f"LLM '{self.model_label}' failed to return a legal move after {self.max_attempts} attempts"
             )
-        return self._rng.choice(legal_moves)
+        move = self._rng.choice(legal_moves)
+        self._record_turn(turn_user, self._move_reply(move))
+        return move
+
+    def _record_turn(self, turn_user: Message, reply: str) -> None:
+        if not self._conversation:
+            self._conversation.append({"role": "system", "content": self.system_prompt})
+        self._conversation.append(turn_user)
+        self._conversation.append({"role": "assistant", "content": reply})
+
+    @staticmethod
+    def _move_reply(move: Move) -> str:
+        return f'{{"move_type": "{move.move_type.value}", "column": {move.column}}}'
 
     @staticmethod
     def _retry_message(legal_moves: Sequence[Move]) -> str:

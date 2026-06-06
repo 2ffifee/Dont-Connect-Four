@@ -2,7 +2,7 @@ import pytest
 
 from connect4_mcts.game import GameResult, GameState, GameStatus, Move, MoveType, Player
 from connect4_mcts.players import MoveSelectionError
-from connect4_mcts.players.mcts import LGRMemory, MCTSPlayer
+from connect4_mcts.players.mcts import LGRMemory, MCTSPlayer, SearchEvaluation
 
 
 def board_from_rows(*rows: str):
@@ -91,6 +91,81 @@ def test_mcts_player_avoids_immediate_losing_move() -> None:
     move = player.choose_move(state)
 
     assert move.column != 3
+
+
+def test_evaluate_reports_root_and_move_values() -> None:
+    state = GameState.new()
+    player = MCTSPlayer(iterations=200, seed=7)
+
+    evaluation = player.evaluate(state)
+
+    assert isinstance(evaluation, SearchEvaluation)
+    assert evaluation.player_to_move is state.current_player
+    legal = set(state.legal_moves())
+    assert set(evaluation.move_values).issubset(legal)
+    assert evaluation.best_move in evaluation.move_values
+    assert all(0.0 <= value <= 1.0 for value in evaluation.move_values.values())
+    # The root value is the value of the best move under search.
+    assert evaluation.root_value == max(evaluation.move_values.values())
+    assert evaluation.regret_of(evaluation.best_move) == 0.0
+
+
+def test_evaluate_flags_losing_move_as_blunder() -> None:
+    # RED (second player) completing its own 4-line loses the suicide variant,
+    # so dropping into column 3 should be valued far below the best move.
+    state = GameState(
+        board=board_from_rows(
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+            "RRR.....",
+        ),
+        current_player=Player.RED,
+        first_player=Player.YELLOW,
+    )
+    player = MCTSPlayer(iterations=400, seed=1)
+
+    evaluation = player.evaluate(state)
+    losing_move = Move(MoveType.DROP, 3)
+
+    # Completing the line is an immediate, certain loss for RED.
+    assert evaluation.value_of(losing_move) is not None
+    assert evaluation.value_of(losing_move) < 0.1
+    assert evaluation.value_of(losing_move) < evaluation.root_value
+    assert evaluation.best_move != losing_move
+
+
+def test_search_evaluation_blunder_and_regret() -> None:
+    best = Move(MoveType.DROP, 0)
+    mediocre = Move(MoveType.DROP, 1)
+    losing = Move(MoveType.PUSH, 2)
+    evaluation = SearchEvaluation(
+        player_to_move=Player.RED,
+        root_value=0.9,
+        best_move=best,
+        move_values={best: 0.9, mediocre: 0.7, losing: 0.2},
+        move_visits={best: 100, mediocre: 40, losing: 5},
+    )
+
+    assert evaluation.regret_of(best) == 0.0
+    assert evaluation.regret_of(mediocre) == pytest.approx(0.2)
+    assert evaluation.regret_of(Move(MoveType.DROP, 7)) is None
+    assert not evaluation.is_blunder(mediocre, threshold=0.3)
+    assert evaluation.is_blunder(losing, threshold=0.3)
+
+
+def test_evaluate_rejects_state_without_moves() -> None:
+    state = GameState(
+        board=GameState.new().board,
+        status=GameStatus.FINISHED,
+        result=GameResult(winner=None, red_lines=0, yellow_lines=0),
+    )
+    player = MCTSPlayer(iterations=10, seed=1)
+
+    with pytest.raises(MoveSelectionError, match="no legal moves"):
+        player.evaluate(state)
 
 
 def test_mcts_player_validates_hyperparameters() -> None:

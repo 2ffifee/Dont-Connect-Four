@@ -8,6 +8,7 @@ from connect4_mcts.players.random import RandomPlayer
 
 
 AgentName = str
+# Built-in, fully offline agents shown in the GUI/CLI menus.
 AGENT_CHOICES = ("random", "minimax", "uct", "fpu", "lgr", "pmbp")
 
 _AGENT_LABELS = {
@@ -17,6 +18,7 @@ _AGENT_LABELS = {
     "fpu": "UCT+FPU",
     "lgr": "UCT+LGR",
     "pmbp": "UCT+PMBp",
+    "llm": "LLM",
     "loaded": "Loaded",
 }
 
@@ -33,6 +35,8 @@ def create_agent(
         return MinimaxPlayer(depth=depth)
     if agent_name in {"uct", "fpu", "lgr", "pmbp"}:
         return _create_mcts_agent(agent_name, seed=seed, iterations=iterations)
+    if agent_name == "llm":
+        return _create_llm_agent(seed=seed)
     raise ValueError(f"unknown agent: {agent_name}")
 
 
@@ -48,6 +52,18 @@ def _create_mcts_agent(agent_name: AgentName, seed: int | None, iterations: int)
     if agent_name == "lgr":
         return train_lgr(iterations=iterations, seed=seed)
     return train_pmbp(iterations=iterations, seed=seed)
+
+
+def _create_llm_agent(seed: int | None) -> Agent:
+    # Imported lazily so the optional ``openai`` dependency is only required when
+    # an LLM agent is actually requested. The model is taken from the
+    # ``OPENAI_MODEL`` environment variable (default: gpt-4o-mini).
+    import os
+
+    from connect4_mcts.players.llm import LLMPlayer, OpenAIClient
+
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    return LLMPlayer(OpenAIClient(model=model), model_label=model, seed=seed)
 
 
 def format_agent_name(agent_name: AgentName) -> str:

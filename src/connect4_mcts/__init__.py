@@ -14,8 +14,29 @@ from connect4_mcts.game import (
     Player,
     empty_board,
 )
-from connect4_mcts.players import Agent, MinimaxPlayer, MoveSelectionError, RandomPlayer
+from connect4_mcts.players import (
+    Agent,
+    LGRMemory,
+    LLMClient,
+    LLMPlayer,
+    MCTSPlayer,
+    MinimaxPlayer,
+    MockLLMClient,
+    MoveSelectionError,
+    OpenAIClient,
+    RandomPlayer,
+    SearchEvaluation,
+)
 from connect4_mcts.runner import GameRunnerError, MoveRecord, PlayedGame, play_game
+from connect4_mcts.training import (
+    load_player,
+    save_player,
+    selfplay_train,
+    train_fpu,
+    train_lgr,
+    train_pmbp,
+    train_uct,
+)
 
 __all__ = [
     "Agent",
@@ -27,15 +48,29 @@ __all__ = [
     "GameRunnerError",
     "GameStatus",
     "IllegalMoveError",
+    "LGRMemory",
+    "LLMClient",
+    "LLMPlayer",
+    "MCTSPlayer",
     "MinimaxPlayer",
+    "MockLLMClient",
     "Move",
     "MoveSelectionError",
     "MoveRecord",
     "MoveType",
+    "OpenAIClient",
     "Player",
     "ROWS",
     "RandomPlayer",
     "PlayedGame",
+    "SearchEvaluation",
     "empty_board",
+    "load_player",
     "play_game",
+    "save_player",
+    "selfplay_train",
+    "train_fpu",
+    "train_lgr",
+    "train_pmbp",
+    "train_uct",
 ]

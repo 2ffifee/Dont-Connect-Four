@@ -1,4 +1,21 @@
-"""Core domain model for the modified Connect4 game."""
+"""Core domain model for the modified Connect4 game.
+
+Performance notes
+-----------------
+``apply_move`` is on the hot path of MCTS rollouts and tournament play, so it is
+optimized to:
+
+* check legality in O(1) instead of materializing ``legal_moves()``;
+* rebuild only the affected board cells (sharing the immutable row tuples that
+  do not change);
+* detect a finishing line **incrementally** from the cells touched by the move
+  (an ``ONGOING`` board has no four-in-a-row, so any new line must pass through
+  those cells), instead of rescanning the whole board on every move;
+* count all lines (the expensive full scan) only when a terminal state is
+  actually reached, i.e. to build the :class:`GameResult`;
+* construct the successor state without re-running ``__post_init__`` validation
+  (the successor is guaranteed valid by construction).
+"""
 
 from __future__ import annotations
 
@@ -8,6 +25,8 @@ from enum import Enum
 
 ROWS = 6
 COLUMNS = 8
+
+_DIRECTIONS = ((0, 1), (1, 0), (1, 1), (1, -1))
 
 
 class Player(Enum):
@@ -91,6 +110,12 @@ def empty_board() -> Board:
     return tuple(tuple(None for _ in range(COLUMNS)) for _ in range(ROWS))
 
 
+# Pre-built, shareable move objects so the hot ``legal_moves`` path does not
+# allocate new ``Move`` instances on every call.
+_DROP_MOVES = tuple(Move(MoveType.DROP, column) for column in range(COLUMNS))
+_PUSH_MOVES = tuple(Move(MoveType.PUSH, column) for column in range(COLUMNS))
+
+
 @dataclass(frozen=True, slots=True)
 class GameState:
     board: Board
@@ -112,15 +137,20 @@ class GameState:
         if self.status is GameStatus.FINISHED:
             return ()
 
+        top_row = self.board[0]
         moves: list[Move] = []
         for column in range(COLUMNS):
-            if not self.is_column_full(column):
-                moves.append(Move(MoveType.DROP, column))
-                moves.append(Move(MoveType.PUSH, column))
+            if top_row[column] is None:
+                moves.append(_DROP_MOVES[column])
+                moves.append(_PUSH_MOVES[column])
         return tuple(moves)
 
     def is_legal_move(self, move: Move) -> bool:
-        return move in self.legal_moves()
+        if self.status is GameStatus.FINISHED:
+            return False
+        if not 0 <= move.column < COLUMNS:
+            return False
+        return self.board[0][move.column] is None
 
     def count_lines(self, player: Player) -> int:
         if not isinstance(player, Player):
@@ -129,31 +159,27 @@ class GameState:
         return _count_lines(self.board, player)
 
     def line_counts(self) -> dict[Player, int]:
-        return {
-            Player.RED: self.count_lines(Player.RED),
-            Player.YELLOW: self.count_lines(Player.YELLOW),
-        }
+        return _line_counts(self.board)
 
     def apply_move(self, move: Move) -> "GameState":
-        if not self.is_legal_move(move):
-            raise IllegalMoveError(f"illegal move: {move.move_type.value} in column {move.column}")
+        column = move.column
+        if (
+            self.status is GameStatus.FINISHED
+            or not 0 <= column < COLUMNS
+            or self.board[0][column] is not None
+        ):
+            raise IllegalMoveError(f"illegal move: {move.move_type.value} in column {column}")
 
-        player_making_move = self.current_player
+        mover = self.current_player
         if move.move_type is MoveType.DROP:
-            next_board = self._apply_drop(move.column)
+            next_board, affected = _apply_drop(self.board, column, mover)
         elif move.move_type is MoveType.PUSH:
-            next_board = self._apply_push(move.column)
+            next_board, affected = _apply_push(self.board, column, mover)
         else:
             raise IllegalMoveError(f"unsupported move type: {move.move_type}")
 
-        return GameState(
-            board=next_board,
-            current_player=player_making_move.opponent,
-            first_player=self.first_player,
-            status=self._status_after_move(next_board, player_making_move),
-            move_count=self.move_count + 1,
-            result=self._result_after_move(next_board, player_making_move),
-        )
+        next_status, result = self._status_and_result(next_board, mover, affected)
+        return self._successor(next_board, mover.opponent, next_status, result)
 
     def __post_init__(self) -> None:
         if len(self.board) != ROWS:
@@ -188,76 +214,130 @@ class GameState:
         if self.status is not GameStatus.FINISHED and self.result is not None:
             raise ValueError("unfinished game cannot have a result")
 
-    def _apply_drop(self, column: int) -> Board:
-        rows = [list(row) for row in self.board]
+    def _status_and_result(
+        self,
+        board: Board,
+        player_making_move: Player,
+        affected: tuple[tuple[int, int], ...],
+    ) -> tuple[GameStatus, GameResult | None]:
+        if self.status is GameStatus.FAIR_TURN:
+            return GameStatus.FINISHED, GameResult.from_line_counts(_line_counts(board))
 
-        for row_index in range(ROWS - 1, -1, -1):
-            if rows[row_index][column] is None:
-                rows[row_index][column] = self.current_player
-                return _freeze_board(rows)
+        has_any_line = _line_exists_through(board, affected)
+        if has_any_line and player_making_move is self.first_player:
+            return GameStatus.FAIR_TURN, None
+        if has_any_line or _is_board_full(board):
+            return GameStatus.FINISHED, GameResult.from_line_counts(_line_counts(board))
+        return GameStatus.ONGOING, None
 
-        raise IllegalMoveError(f"column {column} is full")
-
-    def _apply_push(self, column: int) -> Board:
-        rows = [list(row) for row in self.board]
-
-        # A push inserts a token from the bottom, moving existing tokens upward.
-        for row_index in range(ROWS - 1):
-            rows[row_index][column] = rows[row_index + 1][column]
-        rows[ROWS - 1][column] = self.current_player
-
-        return _freeze_board(rows)
+    def _successor(
+        self,
+        board: Board,
+        current_player: Player,
+        status: GameStatus,
+        result: GameResult | None,
+    ) -> "GameState":
+        # Build the successor without re-running ``__post_init__``: it is valid
+        # by construction and this avoids per-move validation overhead.
+        successor = object.__new__(GameState)
+        object.__setattr__(successor, "board", board)
+        object.__setattr__(successor, "current_player", current_player)
+        object.__setattr__(successor, "first_player", self.first_player)
+        object.__setattr__(successor, "status", status)
+        object.__setattr__(successor, "move_count", self.move_count + 1)
+        object.__setattr__(successor, "result", result)
+        return successor
 
     @staticmethod
     def _validate_column(column: int) -> None:
         if not 0 <= column < COLUMNS:
             raise ValueError(f"column must be between 0 and {COLUMNS - 1}")
 
-    def _status_after_move(self, board: Board, player_making_move: Player) -> GameStatus:
-        if self.status is GameStatus.FAIR_TURN:
-            return GameStatus.FINISHED
 
-        line_counts = self._line_counts_for_board(board)
-        has_any_line = any(count > 0 for count in line_counts.values())
-        if has_any_line and player_making_move is self.first_player:
-            return GameStatus.FAIR_TURN
-        if has_any_line or self._is_board_full(board):
-            return GameStatus.FINISHED
-        return GameStatus.ONGOING
+def _apply_drop(board: Board, column: int, mover: Player) -> tuple[Board, tuple[tuple[int, int], ...]]:
+    for row_index in range(ROWS - 1, -1, -1):
+        if board[row_index][column] is None:
+            old_row = board[row_index]
+            new_row = old_row[:column] + (mover,) + old_row[column + 1:]
+            new_board = board[:row_index] + (new_row,) + board[row_index + 1:]
+            return new_board, ((row_index, column),)
 
-    def _result_after_move(self, board: Board, player_making_move: Player) -> GameResult | None:
-        next_status = self._status_after_move(board, player_making_move)
-        if next_status is not GameStatus.FINISHED:
-            return None
-
-        return GameResult.from_line_counts(self._line_counts_for_board(board))
-
-    def _line_counts_for_board(self, board: Board) -> dict[Player, int]:
-        return {
-            Player.RED: _count_lines(board, Player.RED),
-            Player.YELLOW: _count_lines(board, Player.YELLOW),
-        }
-
-    @staticmethod
-    def _is_board_full(board: Board) -> bool:
-        return all(cell is not None for cell in board[0])
+    raise IllegalMoveError(f"column {column} is full")
 
 
-def _freeze_board(rows: list[list[Cell]]) -> Board:
-    return tuple(tuple(row) for row in rows)
+def _apply_push(board: Board, column: int, mover: Player) -> tuple[Board, tuple[tuple[int, int], ...]]:
+    # A push inserts a token at the bottom of the column, shifting the existing
+    # tokens in that column up by one. Only ``column`` changes in each row.
+    new_rows = []
+    for row_index in range(ROWS):
+        value = mover if row_index == ROWS - 1 else board[row_index + 1][column]
+        old_row = board[row_index]
+        new_rows.append(old_row[:column] + (value,) + old_row[column + 1:])
+
+    affected = tuple((row_index, column) for row_index in range(ROWS))
+    return tuple(new_rows), affected
+
+
+def _line_exists_through(board: Board, cells: tuple[tuple[int, int], ...]) -> bool:
+    """Return whether any four-in-a-row passes through one of ``cells``.
+
+    Uses a run-length count in both directions from each affected cell, so it is
+    independent of which player owns the cell.
+    """
+    for row, column in cells:
+        cell = board[row][column]
+        if cell is None:
+            continue
+
+        for row_step, column_step in _DIRECTIONS:
+            count = 1
+
+            r, c = row + row_step, column + column_step
+            while 0 <= r < ROWS and 0 <= c < COLUMNS and board[r][c] is cell:
+                count += 1
+                r += row_step
+                c += column_step
+
+            r, c = row - row_step, column - column_step
+            while 0 <= r < ROWS and 0 <= c < COLUMNS and board[r][c] is cell:
+                count += 1
+                r -= row_step
+                c -= column_step
+
+            if count >= 4:
+                return True
+
+    return False
+
+
+def _is_board_full(board: Board) -> bool:
+    return all(cell is not None for cell in board[0])
+
+
+def _line_counts(board: Board) -> dict[Player, int]:
+    return {
+        Player.RED: _count_lines(board, Player.RED),
+        Player.YELLOW: _count_lines(board, Player.YELLOW),
+    }
 
 
 def _count_lines(board: Board, player: Player) -> int:
     count = 0
     for row in range(ROWS):
+        board_row = board[row]
         for column in range(COLUMNS):
+            if board_row[column] is not player:
+                continue
             count += _count_lines_from_cell(board, player, row, column)
     return count
 
 
 def _count_lines_from_cell(board: Board, player: Player, row: int, column: int) -> int:
-    directions = ((0, 1), (1, 0), (1, 1), (1, -1))
-    return sum(1 for row_step, column_step in directions if _has_line(board, player, row, column, row_step, column_step))
+    return sum(
+        1
+        for row_step, column_step in _DIRECTIONS
+        if _has_line(board, player, row, column, row_step, column_step)
+    )
 
 
 def _has_line(board: Board, player: Player, row: int, column: int, row_step: int, column_step: int) -> bool:

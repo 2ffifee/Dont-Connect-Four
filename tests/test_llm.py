@@ -69,6 +69,55 @@ def test_turn_prompt_lists_legal_moves_and_board():
         assert f"{move.move_type.value} column {move.column}" in prompt
 
 
+def test_conversation_keeps_prior_moves_within_same_game():
+    client = MockLLMClient(
+        responses=[
+            '{"move_type": "drop", "column": 0}',
+            '{"move_type": "drop", "column": 1}',
+        ]
+    )
+    player = LLMPlayer(client)
+    first_state = GameState.new()
+    second_state = first_state.apply_move(Move(MoveType.DROP, 0))
+
+    player.choose_move(first_state)
+    player.choose_move(second_state)
+
+    assert len(client.calls) == 2
+    first_call = client.calls[0]
+    second_call = client.calls[1]
+
+    assert first_call[0]["role"] == "system"
+    assert first_call[1]["role"] == "user"
+    assert len(first_call) == 2
+
+    assert second_call[0]["role"] == "system"
+    assert second_call[1]["role"] == "user"
+    assert second_call[2]["role"] == "assistant"
+    assert second_call[3]["role"] == "user"
+
+
+def test_begin_new_game_clears_conversation_for_next_game():
+    client = MockLLMClient(
+        responses=[
+            '{"move_type": "drop", "column": 0}',
+            '{"move_type": "drop", "column": 1}',
+        ]
+    )
+    player = LLMPlayer(client)
+
+    player.choose_move(GameState.new())
+    player.begin_new_game()
+    player.choose_move(GameState.new())
+
+    assert player.moves == 1
+    assert player.games_played == 1
+    assert len(client.calls) == 2
+    assert len(client.calls[1]) == 2
+    assert client.calls[1][0]["role"] == "system"
+    assert client.calls[1][1]["role"] == "user"
+
+
 def test_llm_player_returns_legal_move_from_valid_reply():
     client = MockLLMClient(responses=['{"move_type": "drop", "column": 0}'])
     player = LLMPlayer(client)
@@ -220,4 +269,6 @@ def test_llm_player_plays_full_game_through_runner():
     assert game.final_state.status is GameStatus.FINISHED
     # A competent mock never needs the random fallback.
     assert llm.fallbacks == 0
-    assert llm.moves > 0
+    assert llm.requests > 0
+    # A new play_game clears in-game LLM history before the next match starts.
+    assert llm.games_played == 1

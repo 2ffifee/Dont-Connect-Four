@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -78,6 +79,11 @@ class GuiConfig:
     two_player: bool = False
     loaded_agent: Agent | None = None
     loaded_label: str | None = None
+    llm_agent: Agent | None = None
+    llm_model: str | None = None
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_label: str | None = None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -88,6 +94,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--depth", type=int, default=3, help="Search depth for minimax.")
     parser.add_argument("--two-player", action="store_true", help="Start in local two-player mode.")
     parser.add_argument("--load", default=None, help="Path to a pickled trained player to use as opponent.")
+    parser.add_argument("--llm", action="store_true", help="Use an LLM (OpenAI-compatible) opponent.")
+    parser.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model name (with --llm).")
+    parser.add_argument(
+        "--llm-base-url",
+        default=None,
+        help="Base URL of an OpenAI-compatible server, e.g. http://localhost:11434/v1 (with --llm). "
+        "API key is read from OPENAI_API_KEY.",
+    )
     args = parser.parse_args(argv)
 
     config = GuiConfig(
@@ -103,6 +117,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.loaded_agent = load_player(args.load)
         config.loaded_label = os.path.basename(args.load)
         config.agent_name = "loaded"
+
+    if args.llm:
+        from connect4_mcts.players.llm import create_llm_player
+
+        config.llm_model = args.llm_model
+        config.llm_base_url = args.llm_base_url
+        config.llm_agent = create_llm_player(args.llm_model, base_url=args.llm_base_url)
+        config.llm_label = f"LLM: {args.llm_model}"
+        config.agent_name = "llm"
 
     HumanVsAgentGui(config=config).run()
     return 0
@@ -229,7 +252,20 @@ class HumanVsAgentGui:
         if self.state.status is GameStatus.FINISHED:
             return
 
-        move = self.agent.choose_move(self.state)
+        try:
+            move = self.agent.choose_move(self.state)
+            if not self.state.is_legal_move(move):
+                raise IllegalMoveError(f"agent returned illegal move: {move}")
+        except Exception as exc:  # noqa: BLE001 - keep the GUI responsive (e.g. on LLM/network errors)
+            legal_moves = self.state.legal_moves()
+            if not legal_moves:
+                return
+            move = random.choice(legal_moves)
+            self.state = self.state.apply_move(move)
+            name = format_agent_name(self.config.agent_name)
+            self.message = f"{name} error ({_short_error(exc)}) - played random {format_move(move)}"
+            return
+
         self.state = self.state.apply_move(move)
         self.message = f"{format_agent_name(self.config.agent_name)}: {format_move(move)}"
 
@@ -239,6 +275,7 @@ class HumanVsAgentGui:
     def _start_game(self) -> None:
         self.state = GameState.new(first_player=Player.RED)
         self.agent = self._make_agent()
+        self._reset_llm_conversation()
         self.selected_move_type = MoveType.DROP
         self.mode = "game"
         self.message = ""
@@ -249,7 +286,29 @@ class HumanVsAgentGui:
     def _make_agent(self) -> Agent:
         if self.config.agent_name == "loaded" and self.config.loaded_agent is not None:
             return self.config.loaded_agent
+        if self.config.agent_name == "llm":
+            if self.config.llm_agent is None and self.config.llm_model is not None:
+                self.config.llm_agent = self._make_llm_agent()
+            if self.config.llm_agent is not None:
+                return self.config.llm_agent
         return create_agent(self.config.agent_name, seed=self.config.seed, depth=self.config.depth)
+
+    def _make_llm_agent(self) -> Agent:
+        from connect4_mcts.players.llm import create_llm_player
+
+        return create_llm_player(
+            self.config.llm_model,
+            api_key=self.config.llm_api_key,
+            base_url=self.config.llm_base_url,
+            seed=self.config.seed,
+        )
+
+    def _reset_llm_conversation(self) -> None:
+        if self.config.agent_name != "llm":
+            return
+        begin_new_game = getattr(self.agent, "begin_new_game", None)
+        if callable(begin_new_game):
+            begin_new_game()
 
     def _load_player_from_file(self) -> None:
         path = _prompt_player_file()
@@ -269,6 +328,58 @@ class HumanVsAgentGui:
         self.config.loaded_label = os.path.basename(path)
         self.config.agent_name = "loaded"
         self.message = ""
+
+    def _configure_llm_opponent(self) -> None:
+        connection = _prompt_llm_connection()
+        if connection is None:
+            self.message = "LLM setup cancelled"
+            return
+        base_url, api_key = connection
+
+        try:
+            from connect4_mcts.players.llm import OpenAIClient, create_llm_player
+        except ImportError:
+            self._notify_llm(False, "Install 'openai' to play vs LLM (pip install openai)")
+            return
+
+        endpoint = base_url or "OpenAI (default endpoint)"
+        self.message = f"Connecting to {endpoint}..."
+        self._refresh_display()
+
+        try:
+            client = OpenAIClient(api_key=api_key or None, base_url=base_url or None)
+            models = client.list_models()
+        except Exception as exc:  # noqa: BLE001 - surface any connection/auth failure
+            self._notify_llm(False, f"Connection to {endpoint} failed:\n{_short_error(exc)}")
+            return
+
+        if not models:
+            self._notify_llm(False, f"Connected to {endpoint}, but it returned no models.")
+            return
+
+        self._notify_llm(True, f"Connected to {endpoint}.\n{len(models)} model(s) available.")
+
+        model = _prompt_model_choice(_chat_models_first(models))
+        if not model:
+            self.message = "LLM model selection cancelled"
+            return
+
+        self.config.llm_model = model
+        self.config.llm_base_url = base_url or None
+        self.config.llm_api_key = api_key or None
+        self.config.llm_agent = create_llm_player(
+            model,
+            api_key=api_key or None,
+            base_url=base_url or None,
+            seed=self.config.seed,
+        )
+        self.config.llm_label = f"LLM: {model}"
+        self.config.agent_name = "llm"
+        self.message = f"LLM ready: {model}"
+
+    def _notify_llm(self, success: bool, text: str) -> None:
+        self.message = text.replace("\n", " ")
+        _notify(success, "LLM connection" if success else "LLM connection failed", text)
 
     def _handle_setup_click(self, position: tuple[int, int]) -> None:
         rects = self._setup_rects()
@@ -292,6 +403,9 @@ class HumanVsAgentGui:
             return
         if rects["load"].collidepoint(position):
             self._load_player_from_file()
+            return
+        if rects["llm"].collidepoint(position):
+            self._configure_llm_opponent()
             return
         if rects["depth_minus"].collidepoint(position):
             self.config.depth = max(1, self.config.depth - 1)
@@ -367,6 +481,9 @@ class HumanVsAgentGui:
         load_label = _shorten(self.config.loaded_label) if self.config.loaded_label else "Load player..."
         self._draw_button(rects["load"], load_label, self.config.agent_name == "loaded")
 
+        llm_label = _shorten(self.config.llm_label) if self.config.llm_label else "Play vs LLM..."
+        self._draw_button(rects["llm"], llm_label, self.config.agent_name == "llm")
+
         self._draw_setup_label("Minimax depth", rects["depth_label_y"], center_x)
         self._draw_button(rects["depth_minus"], "-", False)
         depth = self.font.render(str(self.config.depth), True, TEXT)
@@ -374,6 +491,11 @@ class HumanVsAgentGui:
         self._draw_button(rects["depth_plus"], "+", False)
 
         self._draw_button(rects["start"], "Start", True)
+
+        if self.message:
+            color = ERROR if "fail" in self.message.lower() else MUTED_TEXT
+            status = self.small_font.render(self.message, True, color)
+            self.screen.blit(status, status.get_rect(center=(center_x, rects["start"].bottom + 26)))
 
     def _draw_setup_label(self, label: str, y: int, center_x: int) -> None:
         surface = self.font.render(label, True, TEXT)
@@ -410,7 +532,8 @@ class HumanVsAgentGui:
             color = TEXT
         elif self.message:
             text = self.message
-            color = ERROR if self.message == "Illegal move" else MUTED_TEXT
+            lowered = self.message.lower()
+            color = ERROR if "error" in lowered or "illegal" in lowered or "fail" in lowered else MUTED_TEXT
         else:
             text = "Space toggles move type. R resets."
             color = MUTED_TEXT
@@ -445,7 +568,7 @@ class HumanVsAgentGui:
         pair_left = center_x - pair_width // 2
         pair_right_left = pair_left + SETUP_BUTTON_WIDTH + SETUP_BUTTON_GAP
 
-        block_height = 640
+        block_height = 700
         top = max(16, (self.height - block_height) // 2)
         label_to_button = 28
         row_gap = 22
@@ -471,6 +594,8 @@ class HumanVsAgentGui:
         agent_random, agent_minimax = pair(cursor + label_to_button)
         cursor += label_to_button + SETUP_BUTTON_HEIGHT + 10
         load = pygame.Rect(pair_left, cursor, pair_width, SETUP_BUTTON_HEIGHT)
+        cursor += SETUP_BUTTON_HEIGHT + 10
+        llm = pygame.Rect(pair_left, cursor, pair_width, SETUP_BUTTON_HEIGHT)
         cursor += SETUP_BUTTON_HEIGHT + row_gap
 
         depth_label_y = cursor
@@ -495,6 +620,7 @@ class HumanVsAgentGui:
             "agent_random": agent_random,
             "agent_minimax": agent_minimax,
             "load": load,
+            "llm": llm,
             "depth_label_y": depth_label_y,
             "depth_minus": depth_minus,
             "depth_value": depth_value,
@@ -526,6 +652,125 @@ def _prompt_player_file() -> str | None:
         return path or None
     except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
         return None
+
+
+def _prompt_llm_connection() -> tuple[str, str] | None:
+    """Prompt for the LLM endpoint and API key via tkinter dialogs.
+
+    Returns ``(base_url, api_key)`` or ``None`` if cancelled / no dialog backend
+    is available. A blank base URL means the default OpenAI endpoint; a custom
+    URL (e.g. ``http://localhost:11434/v1``) targets a local server. A blank API
+    key falls back to the ``OPENAI_API_KEY`` environment variable.
+    """
+    try:
+        import tkinter
+        from tkinter import simpledialog
+    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
+        return None
+
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            base_url = simpledialog.askstring(
+                "LLM endpoint",
+                "Base URL (blank = OpenAI; e.g. http://localhost:11434/v1 for a local server):",
+                parent=root,
+            )
+            if base_url is None:
+                return None
+            api_key = simpledialog.askstring(
+                "LLM API key",
+                "API key (blank = OK for local server; for OpenAI use your key or OPENAI_API_KEY):",
+                parent=root,
+                show="*",
+            )
+        finally:
+            root.destroy()
+        return base_url.strip(), (api_key or "").strip()
+    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
+        return None
+
+
+def _prompt_model_choice(models: Sequence[str]) -> str | None:
+    """Show a dropdown of ``models`` and return the chosen id (or ``None``)."""
+    if not models:
+        return None
+    try:
+        import tkinter
+        from tkinter import ttk
+    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
+        return None
+
+    chosen: dict[str, str | None] = {"value": None}
+    try:
+        root = tkinter.Tk()
+        root.title("Choose LLM model")
+        root.geometry("420x150")
+
+        tkinter.Label(root, text="Select a model to play against:").pack(padx=14, pady=(16, 6))
+        selected = tkinter.StringVar(value=models[0])
+        # Editable so an advanced user can still type a model not in the list.
+        combo = ttk.Combobox(root, textvariable=selected, values=list(models))
+        combo.pack(fill="x", padx=14)
+
+        def confirm() -> None:
+            chosen["value"] = selected.get().strip() or None
+            root.destroy()
+
+        def cancel() -> None:
+            chosen["value"] = None
+            root.destroy()
+
+        buttons = tkinter.Frame(root)
+        buttons.pack(pady=16)
+        tkinter.Button(buttons, text="Play", width=10, command=confirm).pack(side="left", padx=8)
+        tkinter.Button(buttons, text="Cancel", width=10, command=cancel).pack(side="left", padx=8)
+        root.protocol("WM_DELETE_WINDOW", cancel)
+        combo.focus_set()
+        root.mainloop()
+        return chosen["value"]
+    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
+        return None
+
+
+def _notify(success: bool, title: str, message: str) -> None:
+    """Pop a native info/error dialog (best effort, headless-safe)."""
+    try:
+        import tkinter
+        from tkinter import messagebox
+    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
+        return
+
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            show = messagebox.showinfo if success else messagebox.showerror
+            show(title, message, parent=root)
+        finally:
+            root.destroy()
+    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
+        return
+
+
+_CHAT_MODEL_PREFIXES = ("gpt-", "gpt", "o1", "o3", "o4", "chatgpt")
+
+
+def _chat_models_first(models: Sequence[str]) -> list[str]:
+    """Surface likely chat models first; keep the rest available below them."""
+    chat = [model for model in models if model.lower().startswith(_CHAT_MODEL_PREFIXES)]
+    if not chat:
+        return list(models)
+    others = [model for model in models if model not in set(chat)]
+    return chat + others
+
+
+def _short_error(exc: Exception, max_length: int = 200) -> str:
+    text = str(exc).strip() or exc.__class__.__name__
+    if len(text) > max_length:
+        text = text[: max_length - 3] + "..."
+    return text
 
 
 def _shorten(text: str, max_length: int = 22) -> str:
