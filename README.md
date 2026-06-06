@@ -164,9 +164,11 @@ modelu jezykowym. Kreator dziala tak:
 
 1. **Base URL** - puste = OpenAI; wlasny adres kieruje na **lokalny serwer**
    zgodny z API OpenAI (np. `http://localhost:11434/v1` dla Ollamy albo
-   `http://localhost:8000/v1` dla vLLM/LM Studio).
+   `http://localhost:8000/v1` dla vLLM/LM Studio). Uzywane adresy sa zapisywane
+   lokalnie w `~/.config/connect4-mcts/llm_endpoints.json` i podpowiadane przy
+   kolejnym uruchomieniu (wpisz fragment, np. `11434`, aby przefiltrowac liste).
 2. **API key** - puste = uzyj zmiennej `OPENAI_API_KEY` (lokalne serwery zwykle
-   nie wymagaja klucza).
+   nie wymagaja klucza). Klucze **nie** sa zapisywane na dysku.
 3. Aplikacja **laczy sie i pobiera liste modeli** z endpointu (to zarazem test
    polaczenia) i pokazuje **powiadomienie o sukcesie albo bledzie** (zly klucz,
    brak serwera itp.).

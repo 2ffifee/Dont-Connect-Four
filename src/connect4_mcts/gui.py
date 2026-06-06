@@ -373,6 +373,9 @@ class HumanVsAgentGui:
             base_url=base_url or None,
             seed=self.config.seed,
         )
+        from connect4_mcts.llm_settings import remember_endpoint
+
+        remember_endpoint(base_url)
         self.config.llm_label = f"LLM: {model}"
         self.config.agent_name = "llm"
         self.message = f"LLM ready: {model}"
@@ -655,39 +658,70 @@ def _prompt_player_file() -> str | None:
 
 
 def _prompt_llm_connection() -> tuple[str, str] | None:
-    """Prompt for the LLM endpoint and API key via tkinter dialogs.
+    """Prompt for the LLM endpoint and API key.
 
-    Returns ``(base_url, api_key)`` or ``None`` if cancelled / no dialog backend
-    is available. A blank base URL means the default OpenAI endpoint; a custom
-    URL (e.g. ``http://localhost:11434/v1``) targets a local server. A blank API
-    key falls back to the ``OPENAI_API_KEY`` environment variable.
+    Endpoint URLs are remembered locally and suggested with autocomplete as the
+    user types. API keys are **not** saved to disk.
     """
     try:
         import tkinter
-        from tkinter import simpledialog
+        from tkinter import ttk
     except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
         return None
 
+    from connect4_mcts.llm_settings import load_endpoints, suggest_endpoints
+
+    saved_endpoints = load_endpoints()
+    chosen: dict[str, tuple[str, str] | None] = {"value": None}
+
     try:
         root = tkinter.Tk()
-        root.withdraw()
-        try:
-            base_url = simpledialog.askstring(
-                "LLM endpoint",
-                "Base URL (blank = OpenAI; e.g. http://localhost:11434/v1 for a local server):",
-                parent=root,
-            )
-            if base_url is None:
-                return None
-            api_key = simpledialog.askstring(
-                "LLM API key",
-                "API key (blank = OK for local server; for OpenAI use your key or OPENAI_API_KEY):",
-                parent=root,
-                show="*",
-            )
-        finally:
+        root.title("LLM connection")
+        root.geometry("520x210")
+        root.resizable(False, False)
+
+        tkinter.Label(
+            root,
+            text="Base URL (blank = OpenAI; start typing to filter saved addresses):",
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(14, 4))
+
+        url_var = tkinter.StringVar(value=saved_endpoints[0] if saved_endpoints else "")
+        url_combo = ttk.Combobox(root, textvariable=url_var, values=saved_endpoints)
+        url_combo.pack(fill="x", padx=14)
+
+        def refresh_endpoint_suggestions(_event: object | None = None) -> None:
+            url_combo["values"] = suggest_endpoints(url_var.get())
+
+        url_combo.bind("<KeyRelease>", refresh_endpoint_suggestions)
+        url_combo.bind("<Button-1>", refresh_endpoint_suggestions)
+
+        tkinter.Label(
+            root,
+            text="API key (blank = OK for local server; for OpenAI use your key or OPENAI_API_KEY):",
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(12, 4))
+
+        api_key_var = tkinter.StringVar()
+        api_key_entry = tkinter.Entry(root, textvariable=api_key_var, show="*")
+        api_key_entry.pack(fill="x", padx=14)
+
+        def confirm() -> None:
+            chosen["value"] = (url_var.get().strip(), api_key_var.get().strip())
             root.destroy()
-        return base_url.strip(), (api_key or "").strip()
+
+        def cancel() -> None:
+            chosen["value"] = None
+            root.destroy()
+
+        buttons = tkinter.Frame(root)
+        buttons.pack(pady=16)
+        tkinter.Button(buttons, text="Connect", width=10, command=confirm).pack(side="left", padx=8)
+        tkinter.Button(buttons, text="Cancel", width=10, command=cancel).pack(side="left", padx=8)
+        root.protocol("WM_DELETE_WINDOW", cancel)
+        url_combo.focus_set()
+        root.mainloop()
+        return chosen["value"]
     except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
         return None
 
