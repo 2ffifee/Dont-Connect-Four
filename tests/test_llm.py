@@ -70,7 +70,7 @@ def test_turn_prompt_lists_legal_moves_and_board():
         assert f"{move.move_type.value} column {move.column}" in prompt
 
 
-def test_rules_briefing_uses_client_timeout():
+def test_rules_briefing_has_no_request_timeout():
     recorded: list[float | None | object] = []
 
     class _TimeoutRecordingClient(MockLLMClient):
@@ -81,7 +81,7 @@ def test_rules_briefing_uses_client_timeout():
     client = _TimeoutRecordingClient(responses=["ok"])
     player = LLMPlayer(client)
     player.send_rules_briefing(Player.YELLOW)
-    assert recorded == [_USE_CLIENT_TIMEOUT]
+    assert recorded == [None]
 
 
 def test_rules_briefing_asks_for_acknowledgment_not_a_move():
