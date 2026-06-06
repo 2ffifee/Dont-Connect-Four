@@ -33,12 +33,20 @@ from connect4_mcts.players.base import MoveSelectionError
 
 Message = dict[str, str]
 
+# Passed to :meth:`LLMClient.complete` to use the client's configured timeout.
+_USE_CLIENT_TIMEOUT = object()
+
 
 @runtime_checkable
 class LLMClient(Protocol):
     """Minimal chat interface: turn a message list into a text completion."""
 
-    def complete(self, messages: Sequence[Message]) -> str: ...
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        timeout: float | None | object = _USE_CLIENT_TIMEOUT,
+    ) -> str: ...
 
 
 _CELL_GLYPH = {None: ".", Player.RED: "R", Player.YELLOW: "Y"}
@@ -302,7 +310,7 @@ class LLMPlayer:
         self._conversation = [{"role": "system", "content": self.system_prompt}]
         briefing_user = {"role": "user", "content": render_rules_briefing(llm_player)}
         self.requests += 1
-        reply = self.client.complete(self._conversation + [briefing_user]) or ""
+        reply = self.client.complete(self._conversation + [briefing_user], timeout=None) or ""
         self._conversation.append(briefing_user)
         self._conversation.append({"role": "assistant", "content": reply})
         self.rules_acknowledged = True
@@ -408,7 +416,12 @@ class MockLLMClient:
         self._responder = responder
         self.calls: list[list[Message]] = []
 
-    def complete(self, messages: Sequence[Message]) -> str:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        timeout: float | None | object = _USE_CLIENT_TIMEOUT,
+    ) -> str:
         self.calls.append(list(messages))
         if self._responder is not None:
             return self._responder(messages)
@@ -496,22 +509,33 @@ class OpenAIClient:
         response = self._client.models.list()
         return sorted(model.id for model in response.data)
 
-    def complete(self, messages: Sequence[Message]) -> str:  # pragma: no cover - network
+    def complete(  # pragma: no cover - network
+        self,
+        messages: Sequence[Message],
+        *,
+        timeout: float | None | object = _USE_CLIENT_TIMEOUT,
+    ) -> str:
         params: dict[str, object] = {"model": self.model, "messages": list(messages)}
         if self.temperature is not None:
             params["temperature"] = self.temperature
         if self.max_tokens is not None:
             params["max_tokens"] = self.max_tokens
+        call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
 
         try:
-            response = self._client.chat.completions.create(timeout=self.timeout, **params)
+            response = self._create_completion(params, call_timeout)
         except Exception as exc:  # noqa: BLE001 - adapt to model-specific parameter rules
             adapted = self._adapt_params(params, exc)
             if adapted is None:
                 raise
-            response = self._client.chat.completions.create(timeout=self.timeout, **adapted)
+            response = self._create_completion(adapted, call_timeout)
 
         return response.choices[0].message.content or ""
+
+    def _create_completion(self, params: dict[str, object], timeout: float | None) -> object:
+        if timeout is None:
+            return self._client.chat.completions.create(**params)
+        return self._client.chat.completions.create(timeout=timeout, **params)
 
     @staticmethod
     def _adapt_params(params: dict[str, object], exc: Exception) -> dict[str, object] | None:

@@ -13,6 +13,7 @@ from connect4_mcts.players.llm import (
     DEFAULT_SYSTEM_PROMPT,
     LLMPlayer,
     OpenAIClient,
+    _USE_CLIENT_TIMEOUT,
     parse_move,
     render_turn,
     resolve_openai_credentials,
@@ -67,6 +68,20 @@ def test_turn_prompt_lists_legal_moves_and_board():
     assert "Legal moves:" in prompt
     for move in legal:
         assert f"{move.move_type.value} column {move.column}" in prompt
+
+
+def test_rules_briefing_has_no_request_timeout():
+    recorded: list[float | None | object] = []
+
+    class _TimeoutRecordingClient(MockLLMClient):
+        def complete(self, messages, *, timeout=_USE_CLIENT_TIMEOUT):
+            recorded.append(timeout)
+            return super().complete(messages, timeout=timeout)
+
+    client = _TimeoutRecordingClient(responses=["ok"])
+    player = LLMPlayer(client)
+    player.send_rules_briefing(Player.YELLOW)
+    assert recorded == [None]
 
 
 def test_rules_briefing_asks_for_acknowledgment_not_a_move():
