@@ -281,7 +281,7 @@ class MCTSPlayer:
         while True:
             node = self._node(state)
             path.append(state)
-            if state.status is GameStatus.FINISHED or not node.expanded:
+            if state.status is GameStatus.FINISHED or not node.expanded or not node.children:
                 break
             move = self._select_move(node)
             state = node.children[move]
@@ -289,9 +289,10 @@ class MCTSPlayer:
         node = self._node(state)
         if state.status is not GameStatus.FINISHED and node.visits > 0 and not node.expanded:
             self._expand(node, state)
-            move = self._select_move(node)
-            state = node.children[move]
-            path.append(state)
+            if node.children:
+                move = self._select_move(node)
+                state = node.children[move]
+                path.append(state)
 
         result, history = self._simulate(state)
 
@@ -353,6 +354,8 @@ class MCTSPlayer:
             if self.max_rollout_moves is not None and steps >= self.max_rollout_moves:
                 break
             legal_moves = sim.legal_moves()
+            if not legal_moves:
+                break
             chosen = self._rollout_move(sim, last_move, legal_moves)
             if self.rollout_policy == "lgr":
                 history.append((sim.current_player, last_move, chosen))

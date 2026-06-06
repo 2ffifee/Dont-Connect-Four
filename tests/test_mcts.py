@@ -10,6 +10,15 @@ def board_from_rows(*rows: str):
     return tuple(tuple(player_by_symbol[symbol] for symbol in row) for row in rows)
 
 
+def test_mcts_selfplay_completes_without_empty_rollout_moves() -> None:
+    player = MCTSPlayer(iterations=100, seed=1)
+    for game in range(30):
+        state = GameState.new(first_player=Player.RED if game % 2 == 0 else Player.YELLOW)
+        while state.status is not GameStatus.FINISHED:
+            move = player.sample_move(state, temperature=1.0)
+            state = state.apply_move(move)
+
+
 def test_mcts_player_returns_legal_move() -> None:
     state = GameState.new()
     player = MCTSPlayer(iterations=80, seed=1)

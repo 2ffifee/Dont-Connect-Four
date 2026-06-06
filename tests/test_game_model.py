@@ -264,6 +264,30 @@ def test_fair_turn_move_finishes_game_and_player_with_more_lines_loses() -> None
     assert finished.result.lines_for(Player.RED) == 1
 
 
+def test_fair_turn_equal_line_counts_on_full_board_finishes_game() -> None:
+    fair_turn = GameState(
+        board=board_from_rows(
+            "Y.YRYRYR",
+            "YYRRYYYY",
+            "RRRYRYRR",
+            "YYYRYYRR",
+            "YRRYRRYY",
+            "RRRYRRYR",
+        ),
+        current_player=Player.YELLOW,
+        first_player=Player.RED,
+        status=GameStatus.FAIR_TURN,
+    )
+
+    finished = fair_turn.apply_move(Move(MoveType.PUSH, 1))
+
+    assert finished.status is GameStatus.FINISHED
+    assert finished.legal_moves() == ()
+    assert finished.result is not None
+    assert finished.line_counts() == {Player.RED: 3, Player.YELLOW: 3}
+    assert finished.result.winner is Player.YELLOW
+
+
 def test_fair_turn_equal_line_counts_let_game_continue() -> None:
     state = GameState(
         board=board_from_rows(

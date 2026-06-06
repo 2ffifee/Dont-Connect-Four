@@ -244,6 +244,8 @@ class GameState:
         if self.status is GameStatus.FAIR_TURN:
             counts = _line_counts(board)
             if counts[Player.RED] == counts[Player.YELLOW]:
+                if _is_board_full(board):
+                    return GameStatus.FINISHED, GameResult.from_board(board)
                 return GameStatus.ONGOING, None
             return GameStatus.FINISHED, GameResult.from_board(board)
 
