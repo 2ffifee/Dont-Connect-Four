@@ -22,6 +22,7 @@ prompt deliberately and repeatedly stresses that, since LLMs carry a very strong
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
@@ -34,8 +35,24 @@ from connect4_mcts.players.base import MoveSelectionError
 
 Message = dict[str, str]
 
+logger = logging.getLogger(__name__)
+
 # Passed to :meth:`LLMClient.complete` to use the client's configured timeout.
 _USE_CLIENT_TIMEOUT = object()
+
+
+def llm_debug_enabled() -> bool:
+    """Return whether verbose LLM request/response logging is enabled."""
+    return os.environ.get("CONNECT4_LLM_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
+
+def _log_llm_debug(message: str, *args: object) -> None:
+    if llm_debug_enabled():
+        logger.info("[llm] " + message, *args)
+
+
+def _log_llm_warning(message: str, *args: object) -> None:
+    logger.warning("[llm] " + message, *args)
 
 
 @runtime_checkable
@@ -365,9 +382,17 @@ class LLMPlayer:
         self.last_reply = reply
         client_thinking = getattr(self.client, "last_thinking", None)
         thinking, remainder = extract_thinking(reply)
-        if client_thinking or thinking:
-            self.last_thinking = client_thinking or thinking
-        return remainder or reply
+        self.last_thinking = client_thinking or thinking or self.last_thinking
+        move_text = remainder or reply
+        _log_llm_debug(
+            "reply len=%d thinking_len=%s move_text_len=%d parseable=%s debug=%s",
+            len(reply),
+            len(self.last_thinking) if self.last_thinking else None,
+            len(move_text),
+            parse_move(move_text) is not None,
+            getattr(self.client, "last_completion_debug", None),
+        )
+        return move_text
 
     def begin_new_game(self) -> None:
         """Start a new game: drop in-game conversation history."""
@@ -527,13 +552,40 @@ def gemini_supports_visible_thoughts(model: str) -> bool:
 
 
 def _gemini_thinking_extra_body() -> dict[str, object]:
+    """Build ``extra_body`` for the OpenAI Python SDK against Gemini.
+
+    The SDK merges the ``extra_body`` argument into the HTTP JSON body. Gemini
+    expects a nested ``extra_body.google.thinking_config`` object, so we wrap
+    the Google fields one level down (see Gemini OpenAI compatibility docs).
+    """
     return {
-        "google": {
-            "thinking_config": {
-                "include_thoughts": True,
+        "extra_body": {
+            "google": {
+                "thinking_config": {
+                    "include_thoughts": True,
+                }
             }
         }
     }
+
+
+def _gemini_thinking_config(params: dict[str, object]) -> dict[str, object] | None:
+    extra_body = params.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return None
+    google = extra_body.get("google")
+    if isinstance(google, dict):
+        thinking = google.get("thinking_config")
+        if isinstance(thinking, dict):
+            return thinking
+    nested = extra_body.get("extra_body")
+    if isinstance(nested, dict):
+        google = nested.get("google")
+        if isinstance(google, dict):
+            thinking = google.get("thinking_config")
+            if isinstance(thinking, dict):
+                return thinking
+    return None
 
 LLMProvider = Literal["openai", "gemini", "openai_compatible"]
 
@@ -647,6 +699,18 @@ class OpenAIClient:
         self.base_url = resolved_base
         self._client = OpenAI(api_key=resolved_key, base_url=resolved_base)
         self.last_thinking: str | None = None
+        self.last_completion_debug: str | None = None
+
+    def _set_completion_debug(self, summary: str) -> None:
+        self.last_completion_debug = summary
+        _log_llm_debug("%s", summary)
+
+    @staticmethod
+    def _summarize_params(params: dict[str, object]) -> str:
+        keys = sorted(params.keys())
+        mode = "stream" if params.get("stream") else "blocking"
+        thinking = "yes" if _gemini_thinking_config(params) else "no"
+        return f"mode={mode} keys={keys} gemini_thinking={thinking}"
 
     def list_models(self) -> list[str]:  # pragma: no cover - network
         """Return the sorted model ids exposed by the endpoint.
@@ -668,25 +732,54 @@ class OpenAIClient:
         call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
         param_variants = self._completion_param_variants(params)
         errors: list[Exception] = []
+        # Gemini's OpenAI-compatible streaming is unreliable (empty/hanging chunks).
+        # Prefer a single blocking response; CoT is shown after the full reply arrives.
+        use_streaming = on_thinking_update is not None and self.provider != "gemini"
 
-        if on_thinking_update is not None:
-            for variant in param_variants:
+        _log_llm_debug(
+            "complete provider=%s model=%s variants=%d streaming=%s timeout=%s",
+            self.provider,
+            self.model,
+            len(param_variants),
+            use_streaming,
+            call_timeout,
+        )
+
+        if use_streaming:
+            for index, variant in enumerate(param_variants):
+                summary = self._summarize_params(variant)
                 try:
                     content = self._complete_streaming(variant, call_timeout, on_thinking_update)
                 except Exception as exc:  # noqa: BLE001 - fall back to blocking completion
                     errors.append(exc)
+                    _log_llm_warning("streaming failed (%s): %s", summary, exc)
                     continue
+                self._set_completion_debug(
+                    f"{summary} variant={index} content_len={len(content)} thinking={'yes' if self.last_thinking else 'no'}"
+                )
                 if content.strip():
                     return content
+                _log_llm_warning("streaming returned empty content (%s)", summary)
 
-        for variant in param_variants:
+        for index, variant in enumerate(param_variants):
+            summary = self._summarize_params(variant)
             try:
-                return self._complete_blocking(variant, call_timeout, on_thinking_update)
+                content = self._complete_blocking(variant, call_timeout, on_thinking_update)
             except Exception as exc:  # noqa: BLE001 - try next param variant
                 errors.append(exc)
+                _log_llm_warning("blocking failed (%s): %s", summary, exc)
+                continue
+            self._set_completion_debug(
+                f"{summary} variant={index} content_len={len(content)} thinking={'yes' if self.last_thinking else 'no'}"
+            )
+            if content.strip():
+                return content
+            _log_llm_warning("blocking returned empty content (%s)", summary)
 
         if errors:
+            self._set_completion_debug(f"failed after {len(errors)} error(s): {errors[-1]}")
             raise errors[-1]
+        self._set_completion_debug("failed: all variants returned empty content")
         return ""
 
     def _build_completion_params(self, messages: Sequence[Message]) -> dict[str, object]:
@@ -705,11 +798,7 @@ class OpenAIClient:
 
     @staticmethod
     def _has_gemini_thinking(params: dict[str, object]) -> bool:
-        extra_body = params.get("extra_body")
-        if not isinstance(extra_body, dict):
-            return False
-        google = extra_body.get("google")
-        return isinstance(google, dict) and "thinking_config" in google
+        return _gemini_thinking_config(params) is not None
 
     @staticmethod
     def _without_gemini_thinking(params: dict[str, object]) -> dict[str, object]:
@@ -786,6 +875,13 @@ class OpenAIClient:
     ) -> str:
         content = message.content or ""
         reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+        if llm_debug_enabled():
+            attrs = {
+                name: getattr(message, name)
+                for name in ("content", "reasoning_content", "reasoning", "role", "refusal")
+                if getattr(message, name, None)
+            }
+            _log_llm_debug("message fields: %s", attrs)
         if reasoning:
             thinking = str(reasoning).strip() or None
             self.last_thinking = thinking

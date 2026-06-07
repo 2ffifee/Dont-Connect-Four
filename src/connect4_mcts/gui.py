@@ -318,6 +318,13 @@ class GuiConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from connect4_mcts.players.llm import llm_debug_enabled
+
+    if llm_debug_enabled():
+        import logging
+
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
     parser = argparse.ArgumentParser(description="Play Don't Connect 4 against an agent.")
     parser.add_argument("--seed", type=int, default=None, help="Seed for the random player.")
     parser.add_argument("--human", choices=("red", "yellow"), default="red", help="Human player color.")
@@ -520,19 +527,19 @@ class HumanVsAgentGui:
             return
 
         if kind == "briefing_error":
-            self.message = f"LLM rules briefing failed ({_short_error(payload)})"
+            self.message = f"LLM rules briefing failed ({_llm_error_detail(payload, self.agent)})"
             return
 
         if kind == "error":
             exc = payload
             legal_moves = self.state.legal_moves()
             if not legal_moves:
-                self.message = f"Agent error ({_short_error(exc)})"
+                self.message = f"Agent error ({_llm_error_detail(exc, self.agent)})"
                 return
             move = random.choice(legal_moves)
             self.state = self.state.apply_move(move)
             name = self._opponent_label()
-            self.message = f"{name} error ({_short_error(exc)}) - played random {format_move(move)}"
+            self.message = f"{name} error ({_llm_error_detail(exc, self.agent)}) - played random {format_move(move)}"
             self._maybe_schedule_agent_turn()
             return
 
@@ -1325,6 +1332,15 @@ def _short_error(exc: Exception, max_length: int = 200) -> str:
     text = str(exc).strip() or exc.__class__.__name__
     if len(text) > max_length:
         text = text[: max_length - 3] + "..."
+    return text
+
+
+def _llm_error_detail(exc: Exception, agent: Agent) -> str:
+    text = _short_error(exc)
+    client = getattr(agent, "client", None)
+    debug = getattr(client, "last_completion_debug", None)
+    if debug:
+        return f"{text} | {debug}"
     return text
 
 
