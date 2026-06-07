@@ -725,12 +725,18 @@ class HumanVsAgentGui:
         base_url, api_key = connection
 
         try:
-            from connect4_mcts.players.llm import OpenAIClient, create_llm_player
+            from connect4_mcts.players.llm import OpenAIClient, create_llm_player, detect_llm_provider
         except ImportError:
             self._notify_llm(False, "Install 'openai' to play vs LLM (pip install openai)")
             return
 
-        endpoint = base_url or "OpenAI (default endpoint)"
+        provider = detect_llm_provider(base_url)
+        if provider == "gemini":
+            endpoint = "Google Gemini"
+        elif base_url:
+            endpoint = base_url
+        else:
+            endpoint = "OpenAI (default endpoint)"
         self.message = f"Connecting to {endpoint}..."
         self._refresh_display()
 
@@ -747,18 +753,18 @@ class HumanVsAgentGui:
 
         self._notify_llm(True, f"Connected to {endpoint}.\n{len(models)} model(s) available.")
 
-        model = _prompt_model_choice(_chat_models_first(models))
+        model = _prompt_model_choice(_chat_models_first(models, base_url=base_url or client.base_url))
         if not model:
             self.message = "LLM model selection cancelled"
             return
 
         self.config.llm_model = model
-        self.config.llm_base_url = base_url or None
+        self.config.llm_base_url = client.base_url
         self.config.llm_api_key = api_key or None
         self.config.llm_agent = create_llm_player(
             model,
             api_key=api_key or None,
-            base_url=base_url or None,
+            base_url=client.base_url,
             seed=self.config.seed,
         )
         from connect4_mcts.llm_settings import remember_endpoint
@@ -1261,10 +1267,24 @@ def _notify(success: bool, title: str, message: str) -> None:
 
 
 _CHAT_MODEL_PREFIXES = ("gpt-", "gpt", "o1", "o3", "o4", "chatgpt")
+_GEMINI_MODEL_PREFIXES = ("gemini-",)
 
 
-def _chat_models_first(models: Sequence[str]) -> list[str]:
+def _chat_models_first(models: Sequence[str], *, base_url: str | None = None) -> list[str]:
     """Surface likely chat models first; keep the rest available below them."""
+    try:
+        from connect4_mcts.players.llm import detect_llm_provider
+
+        provider = detect_llm_provider(base_url)
+    except Exception:  # noqa: BLE001 - GUI should stay usable if import fails
+        provider = "openai"
+
+    if provider == "gemini":
+        preferred = [model for model in models if model.lower().startswith(_GEMINI_MODEL_PREFIXES)]
+        if preferred:
+            others = [model for model in models if model not in set(preferred)]
+            return preferred + others
+
     chat = [model for model in models if model.lower().startswith(_CHAT_MODEL_PREFIXES)]
     if not chat:
         return list(models)

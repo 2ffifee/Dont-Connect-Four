@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 _DEFAULT_ENDPOINTS = (
+    "https://generativelanguage.googleapis.com/v1beta/openai/",
     "http://localhost:11434/v1",
     "http://localhost:1234/v1",
     "http://127.0.0.1:11434/v1",

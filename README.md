@@ -351,8 +351,10 @@ dziala wszedzie tam, gdzie inni gracze (`play_game`, eksperymenty). Model jest
 osiagany przez maly protokol `LLMClient`, dzieki czemu gracz jest niezalezny od
 dostawcy:
 
-- `OpenAIClient` - dowolny endpoint zgodny z API OpenAI (OpenAI lub lokalny
-  serwer; wybor przez `base_url`); wymaga pakietu `openai` (`pip install '.[llm]'`).
+- `OpenAIClient` - dowolny endpoint zgodny z API OpenAI (OpenAI, Google Gemini
+  przez URL `generativelanguage.googleapis.com`, lub lokalny serwer; wybor przez
+  `base_url`; typ providera wnioskuje sie z adresu); wymaga pakietu `openai`
+  (`pip install '.[llm]'`).
 - `MockLLMClient` - deterministyczny klient offline do testow/demonstracji.
 
 ```python

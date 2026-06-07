@@ -9,8 +9,9 @@ feedback before falling back to a random legal move.
 The model is reached through a small :class:`LLMClient` protocol so the player
 is provider-agnostic:
 
-* :class:`OpenAIClient` - any OpenAI-compatible chat endpoint (OpenAI itself or
-  a local server exposing the same API), selected via ``base_url``.
+* :class:`OpenAIClient` - any OpenAI-compatible chat endpoint (OpenAI itself,
+  Google Gemini via ``generativelanguage.googleapis.com``, or a local server),
+  selected via ``base_url`` (provider is inferred from the URL).
 * :class:`MockLLMClient` - deterministic, offline client for tests/demos.
 
 Because the objective here is *inverted* (forming a four-in-a-row is bad), the
@@ -25,7 +26,7 @@ import os
 import random
 import re
 from collections.abc import Callable, Sequence
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from connect4_mcts.game import COLUMNS, ROWS, GameState, Move, MoveType, Player
 from connect4_mcts.players.base import MoveSelectionError
@@ -247,9 +248,29 @@ def create_llm_player(
 ) -> LLMPlayer:
     """Build a fresh :class:`LLMPlayer` for a single game session."""
     return LLMPlayer(
-        OpenAIClient(model=model, api_key=api_key, base_url=base_url, timeout=timeout),
+        create_llm_client(model=model, api_key=api_key, base_url=base_url, timeout=timeout),
         model_label=model,
         seed=seed,
+    )
+
+
+def create_llm_client(
+    model: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    timeout: float = 300.0,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> OpenAIClient:
+    """Build an LLM HTTP client, inferring the provider from ``base_url``."""
+    return OpenAIClient(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
 
 
@@ -491,20 +512,54 @@ class MockLLMClient:
 
 
 _LOCAL_API_KEY_PLACEHOLDER = "ollama"
+_GOOGLE_GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+LLMProvider = Literal["openai", "gemini", "openai_compatible"]
 
 
-def resolve_openai_credentials(
+def detect_llm_provider(base_url: str | None) -> LLMProvider:
+    """Infer the backend type from a user-supplied endpoint URL."""
+    text = (base_url or "").strip().lower()
+    if not text:
+        return "openai"
+    if "generativelanguage.googleapis.com" in text:
+        return "gemini"
+    return "openai_compatible"
+
+
+def normalize_llm_endpoint(
+    base_url: str | None,
+    *,
+    provider: LLMProvider | None = None,
+) -> str | None:
+    """Return a canonical endpoint URL for the inferred provider."""
+    text = (base_url or "").strip()
+    provider = provider or detect_llm_provider(text or None)
+    if provider == "gemini":
+        return _GOOGLE_GEMINI_OPENAI_BASE
+    return text or None
+
+
+def resolve_llm_credentials(
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> tuple[str, str | None]:
-    """Resolve credentials for an OpenAI-compatible client.
+    """Resolve API key and normalized endpoint for OpenAI, Gemini, or local servers."""
+    provider = detect_llm_provider(base_url)
+    resolved_base = normalize_llm_endpoint(base_url, provider=provider)
 
-    The official ``openai`` Python package refuses to connect without *any*
-    ``api_key``, even when the target server (Ollama, LM Studio, vLLM) does not
-    validate keys. For custom ``base_url`` endpoints we therefore supply a
-    harmless placeholder when no key was given.
-    """
-    resolved_base = (base_url or os.environ.get("OPENAI_BASE_URL") or "").strip() or None
+    if provider == "gemini":
+        resolved_key = (
+            api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+        ).strip()
+        if not resolved_key:
+            raise ValueError(
+                "API key required for Google Gemini. Enter a key in the dialog or set GEMINI_API_KEY."
+            )
+        return resolved_key, resolved_base
+
+    env_base = (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
+    resolved_base = resolved_base or env_base
     resolved_key = (api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
 
     if not resolved_key:
@@ -518,12 +573,24 @@ def resolve_openai_credentials(
     return resolved_key, resolved_base
 
 
+def resolve_openai_credentials(
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> tuple[str, str | None]:
+    """Backward-compatible alias for :func:`resolve_llm_credentials`."""
+    return resolve_llm_credentials(api_key, base_url)
+
+
 class OpenAIClient:
-    """Client for any OpenAI-compatible chat-completions endpoint.
+    """Client for OpenAI-compatible chat-completions endpoints.
+
+    Works with OpenAI itself, Google Gemini (when ``base_url`` points at
+    ``generativelanguage.googleapis.com``), and local OpenAI-compatible servers.
+    The provider is inferred automatically from ``base_url``.
 
     Requires the optional ``openai`` package. ``api_key`` and ``base_url`` fall
-    back to the ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` environment variables,
-    so the same client works against OpenAI or a local compatible server.
+    back to provider-specific environment variables, so the same client works
+    against OpenAI, Gemini, or a local compatible server.
     """
 
     def __init__(
@@ -554,7 +621,9 @@ class OpenAIClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
-        resolved_key, resolved_base = resolve_openai_credentials(api_key, base_url)
+        self.provider = detect_llm_provider(base_url)
+        resolved_key, resolved_base = resolve_llm_credentials(api_key, base_url)
+        self.base_url = resolved_base
         self._client = OpenAI(api_key=resolved_key, base_url=resolved_base)
         self.last_thinking: str | None = None
 

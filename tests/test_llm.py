@@ -14,10 +14,13 @@ from connect4_mcts.players.llm import (
     LLMPlayer,
     OpenAIClient,
     _USE_CLIENT_TIMEOUT,
+    detect_llm_provider,
     extract_thinking,
+    normalize_llm_endpoint,
     parse_move,
     render_rules_briefing,
     render_turn,
+    resolve_llm_credentials,
     resolve_openai_credentials,
 )
 from connect4_mcts.runner import play_game
@@ -355,9 +358,73 @@ def test_resolve_credentials_keeps_explicit_key():
 def test_resolve_credentials_requires_key_for_default_openai_endpoint(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
     with pytest.raises(ValueError, match="API key required"):
         resolve_openai_credentials(api_key="", base_url="")
+
+
+def test_detect_gemini_provider_from_url() -> None:
+    assert detect_llm_provider("") == "openai"
+    assert detect_llm_provider("https://generativelanguage.googleapis.com/v1beta/openai/") == "gemini"
+    assert detect_llm_provider("generativelanguage.googleapis.com/v1beta") == "gemini"
+    assert detect_llm_provider("http://localhost:11434/v1") == "openai_compatible"
+
+
+def test_normalize_gemini_endpoint_uses_openai_compat_base() -> None:
+    assert (
+        normalize_llm_endpoint("https://generativelanguage.googleapis.com/v1beta/")
+        == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
+    assert normalize_llm_endpoint("http://localhost:11434/v1") == "http://localhost:11434/v1"
+
+
+def test_resolve_credentials_uses_gemini_env_key(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    key, base = resolve_llm_credentials(
+        api_key="",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+
+    assert key == "gemini-test-key"
+    assert base == "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+def test_resolve_credentials_requires_gemini_key_without_env(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="Google Gemini"):
+        resolve_llm_credentials(
+            api_key="",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+
+
+def test_openai_client_normalizes_gemini_base_url(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None) -> None:
+            created["api_key"] = api_key
+            created["base_url"] = base_url
+
+    fake_openai = type("openai", (), {"OpenAI": FakeOpenAI})
+    monkeypatch.setitem(__import__("sys").modules, "openai", fake_openai)
+
+    client = OpenAIClient(
+        model="gemini-2.0-flash",
+        api_key="test-key",
+        base_url="https://generativelanguage.googleapis.com/v1beta/",
+    )
+
+    assert client.provider == "gemini"
+    assert client.base_url == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert created["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert created["api_key"] == "test-key"
 
 
 def test_adapt_params_swaps_max_tokens_for_reasoning_models():
