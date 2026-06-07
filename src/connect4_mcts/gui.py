@@ -732,18 +732,13 @@ class HumanVsAgentGui:
         base_url, api_key = connection
 
         try:
-            from connect4_mcts.players.llm import OpenAIClient, create_llm_player, detect_llm_provider
+            from connect4_mcts.players.llm import OpenAIClient, create_llm_player
+            from connect4_mcts.llm_settings import endpoint_provider_label, remember_endpoint
         except ImportError:
             self._notify_llm(False, "Install 'openai' to play vs LLM (pip install openai)")
             return
 
-        provider = detect_llm_provider(base_url)
-        if provider == "gemini":
-            endpoint = "Google Gemini"
-        elif base_url:
-            endpoint = base_url
-        else:
-            endpoint = "OpenAI (default endpoint)"
+        endpoint = endpoint_provider_label(base_url)
         self.message = f"Connecting to {endpoint}..."
         self._refresh_display()
 
@@ -774,7 +769,6 @@ class HumanVsAgentGui:
             base_url=client.base_url,
             seed=self.config.seed,
         )
-        from connect4_mcts.llm_settings import remember_endpoint
 
         remember_endpoint(base_url)
         self.config.llm_label = f"LLM: {model}"
@@ -1154,25 +1148,35 @@ def _prompt_llm_connection() -> tuple[str, str] | None:
     except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
         return None
 
-    from connect4_mcts.llm_settings import load_endpoints, suggest_endpoints
+    from connect4_mcts.llm_settings import (
+        api_key_hint,
+        display_for_url,
+        endpoint_dropdown_values,
+        load_endpoints,
+        resolve_endpoint_input,
+        suggest_endpoints,
+    )
 
     saved_endpoints = load_endpoints()
+    dropdown_values = endpoint_dropdown_values()
+    initial_url = saved_endpoints[0] if saved_endpoints else ""
+    initial_display = display_for_url(initial_url)
     chosen: dict[str, tuple[str, str] | None] = {"value": None}
 
     try:
         root = tkinter.Tk()
         root.title("LLM connection")
-        root.geometry("520x210")
+        root.geometry("620x250")
         root.resizable(False, False)
 
         tkinter.Label(
             root,
-            text="Base URL (blank = OpenAI; start typing to filter saved addresses):",
+            text="API provider (pick a preset or type a custom OpenAI-compatible base URL):",
             anchor="w",
         ).pack(fill="x", padx=14, pady=(14, 4))
 
-        url_var = tkinter.StringVar(value=saved_endpoints[0] if saved_endpoints else "")
-        url_combo = ttk.Combobox(root, textvariable=url_var, values=saved_endpoints)
+        url_var = tkinter.StringVar(value=initial_display if initial_display in dropdown_values else initial_url)
+        url_combo = ttk.Combobox(root, textvariable=url_var, values=dropdown_values)
         url_combo.pack(fill="x", padx=14)
 
         def refresh_endpoint_suggestions(_event: object | None = None) -> None:
@@ -1181,18 +1185,22 @@ def _prompt_llm_connection() -> tuple[str, str] | None:
         url_combo.bind("<KeyRelease>", refresh_endpoint_suggestions)
         url_combo.bind("<Button-1>", refresh_endpoint_suggestions)
 
-        tkinter.Label(
-            root,
-            text="API key (blank = OK for local server; for OpenAI use your key or OPENAI_API_KEY):",
-            anchor="w",
-        ).pack(fill="x", padx=14, pady=(12, 4))
+        api_key_label = tkinter.Label(root, text=api_key_hint(resolve_endpoint_input(url_var.get())), anchor="w")
+
+        def refresh_api_key_hint(_event: object | None = None) -> None:
+            api_key_label.config(text=api_key_hint(resolve_endpoint_input(url_var.get())))
+
+        url_combo.bind("<<ComboboxSelected>>", refresh_api_key_hint)
+        url_combo.bind("<KeyRelease>", refresh_api_key_hint, add="+")
+
+        api_key_label.pack(fill="x", padx=14, pady=(12, 4))
 
         api_key_var = tkinter.StringVar()
         api_key_entry = tkinter.Entry(root, textvariable=api_key_var, show="*")
         api_key_entry.pack(fill="x", padx=14)
 
         def confirm() -> None:
-            chosen["value"] = (url_var.get().strip(), api_key_var.get().strip())
+            chosen["value"] = (resolve_endpoint_input(url_var.get()), api_key_var.get().strip())
             root.destroy()
 
         def cancel() -> None:
@@ -1274,29 +1282,20 @@ def _notify(success: bool, title: str, message: str) -> None:
 
 
 _CHAT_MODEL_PREFIXES = ("gpt-", "gpt", "o1", "o3", "o4", "chatgpt")
-_GEMINI_MODEL_PREFIXES = ("gemini-",)
 
 
 def _chat_models_first(models: Sequence[str], *, base_url: str | None = None) -> list[str]:
     """Surface likely chat models first; keep the rest available below them."""
     try:
-        from connect4_mcts.players.llm import detect_llm_provider
+        from connect4_mcts.llm_settings import prefer_models_for_endpoint
 
-        provider = detect_llm_provider(base_url)
+        return prefer_models_for_endpoint(base_url, list(models))
     except Exception:  # noqa: BLE001 - GUI should stay usable if import fails
-        provider = "openai"
-
-    if provider == "gemini":
-        preferred = [model for model in models if model.lower().startswith(_GEMINI_MODEL_PREFIXES)]
-        if preferred:
-            others = [model for model in models if model not in set(preferred)]
-            return preferred + others
-
-    chat = [model for model in models if model.lower().startswith(_CHAT_MODEL_PREFIXES)]
-    if not chat:
-        return list(models)
-    others = [model for model in models if model not in set(chat)]
-    return chat + others
+        chat = [model for model in models if model.lower().startswith(_CHAT_MODEL_PREFIXES)]
+        if not chat:
+            return list(models)
+        others = [model for model in models if model not in set(chat)]
+        return chat + others
 
 
 def _wrap_text_preserve_newlines(text: str, font: pygame.font.Font, max_width: int) -> list[str]:

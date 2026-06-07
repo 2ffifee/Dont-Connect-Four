@@ -190,7 +190,82 @@ _THINKING_TAG_PATTERNS = (
     re.compile(r"<\s*thought\s*>(.*?)\s*<\s*/\s*thought\s*>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<\s*redacted_thinking\s*>(.*?)\s*<\s*/\s*redacted_thinking\s*>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<\s*thinking\s*>(.*?)\s*<\s*/\s*thinking\s*>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\s*reasoning\s*>(.*?)\s*<\s*/\s*reasoning\s*>", re.DOTALL | re.IGNORECASE),
 )
+
+_STRUCTURED_REASONING_MODEL_MARKERS = (
+    "o1-",
+    "o1/",
+    "/o1",
+    "o3-",
+    "o3/",
+    "/o3",
+    "o4-",
+    "o4/",
+    "/o4",
+    "deepseek-r",
+    "deepseek-reasoner",
+    "deepseek-reason",
+    "qwen3",
+    "qwq",
+    ":thinking",
+    "/thinking",
+    "thinking-",
+    "-thinking",
+    "/r1",
+    "r1-",
+    "reasoner",
+    "gpt-5",
+)
+
+
+def uses_structured_reasoning(model: str) -> bool:
+    """Return whether a model likely exposes CoT via API reasoning fields."""
+    name = model.lower().removeprefix("models/")
+    return any(marker in name for marker in _STRUCTURED_REASONING_MODEL_MARKERS)
+
+
+def prefers_blocking_completion(base_url: str | None, model: str) -> bool:
+    """Return whether to skip streaming and wait for one full response.
+
+    Local servers and providers/models with structured reasoning fields are
+    handled in blocking mode. CoT is still published once the full reply is
+    available (live streaming is optional and mainly used for cloud tag-based
+    output).
+    """
+    from connect4_mcts.llm_settings import is_local_endpoint, match_endpoint_preset
+
+    preset = match_endpoint_preset(base_url)
+    if preset.provider_id == "gemini":
+        return True
+    if preset.local or is_local_endpoint(base_url):
+        return True
+    return uses_structured_reasoning(model)
+
+
+def _read_reasoning_from_part(part: object) -> str | None:
+    """Extract chain-of-thought text from a message or stream delta object."""
+    for attr in ("reasoning_content", "reasoning", "thinking"):
+        value = getattr(part, attr, None)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+
+    model_dump = getattr(part, "model_dump", None)
+    if callable(model_dump):
+        try:
+            data = model_dump()
+        except Exception:  # noqa: BLE001 - best-effort introspection only
+            data = None
+        if isinstance(data, dict):
+            for key in ("reasoning_content", "reasoning", "thinking"):
+                value = data.get(key)
+                if value:
+                    text = str(value).strip()
+                    if text:
+                        return text
+    return None
 
 
 def extract_thinking(text: str) -> tuple[str | None, str]:
@@ -198,12 +273,20 @@ def extract_thinking(text: str) -> tuple[str | None, str]:
     if not text:
         return None, ""
 
+    thinking_parts: list[str] = []
+    remainder = text
     for pattern in _THINKING_TAG_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            thinking = match.group(1).strip()
-            remainder = pattern.sub("", text, count=1).strip()
-            return (thinking or None), remainder
+        while True:
+            match = pattern.search(remainder)
+            if not match:
+                break
+            segment = match.group(1).strip()
+            if segment:
+                thinking_parts.append(segment)
+            remainder = pattern.sub("", remainder, count=1).strip()
+
+    if thinking_parts:
+        return "\n\n".join(thinking_parts), remainder
 
     json_start = re.search(r'\{[^{}]*"move_type"', text, re.DOTALL)
     if json_start and json_start.start() > 0:
@@ -382,7 +465,10 @@ class LLMPlayer:
         self.last_reply = reply
         client_thinking = getattr(self.client, "last_thinking", None)
         thinking, remainder = extract_thinking(reply)
-        self.last_thinking = client_thinking or thinking or self.last_thinking
+        merged_thinking = client_thinking or thinking
+        if merged_thinking and thinking and client_thinking and thinking not in client_thinking:
+            merged_thinking = f"{client_thinking.strip()}\n\n{thinking.strip()}".strip()
+        self.last_thinking = merged_thinking or self.last_thinking
         move_text = remainder or reply
         _log_llm_debug(
             "reply len=%d thinking_len=%s move_text_len=%d parseable=%s debug=%s",
@@ -592,11 +678,15 @@ LLMProvider = Literal["openai", "gemini", "openai_compatible"]
 
 def detect_llm_provider(base_url: str | None) -> LLMProvider:
     """Infer the backend type from a user-supplied endpoint URL."""
-    text = (base_url or "").strip().lower()
-    if not text:
-        return "openai"
-    if "generativelanguage.googleapis.com" in text:
+    from connect4_mcts.llm_settings import match_endpoint_preset
+
+    preset = match_endpoint_preset(base_url)
+    if preset.provider_id == "gemini":
         return "gemini"
+    if preset.provider_id == "openai" and not (base_url or "").strip():
+        return "openai"
+    if preset.provider_id == "openai":
+        return "openai_compatible"
     return "openai_compatible"
 
 
@@ -617,33 +707,41 @@ def resolve_llm_credentials(
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> tuple[str, str | None]:
-    """Resolve API key and normalized endpoint for OpenAI, Gemini, or local servers."""
+    """Resolve API key and normalized endpoint for supported providers."""
+    from connect4_mcts.llm_settings import is_local_endpoint, match_endpoint_preset
+
+    preset = match_endpoint_preset(base_url)
     provider = detect_llm_provider(base_url)
     resolved_base = normalize_llm_endpoint(base_url, provider=provider)
+    if not resolved_base and preset.provider_id == "openai":
+        resolved_base = (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
 
-    if provider == "gemini":
-        resolved_key = (
-            api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-        ).strip()
-        if not resolved_key:
-            raise ValueError(
-                "API key required for Google Gemini. Enter a key in the dialog or set GEMINI_API_KEY."
-            )
+    resolved_key = (api_key or "").strip()
+    if not resolved_key:
+        for env_name in preset.env_keys:
+            resolved_key = os.environ.get(env_name, "").strip()
+            if resolved_key:
+                break
+
+    if resolved_key:
         return resolved_key, resolved_base
 
-    env_base = (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
-    resolved_base = resolved_base or env_base
-    resolved_key = (api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
+    if preset.local or is_local_endpoint(resolved_base):
+        return _LOCAL_API_KEY_PLACEHOLDER, resolved_base
 
-    if not resolved_key:
-        if resolved_base is not None:
-            resolved_key = _LOCAL_API_KEY_PLACEHOLDER
-        else:
-            raise ValueError(
-                "API key required for OpenAI. Enter a key in the dialog or set OPENAI_API_KEY."
-            )
-
-    return resolved_key, resolved_base
+    env_hint = preset.env_keys[0] if preset.env_keys else "OPENAI_API_KEY"
+    if preset.provider_id == "openai" and not resolved_base:
+        raise ValueError(
+            "API key required for OpenAI. Enter a key in the dialog or set OPENAI_API_KEY."
+        )
+    if preset.provider_id == "gemini":
+        raise ValueError(
+            "API key required for Google Gemini. Enter a key in the dialog or set "
+            "GEMINI_API_KEY (or GOOGLE_API_KEY)."
+        )
+    raise ValueError(
+        f"API key required for {preset.label}. Enter a key in the dialog or set {env_hint}."
+    )
 
 
 def resolve_openai_credentials(
@@ -697,7 +795,14 @@ class OpenAIClient:
         self.provider = detect_llm_provider(base_url)
         resolved_key, resolved_base = resolve_llm_credentials(api_key, base_url)
         self.base_url = resolved_base
-        self._client = OpenAI(api_key=resolved_key, base_url=resolved_base)
+        from connect4_mcts.llm_settings import match_endpoint_preset, provider_default_headers
+
+        self.endpoint_preset = match_endpoint_preset(resolved_base)
+        default_headers = provider_default_headers(resolved_base)
+        client_kwargs: dict[str, object] = {"api_key": resolved_key, "base_url": resolved_base}
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+        self._client = OpenAI(**client_kwargs)
         self.last_thinking: str | None = None
         self.last_completion_debug: str | None = None
 
@@ -732,16 +837,18 @@ class OpenAIClient:
         call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
         param_variants = self._completion_param_variants(params)
         errors: list[Exception] = []
-        # Gemini's OpenAI-compatible streaming is unreliable (empty/hanging chunks).
-        # Prefer a single blocking response; CoT is shown after the full reply arrives.
-        use_streaming = on_thinking_update is not None and self.provider != "gemini"
+        use_streaming = (
+            on_thinking_update is not None
+            and not prefers_blocking_completion(self.base_url, self.model)
+        )
 
         _log_llm_debug(
-            "complete provider=%s model=%s variants=%d streaming=%s timeout=%s",
+            "complete provider=%s model=%s variants=%d streaming=%s blocking_reason=%s timeout=%s",
             self.provider,
             self.model,
             len(param_variants),
             use_streaming,
+            prefers_blocking_completion(self.base_url, self.model),
             call_timeout,
         )
 
@@ -822,6 +929,17 @@ class OpenAIClient:
 
         return self._finalize_message(response.choices[0].message, on_thinking_update)
 
+    def _publish_thinking(
+        self,
+        thinking: str | None,
+        on_thinking_update: Callable[[str], None] | None,
+    ) -> None:
+        if not thinking:
+            return
+        self.last_thinking = thinking
+        if on_thinking_update is not None:
+            on_thinking_update(thinking)
+
     def _complete_streaming(
         self,
         params: dict[str, object],
@@ -844,28 +962,23 @@ class OpenAIClient:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            reasoning = _read_reasoning_from_part(delta)
             if reasoning:
                 reasoning_parts.append(reasoning)
-                thinking = "".join(reasoning_parts)
-                self.last_thinking = thinking
-                on_thinking_update(thinking)
+                self._publish_thinking("".join(reasoning_parts), on_thinking_update)
             if delta.content:
                 content_parts.append(delta.content)
                 content = "".join(content_parts)
                 thinking, _ = extract_thinking(content)
                 if thinking and not reasoning_parts:
-                    self.last_thinking = thinking
-                    on_thinking_update(thinking)
+                    self._publish_thinking(thinking, on_thinking_update)
 
         content = "".join(content_parts)
         if reasoning_parts:
-            self.last_thinking = "".join(reasoning_parts).strip() or None
+            self._publish_thinking("".join(reasoning_parts).strip() or None, on_thinking_update)
         elif content:
             thinking, _ = extract_thinking(content)
-            self.last_thinking = thinking
-            if thinking:
-                on_thinking_update(thinking)
+            self._publish_thinking(thinking, on_thinking_update)
         return content
 
     def _finalize_message(
@@ -874,32 +987,41 @@ class OpenAIClient:
         on_thinking_update: Callable[[str], None] | None,
     ) -> str:
         content = message.content or ""
-        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+        reasoning = _read_reasoning_from_part(message)
         if llm_debug_enabled():
             attrs = {
                 name: getattr(message, name)
-                for name in ("content", "reasoning_content", "reasoning", "role", "refusal")
+                for name in ("content", "reasoning_content", "reasoning", "thinking", "role", "refusal")
                 if getattr(message, name, None)
             }
             _log_llm_debug("message fields: %s", attrs)
+        tagged_thinking, tagged_remainder = extract_thinking(content)
         if reasoning:
-            thinking = str(reasoning).strip() or None
-            self.last_thinking = thinking
-            if thinking and on_thinking_update is not None:
-                on_thinking_update(thinking)
-            return content
-        thinking, _ = extract_thinking(content)
-        self.last_thinking = thinking
-        if thinking and on_thinking_update is not None:
-            on_thinking_update(thinking)
-        return content
+            thinking = reasoning
+            if tagged_thinking and tagged_thinking not in reasoning:
+                thinking = f"{reasoning.strip()}\n\n{tagged_thinking.strip()}".strip()
+            self._publish_thinking(thinking, on_thinking_update)
+            return tagged_remainder or content
+        self._publish_thinking(tagged_thinking, on_thinking_update)
+        return tagged_remainder or content
 
     def _apply_provider_params(self, params: dict[str, object]) -> dict[str, object]:
         """Add provider-specific request fields."""
-        if self.provider != "gemini" or not gemini_supports_visible_thoughts(self.model):
-            return params
         merged = dict(params)
-        merged["extra_body"] = _gemini_thinking_extra_body()
+        extra_body: dict[str, object] = {}
+
+        if self.provider == "gemini" and gemini_supports_visible_thoughts(self.model):
+            extra_body.update(_gemini_thinking_extra_body())
+
+        if (
+            getattr(self, "endpoint_preset", None) is not None
+            and self.endpoint_preset.provider_id == "openrouter"
+            and uses_structured_reasoning(self.model)
+        ):
+            extra_body["reasoning"] = {"effort": "medium"}
+
+        if extra_body:
+            merged["extra_body"] = extra_body
         return merged
 
     def _create_completion(self, params: dict[str, object], timeout: float | None) -> object:
@@ -926,7 +1048,7 @@ class OpenAIClient:
             adapted.pop("temperature")
             changed = True
         if "extra_body" in adapted and any(
-            marker in text for marker in ("extra_body", "thinking", "thought", "google", "invalid", "unknown")
+            marker in text for marker in ("extra_body", "thinking", "thought", "google", "invalid", "unknown", "reasoning")
         ):
             adapted.pop("extra_body", None)
             changed = True

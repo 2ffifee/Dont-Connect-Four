@@ -19,10 +19,13 @@ from connect4_mcts.players.llm import (
     gemini_supports_visible_thoughts,
     normalize_llm_endpoint,
     parse_move,
+    prefers_blocking_completion,
     render_rules_briefing,
     render_turn,
     resolve_llm_credentials,
     resolve_openai_credentials,
+    uses_structured_reasoning,
+    _read_reasoning_from_part,
 )
 from connect4_mcts.runner import play_game
 
@@ -175,6 +178,149 @@ def test_extract_thinking_splits_gemini_thought_tags():
     assert parse_move(remainder) == Move(MoveType.DROP, 3)
 
 
+def test_extract_thinking_joins_multiple_tag_blocks():
+    tagged = (
+        "<think>First</think>"
+        "<think>Second</think>"
+        '{"move_type": "drop", "column": 1}'
+    )
+    thinking, remainder = extract_thinking(tagged)
+    assert thinking == "First\n\nSecond"
+    assert parse_move(remainder) == Move(MoveType.DROP, 1)
+
+
+def test_uses_structured_reasoning_detects_common_model_ids() -> None:
+    assert uses_structured_reasoning("o3-mini")
+    assert uses_structured_reasoning("deepseek-reasoner")
+    assert uses_structured_reasoning("anthropic/claude-3.7-sonnet:thinking")
+    assert not uses_structured_reasoning("gpt-4o-mini")
+
+
+def test_prefers_blocking_for_local_and_structured_reasoning() -> None:
+    assert prefers_blocking_completion("http://localhost:11434/v1", "llama3")
+    assert prefers_blocking_completion("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.5-flash")
+    assert prefers_blocking_completion("https://api.openai.com/v1", "o3-mini")
+    assert not prefers_blocking_completion("https://api.openai.com/v1", "gpt-4o-mini")
+
+
+def test_read_reasoning_from_part_supports_reasoning_content() -> None:
+    message = type("Message", (), {"reasoning_content": "Plan the move", "content": '{"move_type": "drop", "column": 2}'})()
+    assert _read_reasoning_from_part(message) == "Plan the move"
+
+
+def test_openai_client_blocking_reasoning_field_updates_thinking(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs: object) -> object:
+            captured.update(kwargs)
+            message = type(
+                "Message",
+                (),
+                {
+                    "reasoning_content": "Evaluate columns 0-7.",
+                    "content": '{"move_type": "drop", "column": 4}',
+                },
+            )()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    class FakeChat:
+        completions = FakeCompletions
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None, default_headers=None) -> None:
+            del default_headers
+            self.chat = FakeChat()
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
+
+    client = OpenAIClient(model="o3-mini", api_key="test-key")
+    updates: list[str] = []
+    content = client.complete(
+        [{"role": "user", "content": "pick a move"}],
+        on_thinking_update=updates.append,
+    )
+
+    assert not captured.get("stream")
+    assert client.last_thinking == "Evaluate columns 0-7."
+    assert updates == ["Evaluate columns 0-7."]
+    assert parse_move(content) == Move(MoveType.DROP, 4)
+
+
+def test_openai_client_local_server_uses_blocking_not_streaming(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs: object) -> object:
+            calls.append(dict(kwargs))
+            message = type(
+                "Message",
+                (),
+                {"content": 'Local plan{"move_type": "push", "column": 1}'},
+            )()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    class FakeChat:
+        completions = FakeCompletions
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None, default_headers=None) -> None:
+            del default_headers
+            self.chat = FakeChat()
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
+
+    client = OpenAIClient(
+        model="qwen3:8b",
+        api_key="test-key",
+        base_url="http://localhost:11434/v1",
+    )
+    updates: list[str] = []
+    content = client.complete(
+        [{"role": "user", "content": "pick a move"}],
+        on_thinking_update=updates.append,
+    )
+
+    assert all(not call.get("stream") for call in calls)
+    assert client.last_thinking == "Local plan"
+    assert updates == ["Local plan"]
+    assert parse_move(content) == Move(MoveType.PUSH, 1)
+
+
+def test_openrouter_client_requests_reasoning_for_reasoning_models(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs: object) -> object:
+            captured.update(kwargs)
+            message = type("Message", (), {"content": '{"move_type": "drop", "column": 0}'})()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    class FakeChat:
+        completions = FakeCompletions
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None, default_headers=None) -> None:
+            del default_headers
+            self.chat = FakeChat()
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
+
+    client = OpenAIClient(
+        model="deepseek/deepseek-r1",
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    client.complete([{"role": "user", "content": "hi"}])
+
+    extra_body = captured.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body.get("reasoning") == {"effort": "medium"}
+
+
 def test_gemini_client_requests_include_thoughts_for_thinking_models(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -311,7 +457,7 @@ def test_openai_client_falls_back_to_blocking_when_streaming_fails(monkeypatch) 
     client = OpenAIClient(
         model="gpt-4o-mini",
         api_key="test-key",
-        base_url="http://localhost:11434/v1",
+        base_url="https://api.openai.com/v1",
     )
     updates: list[str] = []
     content = client.complete(
@@ -562,13 +708,43 @@ def test_resolve_credentials_requires_gemini_key_without_env(monkeypatch) -> Non
         )
 
 
+@pytest.mark.parametrize(
+    ("base_url", "env_name", "env_value"),
+    [
+        ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "or-test"),
+        ("https://api.x.ai/v1", "XAI_API_KEY", "xai-test"),
+        ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "groq-test"),
+        ("https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-test"),
+        ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-test"),
+        ("https://api.together.xyz/v1", "TOGETHER_API_KEY", "together-test"),
+    ],
+)
+def test_resolve_credentials_uses_provider_env_keys(monkeypatch, base_url, env_name, env_value) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    key, resolved_base = resolve_llm_credentials(api_key="", base_url=base_url)
+
+    assert key == env_value
+    assert resolved_base == base_url
+
+
+def test_resolve_credentials_requires_provider_specific_key(monkeypatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="Groq"):
+        resolve_llm_credentials(api_key="", base_url="https://api.groq.com/openai/v1")
+
+
 def test_openai_client_normalizes_gemini_base_url(monkeypatch) -> None:
     created: dict[str, object] = {}
 
     class FakeOpenAI:
-        def __init__(self, *, api_key: str, base_url: str | None) -> None:
+        def __init__(self, *, api_key: str, base_url: str | None, default_headers=None) -> None:
             created["api_key"] = api_key
             created["base_url"] = base_url
+            created["default_headers"] = default_headers
 
     fake_openai = type("openai", (), {"OpenAI": FakeOpenAI})
     monkeypatch.setitem(__import__("sys").modules, "openai", fake_openai)
@@ -583,6 +759,28 @@ def test_openai_client_normalizes_gemini_base_url(monkeypatch) -> None:
     assert client.base_url == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert created["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai/"
     assert created["api_key"] == "test-key"
+
+
+def test_openai_client_adds_openrouter_headers(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None, default_headers=None) -> None:
+            created["default_headers"] = default_headers
+
+    fake_openai = type("openai", (), {"OpenAI": FakeOpenAI})
+    monkeypatch.setitem(__import__("sys").modules, "openai", fake_openai)
+
+    OpenAIClient(
+        model="anthropic/claude-3.5-sonnet",
+        api_key="or-test",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    headers = created["default_headers"]
+    assert isinstance(headers, dict)
+    assert headers["HTTP-Referer"]
+    assert headers["X-Title"]
 
 
 def test_adapt_params_swaps_max_tokens_for_reasoning_models():
