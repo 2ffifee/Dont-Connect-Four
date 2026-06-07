@@ -235,6 +235,29 @@ def test_first_player_gets_fair_turn_when_their_move_creates_a_line() -> None:
     assert after_move.current_player is Player.YELLOW
     assert after_move.result is None
     assert after_move.line_counts()[Player.RED] == 1
+    assert after_move.protected_segments
+
+
+def test_fair_turn_forbids_breaking_existing_lines() -> None:
+    state = GameState(
+        board=board_from_rows(
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+            "RRR.....",
+        ),
+        current_player=Player.RED,
+        first_player=Player.RED,
+    )
+
+    fair_turn = state.apply_move(Move(MoveType.DROP, 3))
+
+    assert Move(MoveType.PUSH, 0) not in fair_turn.legal_moves()
+    assert Move(MoveType.DROP, 7) in fair_turn.legal_moves()
+    with pytest.raises(IllegalMoveError):
+        fair_turn.apply_move(Move(MoveType.PUSH, 0))
 
 
 def test_fair_turn_move_finishes_game_and_player_with_more_lines_loses() -> None:
@@ -309,6 +332,8 @@ def test_fair_turn_equal_line_counts_let_game_continue() -> None:
 
     assert continued.status is GameStatus.ONGOING
     assert continued.result is None
+    assert continued.protected_segments
+    assert Move(MoveType.PUSH, 4) not in continued.legal_moves()
 
 
 def test_count_lines_six_in_a_row_counts_as_three_segments() -> None:
@@ -346,6 +371,7 @@ def test_game_continues_when_equal_line_counts_after_line() -> None:
 
     assert after.status is GameStatus.ONGOING
     assert after.result is None
+    assert after.protected_segments
 
 
 def test_second_player_line_finishes_game_without_extra_turn() -> None:

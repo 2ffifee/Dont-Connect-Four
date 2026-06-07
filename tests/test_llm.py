@@ -167,6 +167,44 @@ def test_extract_thinking_splits_think_tags():
     assert parse_move(remainder) == Move(MoveType.DROP, 1)
 
 
+def test_extract_thinking_splits_gemini_thought_tags():
+    tagged = '<thought>Consider column 3.</thought>{"move_type": "drop", "column": 3}'
+    thinking, remainder = extract_thinking(tagged)
+    assert thinking == "Consider column 3."
+    assert parse_move(remainder) == Move(MoveType.DROP, 3)
+
+
+def test_gemini_client_requests_include_thoughts(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs: object) -> object:
+            captured.update(kwargs)
+            message = type("Message", (), {"content": '{"move_type": "drop", "column": 0}'})()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    class FakeChat:
+        completions = FakeCompletions
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None) -> None:
+            self.chat = FakeChat()
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
+
+    client = OpenAIClient(
+        model="gemini-2.0-flash",
+        api_key="test-key",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+    client.complete([{"role": "user", "content": "hi"}])
+
+    extra_body = captured.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body["google"]["thinking_config"]["include_thoughts"] is True
+
+
 def test_choose_move_after_briefing_reuses_opening_conversation():
     client = MockLLMClient(
         responses=[

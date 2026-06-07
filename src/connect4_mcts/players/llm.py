@@ -82,10 +82,13 @@ GOAL (THIS IS INVERTED - READ TWICE):
 Fair-turn rule:
 - If the player who moved first completes a line, the second player gets exactly
   one more move.
+- During that response move, and for the rest of the game after a tied
+  response, moves that would break any existing four-in-a-row segment already on
+  the board are illegal (push cannot be used to dismantle an existing line).
 - After that move: if line COUNTS are unequal, the game ends and the player with
   fewer segments wins.
 - If that move leaves EQUAL line counts for both players, the game continues
-  normally instead of ending.
+  with those existing segments locked in place.
 
 When it is your turn:
 - Choose exactly one move from the provided list of legal moves.
@@ -167,6 +170,7 @@ def render_turn(state: GameState, legal_moves: Sequence[Move], include_line_coun
 
 _THINKING_TAG_PATTERNS = (
     re.compile(r"<\s*think\s*>(.*?)\s*<\s*/\s*think\s*>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\s*thought\s*>(.*?)\s*<\s*/\s*thought\s*>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<\s*redacted_thinking\s*>(.*?)\s*<\s*/\s*redacted_thinking\s*>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<\s*thinking\s*>(.*?)\s*<\s*/\s*thinking\s*>", re.DOTALL | re.IGNORECASE),
 )
@@ -648,6 +652,7 @@ class OpenAIClient:
             params["temperature"] = self.temperature
         if self.max_tokens is not None:
             params["max_tokens"] = self.max_tokens
+        params = self._apply_provider_params(params)
         call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
 
         if on_thinking_update is not None:
@@ -727,6 +732,20 @@ class OpenAIClient:
         if thinking and on_thinking_update is not None:
             on_thinking_update(thinking)
         return remainder
+
+    def _apply_provider_params(self, params: dict[str, object]) -> dict[str, object]:
+        """Add provider-specific request fields."""
+        if self.provider != "gemini":
+            return params
+        merged = dict(params)
+        merged["extra_body"] = {
+            "google": {
+                "thinking_config": {
+                    "include_thoughts": True,
+                }
+            }
+        }
+        return merged
 
     def _create_completion(self, params: dict[str, object], timeout: float | None) -> object:
         if timeout is None:

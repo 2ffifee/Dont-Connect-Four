@@ -11,7 +11,7 @@ Dostepne sa dwa typy ruchow:
 - `drop` - klasyczne wrzucenie zetonu do kolumny,
 - `push` - wlozenie zetonu od spodu niezapelnionej kolumny; pozostale zetony w tej kolumnie przesuwaja sie o jedno pole w gore.
 
-Obowiazuje sprawiedliwosc turowa: jesli segment czterech zetonow pojawi sie po ruchu gracza rozpoczynajacego, drugi gracz dostaje jeszcze jeden ruch. Jesli po tym ruchu obaj gracze maja **ta sama liczbe** segmentow, gra toczy sie dalej. W przeciwnym razie wygrywa gracz z mniejsza liczba segmentow.
+Obowiazuje sprawiedliwosc turowa: jesli segment czterech zetonow pojawi sie po ruchu gracza rozpoczynajacego, drugi gracz dostaje jeszcze jeden ruch. Ten ruch (oraz wszystkie kolejne po remisie liczby segmentow) **nie moze naruszac** juz istniejacych segmentow czterech zetonow — nie mozna ich rozwalic push'em. Jesli po tym ruchu obaj gracze maja **ta sama liczbe** segmentow, gra toczy sie dalej z zablokowanymi segmentami. W przeciwnym razie wygrywa gracz z mniejsza liczba segmentow.
 
 Remis: gdy liczba segmentow jest rowna, gra toczy sie dalej (albo konczy sie remisem, gdy plansza jest pelna).
 
