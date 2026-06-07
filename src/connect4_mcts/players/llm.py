@@ -517,6 +517,23 @@ class MockLLMClient:
 
 _LOCAL_API_KEY_PLACEHOLDER = "ollama"
 _GOOGLE_GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+_GEMINI_THINKING_MODEL_MARKERS = ("gemini-2.5", "gemini-3", "gemini-3.5")
+
+
+def gemini_supports_visible_thoughts(model: str) -> bool:
+    """Return whether we should ask Gemini to include thought summaries."""
+    name = model.lower().removeprefix("models/")
+    return any(marker in name for marker in _GEMINI_THINKING_MODEL_MARKERS)
+
+
+def _gemini_thinking_extra_body() -> dict[str, object]:
+    return {
+        "google": {
+            "thinking_config": {
+                "include_thoughts": True,
+            }
+        }
+    }
 
 LLMProvider = Literal["openai", "gemini", "openai_compatible"]
 
@@ -647,24 +664,72 @@ class OpenAIClient:
         timeout: float | None | object = _USE_CLIENT_TIMEOUT,
         on_thinking_update: Callable[[str], None] | None = None,
     ) -> str:
+        params = self._build_completion_params(messages)
+        call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
+        param_variants = self._completion_param_variants(params)
+        errors: list[Exception] = []
+
+        if on_thinking_update is not None:
+            for variant in param_variants:
+                try:
+                    content = self._complete_streaming(variant, call_timeout, on_thinking_update)
+                except Exception as exc:  # noqa: BLE001 - fall back to blocking completion
+                    errors.append(exc)
+                    continue
+                if content.strip():
+                    return content
+
+        for variant in param_variants:
+            try:
+                return self._complete_blocking(variant, call_timeout, on_thinking_update)
+            except Exception as exc:  # noqa: BLE001 - try next param variant
+                errors.append(exc)
+
+        if errors:
+            raise errors[-1]
+        return ""
+
+    def _build_completion_params(self, messages: Sequence[Message]) -> dict[str, object]:
         params: dict[str, object] = {"model": self.model, "messages": list(messages)}
         if self.temperature is not None:
             params["temperature"] = self.temperature
         if self.max_tokens is not None:
             params["max_tokens"] = self.max_tokens
-        params = self._apply_provider_params(params)
-        call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
+        return self._apply_provider_params(params)
 
-        if on_thinking_update is not None:
-            return self._complete_streaming(params, call_timeout, on_thinking_update)
+    def _completion_param_variants(self, params: dict[str, object]) -> list[dict[str, object]]:
+        if not self._has_gemini_thinking(params):
+            return [params]
+        stripped = self._without_gemini_thinking(params)
+        return [params, stripped]
 
+    @staticmethod
+    def _has_gemini_thinking(params: dict[str, object]) -> bool:
+        extra_body = params.get("extra_body")
+        if not isinstance(extra_body, dict):
+            return False
+        google = extra_body.get("google")
+        return isinstance(google, dict) and "thinking_config" in google
+
+    @staticmethod
+    def _without_gemini_thinking(params: dict[str, object]) -> dict[str, object]:
+        variant = dict(params)
+        variant.pop("extra_body", None)
+        return variant
+
+    def _complete_blocking(
+        self,
+        params: dict[str, object],
+        timeout: float | None,
+        on_thinking_update: Callable[[str], None] | None,
+    ) -> str:
         try:
-            response = self._create_completion(params, call_timeout)
+            response = self._create_completion(params, timeout)
         except Exception as exc:  # noqa: BLE001 - adapt to model-specific parameter rules
             adapted = self._adapt_params(params, exc)
             if adapted is None:
                 raise
-            response = self._create_completion(adapted, call_timeout)
+            response = self._create_completion(adapted, timeout)
 
         return self._finalize_message(response.choices[0].message, on_thinking_update)
 
@@ -707,12 +772,12 @@ class OpenAIClient:
         content = "".join(content_parts)
         if reasoning_parts:
             self.last_thinking = "".join(reasoning_parts).strip() or None
-            return content
-        thinking, remainder = extract_thinking(content)
-        self.last_thinking = thinking
-        if thinking:
-            on_thinking_update(thinking)
-        return remainder
+        elif content:
+            thinking, _ = extract_thinking(content)
+            self.last_thinking = thinking
+            if thinking:
+                on_thinking_update(thinking)
+        return content
 
     def _finalize_message(
         self,
@@ -727,24 +792,18 @@ class OpenAIClient:
             if thinking and on_thinking_update is not None:
                 on_thinking_update(thinking)
             return content
-        thinking, remainder = extract_thinking(content)
+        thinking, _ = extract_thinking(content)
         self.last_thinking = thinking
         if thinking and on_thinking_update is not None:
             on_thinking_update(thinking)
-        return remainder
+        return content
 
     def _apply_provider_params(self, params: dict[str, object]) -> dict[str, object]:
         """Add provider-specific request fields."""
-        if self.provider != "gemini":
+        if self.provider != "gemini" or not gemini_supports_visible_thoughts(self.model):
             return params
         merged = dict(params)
-        merged["extra_body"] = {
-            "google": {
-                "thinking_config": {
-                    "include_thoughts": True,
-                }
-            }
-        }
+        merged["extra_body"] = _gemini_thinking_extra_body()
         return merged
 
     def _create_completion(self, params: dict[str, object], timeout: float | None) -> object:
@@ -769,6 +828,11 @@ class OpenAIClient:
             changed = True
         if "temperature" in adapted and "temperature" in text:
             adapted.pop("temperature")
+            changed = True
+        if "extra_body" in adapted and any(
+            marker in text for marker in ("extra_body", "thinking", "thought", "google", "invalid", "unknown")
+        ):
+            adapted.pop("extra_body", None)
             changed = True
 
         return adapted if changed else None
