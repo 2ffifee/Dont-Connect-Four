@@ -1,0 +1,281 @@
+# Tournament player grid (35 automated agents, round-robin).
+#
+# Training is bounded by in-RAM tree size, not game count:
+#   - oracle: 16 GB  (scripts/train_oracle.py or --include-oracle here)
+#   - others: <= 7 GB each  => oracle + one opponent fits in 32 GB RAM
+#
+# Train all MCTS entries:
+#   python scripts/train_tournament_grid.py
+#   python scripts/train_tournament_grid.py --only fpu-1.0-m7,lgr-m7
+#
+# Round-robin (10 games/pair, seed varies per game):
+#   python scripts/run_tournament.py --games-per-pair 10 --base-seed 0
+#
+# LLM contestants (optional, configs/tournament_llm.toml):
+#   python scripts/run_tournament.py --llm-config configs/tournament_llm.toml
+
+[defaults]
+play_iterations = 1000
+build_iterations = 1000
+selfplay_temperature = 1.0
+exploration = 1.4142135623730951
+power_mean_p = 1.0
+final_move = "robust"
+rollout_policy = "random"
+seed = 0
+bytes_per_node = 2867.0
+safety_fraction = 0.85
+max_selfplay_games = 100000
+max_minutes = 480.0
+checkpoint_every_games = 25
+output_dir = "models/tournament"
+
+# --- Baselines (no pickle; created at runtime) ---
+
+[[players]]
+id = "random"
+kind = "builtin"
+builtin = "random"
+
+[[players]]
+id = "minimax-d3"
+kind = "builtin"
+builtin = "minimax"
+depth = 3
+
+[[players]]
+id = "minimax-d4"
+kind = "builtin"
+builtin = "minimax"
+depth = 4
+
+[[players]]
+id = "minimax-d6"
+kind = "builtin"
+builtin = "minimax"
+depth = 6
+
+# --- Oracle (16 GB cap; also a tournament contestant) ---
+
+[[players]]
+id = "oracle"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 16.0
+exploration = 1.0
+power_mean_p = 1.0
+play_iterations = 1000
+
+# --- UCT: memory ladder + exploration ablations @ 7 GB ---
+
+[[players]]
+id = "uct-m0"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 0.0
+
+[[players]]
+id = "uct-m2"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 2.0
+
+[[players]]
+id = "uct-m4"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 4.0
+
+[[players]]
+id = "uct-m7"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 7.0
+
+[[players]]
+id = "uct-c0.5-m7"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 7.0
+exploration = 0.5
+
+[[players]]
+id = "uct-c1.0-m7"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 7.0
+exploration = 1.0
+
+[[players]]
+id = "uct-c2.5-m7"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 7.0
+exploration = 2.5
+
+# --- FPU @ 7 GB (+ memory ladder for fpu=1.0) ---
+
+[[players]]
+id = "fpu-0.1-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 0.1
+
+[[players]]
+id = "fpu-0.2-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 0.2
+
+[[players]]
+id = "fpu-0.5-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 0.5
+
+[[players]]
+id = "fpu-1.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 1.0
+
+[[players]]
+id = "fpu-2.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 2.0
+
+[[players]]
+id = "fpu-4.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 4.0
+
+[[players]]
+id = "fpu-8.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 8.0
+
+[[players]]
+id = "fpu-1.0-m0"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 0.0
+fpu = 1.0
+
+[[players]]
+id = "fpu-1.0-m2"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 2.0
+fpu = 1.0
+
+[[players]]
+id = "fpu-1.0-m4"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 4.0
+fpu = 1.0
+
+# --- PMBp @ 7 GB (+ memory ladder for p=2.5) ---
+
+[[players]]
+id = "pmbp-1.25-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 1.25
+
+[[players]]
+id = "pmbp-1.5-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 1.5
+
+[[players]]
+id = "pmbp-2.0-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 2.0
+
+[[players]]
+id = "pmbp-2.5-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 2.5
+
+[[players]]
+id = "pmbp-3.5-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 3.5
+
+[[players]]
+id = "pmbp-5.0-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 5.0
+
+[[players]]
+id = "pmbp-8.0-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 8.0
+
+[[players]]
+id = "pmbp-2.5-m0"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 0.0
+power_mean_p = 2.5
+
+[[players]]
+id = "pmbp-2.5-m2"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 2.0
+power_mean_p = 2.5
+
+[[players]]
+id = "pmbp-2.5-m4"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 4.0
+power_mean_p = 2.5
+
+# --- LGR ---
+
+[[players]]
+id = "lgr-m0"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 0.0
+rollout_policy = "lgr"
+
+[[players]]
+id = "lgr-m4"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 4.0
+rollout_policy = "lgr"
+
+[[players]]
+id = "lgr-m7"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 7.0
+rollout_policy = "lgr"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -26,6 +27,7 @@ BOARD_TOP = 118
 MARGIN = 24
 TOP_BAR_HEIGHT = 104
 FOOTER_RESERVE = 76
+THINKING_PANEL_HEIGHT = 88
 MIN_CELL_SIZE = 28
 BUTTON_WIDTH = 96
 BUTTON_HEIGHT = 38
@@ -157,6 +159,11 @@ class HumanVsAgentGui:
         self.selected_move_type = MoveType.DROP
         self.message = ""
         self.llm_awaiting_rules_ack = False
+        self.llm_thinking_text: str | None = None
+        self._agent_busy = False
+        self._async_generation = 0
+        self._async_lock = threading.Lock()
+        self._async_result: tuple[str, object] | None = None
         self.layout = self._compute_board_layout()
 
     def run(self) -> None:
@@ -172,6 +179,7 @@ class HumanVsAgentGui:
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self._handle_click(event.pos)
 
+            self._process_async_results()
             self._draw()
             pygame.display.flip()
             self.clock.tick(60)
@@ -216,8 +224,10 @@ class HumanVsAgentGui:
             self._reset()
             return
         if self._menu_button_rect().collidepoint(position):
+            self._invalidate_async_work()
             self.mode = "setup"
             self.message = ""
+            self.llm_thinking_text = None
             return
 
         if self.state.status is GameStatus.FINISHED:
@@ -244,81 +254,184 @@ class HumanVsAgentGui:
             return
 
         if self.state.status is not GameStatus.FINISHED and self.state.current_player is not self.config.human:
-            self._refresh_display()
-            self._play_agent_turn()
+            self._schedule_agent_turn()
+
+    def _invalidate_async_work(self) -> None:
+        self._async_generation += 1
+        self._agent_busy = False
+        with self._async_lock:
+            self._async_result = None
+
+    def _process_async_results(self) -> None:
+        with self._async_lock:
+            result = self._async_result
+            self._async_result = None
+        if result is None:
+            return
+
+        self._agent_busy = False
+        self.llm_awaiting_rules_ack = False
+        kind, payload = result
+
+        if kind == "briefing":
+            ack = str(payload)
+            self.message = f"LLM ready: {_shorten(ack, 72)}"
+            thinking = getattr(self.agent, "last_thinking", None)
+            if thinking:
+                self.llm_thinking_text = thinking
+            self._maybe_schedule_agent_turn()
+            return
+
+        if kind == "briefing_error":
+            self.message = f"LLM rules briefing failed ({_short_error(payload)})"
+            return
+
+        if kind == "error":
+            exc = payload
+            legal_moves = self.state.legal_moves()
+            if not legal_moves:
+                self.message = f"Agent error ({_short_error(exc)})"
+                return
+            move = random.choice(legal_moves)
+            self.state = self.state.apply_move(move)
+            name = self._opponent_label()
+            self.message = f"{name} error ({_short_error(exc)}) - played random {format_move(move)}"
+            self._maybe_schedule_agent_turn()
+            return
+
+        move, thinking = payload
+        try:
+            if not self.state.is_legal_move(move):
+                raise IllegalMoveError(f"agent returned illegal move: {move}")
+        except IllegalMoveError as exc:
+            legal_moves = self.state.legal_moves()
+            if not legal_moves:
+                self.message = str(exc)
+                return
+            move = random.choice(legal_moves)
+            name = self._opponent_label()
+            self.message = f"{name} illegal move - played random {format_move(move)}"
+        else:
+            name = self._opponent_label()
+            self.message = f"{name}: {format_move(move)}"
+
+        if thinking:
+            self.llm_thinking_text = str(thinking)
+
+        self.state = self.state.apply_move(move)
+        self._maybe_schedule_agent_turn()
+
+    def _opponent_label(self) -> str:
+        if self.config.agent_name == "loaded" and self.config.loaded_label:
+            return _shorten(self.config.loaded_label, 28)
+        if self.config.agent_name == "llm" and self.config.llm_label:
+            return _shorten(self.config.llm_label, 28)
+        return format_agent_name(self.config.agent_name)
+
+    def _maybe_schedule_agent_turn(self) -> None:
+        if self.config.two_player or self.state.status is GameStatus.FINISHED:
+            return
+        if self.state.current_player is self.config.human:
+            return
+        if self._agent_busy:
+            return
+        self._schedule_agent_turn()
+
+    def _schedule_agent_turn(self) -> None:
+        if self._agent_busy or self.state.status is GameStatus.FINISHED:
+            return
+        if self.config.two_player or self.state.current_player is self.config.human:
+            return
+
+        self._agent_busy = True
+        self.message = f"{self._opponent_label()} thinking..."
+        state = self.state
+        agent = self.agent
+        generation = self._async_generation
+
+        def worker() -> tuple[str, object]:
+            try:
+                move = agent.choose_move(state)
+                thinking = getattr(agent, "last_thinking", None)
+                return ("move", (move, thinking))
+            except Exception as exc:  # noqa: BLE001 - report in the UI thread
+                return ("error", exc)
+
+        def run() -> None:
+            result = worker()
+            if generation != self._async_generation:
+                return
+            with self._async_lock:
+                self._async_result = result
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _schedule_rules_briefing(self) -> None:
+        send_briefing = getattr(self.agent, "send_rules_briefing", None)
+        if not callable(send_briefing):
+            self._maybe_schedule_agent_turn()
+            return
+
+        llm_color = self._llm_agent_color()
+        self.llm_awaiting_rules_ack = True
+        self.message = "Sending rules to LLM..."
+        self.llm_thinking_text = None
+        agent = self.agent
+        generation = self._async_generation
+
+        def worker() -> tuple[str, object]:
+            try:
+                ack = send_briefing(llm_color)
+                return ("briefing", ack)
+            except Exception as exc:  # noqa: BLE001 - report in the UI thread
+                return ("briefing_error", exc)
+
+        def run() -> None:
+            result = worker()
+            if generation != self._async_generation:
+                return
+            with self._async_lock:
+                self._async_result = result
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _refresh_display(self) -> None:
         self._draw()
         pygame.display.flip()
 
-    def _play_agent_turn(self) -> None:
-        if self.state.status is GameStatus.FINISHED:
-            return
-
-        try:
-            move = self.agent.choose_move(self.state)
-            if not self.state.is_legal_move(move):
-                raise IllegalMoveError(f"agent returned illegal move: {move}")
-        except Exception as exc:  # noqa: BLE001 - keep the GUI responsive (e.g. on LLM/network errors)
-            legal_moves = self.state.legal_moves()
-            if not legal_moves:
-                return
-            move = random.choice(legal_moves)
-            self.state = self.state.apply_move(move)
-            name = format_agent_name(self.config.agent_name)
-            self.message = f"{name} error ({_short_error(exc)}) - played random {format_move(move)}"
-            return
-
-        self.state = self.state.apply_move(move)
-        self.message = f"{format_agent_name(self.config.agent_name)}: {format_move(move)}"
-
     def _reset(self) -> None:
         self._start_game()
 
     def _start_game(self) -> None:
+        self._invalidate_async_work()
         self.state = GameState.new(first_player=Player.RED)
         self.agent = self._make_agent()
         self._reset_llm_conversation()
         self.selected_move_type = MoveType.DROP
         self.mode = "game"
         self.message = ""
-        self.llm_awaiting_rules_ack = False
+        self.llm_thinking_text = None
         self.layout = self._compute_board_layout()
         if self._needs_llm_rules_briefing():
-            self.message = "Sending rules to LLM..."
-            self._refresh_display()
-            self._send_llm_rules_briefing()
+            self._schedule_rules_briefing()
             return
-        if not self.config.two_player and self.state.current_player is not self.config.human:
-            self._play_agent_turn()
+        self._maybe_schedule_agent_turn()
+
+    def _llm_agent_color(self) -> Player:
+        return self.config.human.opponent
 
     def _needs_llm_rules_briefing(self) -> bool:
-        return (
-            self.config.agent_name == "llm"
-            and not self.config.two_player
-            and self.config.human is Player.RED
-        )
+        return self.config.agent_name == "llm" and not self.config.two_player
 
     def _llm_rules_gate_active(self) -> bool:
         if not self._needs_llm_rules_briefing():
             return False
         if self.llm_awaiting_rules_ack:
             return True
-        return not getattr(self.agent, "rules_acknowledged", True)
-
-    def _send_llm_rules_briefing(self) -> None:
-        send_briefing = getattr(self.agent, "send_rules_briefing", None)
-        if not callable(send_briefing):
-            return
-
-        self.llm_awaiting_rules_ack = True
-        try:
-            ack = send_briefing(Player.YELLOW)
-            self.message = f"LLM ready: {_shorten(ack, 72)}"
-        except Exception as exc:  # noqa: BLE001 - keep GUI responsive on LLM errors
-            self.message = f"LLM rules briefing failed ({_short_error(exc)})"
-        finally:
-            self.llm_awaiting_rules_ack = False
+        if not getattr(self.agent, "rules_acknowledged", True):
+            # Human RED waits for YELLOW LLM briefing before the opening move.
+            return self.config.human is Player.RED and self._llm_agent_color() is Player.YELLOW
+        return False
 
     def _make_agent(self) -> Agent:
         if self.config.agent_name == "loaded" and self.config.loaded_agent is not None:
@@ -429,10 +542,10 @@ class HumanVsAgentGui:
         if rects["mode_multiplayer"].collidepoint(position):
             self.config.two_player = True
             return
-        if rects["human_red"].collidepoint(position):
+        if rects["human_red"].collidepoint(position) and not self.config.two_player:
             self.config.human = Player.RED
             return
-        if rects["human_yellow"].collidepoint(position):
+        if rects["human_yellow"].collidepoint(position) and not self.config.two_player:
             self.config.human = Player.YELLOW
             return
         if rects["agent_random"].collidepoint(position):
@@ -459,9 +572,15 @@ class HumanVsAgentGui:
     def _toggle_move_type(self) -> None:
         self.selected_move_type = MoveType.PUSH if self.selected_move_type is MoveType.DROP else MoveType.DROP
 
+    def _bottom_reserve(self) -> int:
+        reserve = FOOTER_RESERVE
+        if self.config.agent_name == "llm" and self.llm_thinking_text:
+            reserve += THINKING_PANEL_HEIGHT
+        return reserve
+
     def _compute_board_layout(self) -> BoardLayout:
         available_width = self.width - 2 * MARGIN
-        available_height = self.height - TOP_BAR_HEIGHT - FOOTER_RESERVE
+        available_height = self.height - TOP_BAR_HEIGHT - self._bottom_reserve()
         cell_size = min(available_width // COLUMNS, available_height // ROWS)
         cell_size = max(MIN_CELL_SIZE, cell_size)
         board_width = cell_size * COLUMNS
@@ -477,6 +596,7 @@ class HumanVsAgentGui:
         self._draw_header()
         self._draw_controls()
         self._draw_board()
+        self._draw_thinking_panel()
         self._draw_footer()
 
     def _draw_header(self) -> None:
@@ -485,6 +605,8 @@ class HumanVsAgentGui:
 
         if self._llm_rules_gate_active():
             status_line = "Waiting for LLM to acknowledge the rules..."
+        elif self._agent_busy:
+            status_line = f"{self._opponent_label()} thinking..."
         else:
             status_line = gui_status_message(
                 self.state, self.config.human, self.config.agent_name, self.config.two_player
@@ -512,9 +634,12 @@ class HumanVsAgentGui:
         self._draw_button(rects["mode_single"], "Single", not self.config.two_player)
         self._draw_button(rects["mode_multiplayer"], "2 Players", self.config.two_player)
 
-        self._draw_setup_label("Your color", rects["color_label_y"], center_x)
-        self._draw_button(rects["human_red"], "Red", self.config.human is Player.RED)
-        self._draw_button(rects["human_yellow"], "Yellow", self.config.human is Player.YELLOW)
+        if not self.config.two_player:
+            self._draw_setup_label("Your color (Red moves first)", rects["color_label_y"], center_x)
+            self._draw_button(rects["human_red"], "Red", self.config.human is Player.RED)
+            self._draw_button(rects["human_yellow"], "Yellow", self.config.human is Player.YELLOW)
+        else:
+            self._draw_setup_label("Local two-player (Red moves first)", rects["color_label_y"], center_x)
 
         self._draw_setup_label("Opponent", rects["opponent_label_y"], center_x)
         self._draw_button(rects["agent_random"], "Random", self.config.agent_name == "random")
@@ -567,8 +692,32 @@ class HumanVsAgentGui:
             x = self.layout.left + column * self.layout.cell_size + self.layout.cell_size // 2
             self.screen.blit(label, label.get_rect(center=(x, self.layout.top + self.layout.height + 22)))
 
+    def _draw_thinking_panel(self) -> None:
+        if self.config.agent_name != "llm" or not self.llm_thinking_text:
+            return
+
+        panel_top = self.layout.top + self.layout.height + 36
+        panel_rect = pygame.Rect(MARGIN, panel_top, self.width - 2 * MARGIN, THINKING_PANEL_HEIGHT - 12)
+        pygame.draw.rect(self.screen, BUTTON, panel_rect, border_radius=6)
+        pygame.draw.rect(self.screen, BUTTON_BORDER, panel_rect, width=1, border_radius=6)
+
+        heading = self.small_font.render("LLM chain-of-thought:", True, TEXT)
+        self.screen.blit(heading, (panel_rect.x + 10, panel_rect.y + 6))
+
+        wrapped = _wrap_text(self.llm_thinking_text, self.small_font, panel_rect.width - 20)
+        y = panel_rect.y + 28
+        for line in wrapped[:3]:
+            surface = self.small_font.render(line, True, MUTED_TEXT)
+            self.screen.blit(surface, (panel_rect.x + 10, y))
+            y += 18
+        if len(wrapped) > 3:
+            more = self.small_font.render("...", True, MUTED_TEXT)
+            self.screen.blit(more, (panel_rect.x + 10, y))
+
     def _draw_footer(self) -> None:
         footer_y = self.layout.top + self.layout.height + 48
+        if self.config.agent_name == "llm" and self.llm_thinking_text:
+            footer_y += THINKING_PANEL_HEIGHT - 8
         if self.state.status is GameStatus.FINISHED:
             text = result_text(self.state.result)
             color = TEXT
@@ -840,6 +989,24 @@ def _chat_models_first(models: Sequence[str]) -> list[str]:
         return list(models)
     others = [model for model in models if model not in set(chat)]
     return chat + others
+
+
+def _wrap_text(text: str, font: pygame.font.Font, max_width: int) -> list[str]:
+    words = text.replace("\n", " ").split()
+    if not words:
+        return []
+
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if font.size(candidate)[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
 
 
 def _short_error(exc: Exception, max_length: int = 200) -> str:

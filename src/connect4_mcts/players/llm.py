@@ -69,23 +69,19 @@ Moves (on a column that is not full you may choose one of two move types):
 GOAL (THIS IS INVERTED - READ TWICE):
 - Making four of YOUR OWN pieces in a row (horizontal, vertical, or diagonal) is
   BAD, not good. Connecting four does NOT win.
-- At the end, whoever has FEWER completed lines of length 4+ WINS. Whoever has
-  MORE lines LOSES.
-- If both players have the SAME number of lines, compare the lengths of their
-  lines (each line is the full run length, e.g. 4, 5, 6...). Sort each player's
-  line lengths from longest to shortest and compare position by position (both
-  lists have the same length because the line counts match). The player with the
-  LONGER line at the first differing position LOSES. If every length matches, the
-  game continues (unless the board is full, then it is a draw).
+- At the end, count every completed four-in-a-row segment for each player.
+  Overlapping segments count separately (e.g. six in a row counts as three
+  segments of four). Whoever has FEWER segments WINS; whoever has MORE LOSES.
+- If both players have the SAME number of segments, the game continues (unless
+  the board is full, then it is a draw).
 - Therefore you must AVOID completing your own lines and try to FORCE the
-  opponent into completing theirs, preferably short lines (length 4).
+  opponent into completing theirs.
 
 Fair-turn rule:
 - If the player who moved first completes a line, the second player gets exactly
   one more move.
 - After that move: if line COUNTS are unequal, the game ends and the player with
-  fewer lines wins (using the length tie-break above when counts are equal at
-  other end-of-game checks).
+  fewer segments wins.
 - If that move leaves EQUAL line counts for both players, the game continues
   normally instead of ending.
 
@@ -150,12 +146,10 @@ def render_turn(state: GameState, legal_moves: Sequence[Move], include_line_coun
 
     if include_line_counts:
         counts = state.line_counts()
-        red_lengths = state.line_lengths(Player.RED)
-        yellow_lengths = state.line_lengths(Player.YELLOW)
         parts.append(
-            f"Completed lines so far - RED: {counts[Player.RED]} {list(red_lengths)}, "
-            f"YELLOW: {counts[Player.YELLOW]} {list(yellow_lengths)} "
-            "(fewer lines wins; equal counts break ties by line lengths, longer loses)."
+            f"Completed four-in-a-row segments so far - RED: {counts[Player.RED]}, "
+            f"YELLOW: {counts[Player.YELLOW]} "
+            "(overlapping segments count separately; fewer wins)."
         )
 
     parts.append("")
@@ -167,6 +161,34 @@ def render_turn(state: GameState, legal_moves: Sequence[Move], include_line_coun
         "choosing one of the legal moves above."
     )
     return "\n".join(parts)
+
+
+_THINKING_TAG_PATTERNS = (
+    re.compile(r"<\s*think\s*>(.*?)\s*<\s*/\s*think\s*>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\s*redacted_thinking\s*>(.*?)\s*<\s*/\s*redacted_thinking\s*>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<\s*thinking\s*>(.*?)\s*<\s*/\s*thinking\s*>", re.DOTALL | re.IGNORECASE),
+)
+
+
+def extract_thinking(text: str) -> tuple[str | None, str]:
+    """Split model output into optional chain-of-thought and the remaining text."""
+    if not text:
+        return None, ""
+
+    for pattern in _THINKING_TAG_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            thinking = match.group(1).strip()
+            remainder = pattern.sub("", text, count=1).strip()
+            return (thinking or None), remainder
+
+    json_start = re.search(r'\{[^{}]*"move_type"', text, re.DOTALL)
+    if json_start and json_start.start() > 0:
+        prefix = text[: json_start.start()].strip()
+        if prefix and not prefix.startswith("{"):
+            return prefix, text[json_start.start() :].strip()
+
+    return None, text.strip()
 
 
 def parse_move(text: str) -> Move | None:
@@ -220,10 +242,11 @@ def create_llm_player(
     api_key: str | None = None,
     base_url: str | None = None,
     seed: int | None = None,
+    timeout: float = 300.0,
 ) -> LLMPlayer:
     """Build a fresh :class:`LLMPlayer` for a single game session."""
     return LLMPlayer(
-        OpenAIClient(model=model, api_key=api_key, base_url=base_url),
+        OpenAIClient(model=model, api_key=api_key, base_url=base_url, timeout=timeout),
         model_label=model,
         seed=seed,
     )
@@ -293,6 +316,16 @@ class LLMPlayer:
         self.games_played = 0
         self._conversation: list[Message] = []
         self.rules_acknowledged = False
+        self.last_reply: str | None = None
+        self.last_thinking: str | None = None
+
+    def _capture_client_reply(self, reply: str) -> str:
+        """Store the latest raw reply and any exposed chain-of-thought."""
+        self.last_reply = reply
+        client_thinking = getattr(self.client, "last_thinking", None)
+        thinking, remainder = extract_thinking(reply)
+        self.last_thinking = client_thinking or thinking
+        return remainder or reply
 
     def begin_new_game(self) -> None:
         """Start a new game: drop in-game conversation history."""
@@ -300,6 +333,8 @@ class LLMPlayer:
         self.moves = 0
         self.games_played += 1
         self.rules_acknowledged = False
+        self.last_reply = None
+        self.last_thinking = None
 
     def send_rules_briefing(self, llm_player: Player = Player.YELLOW) -> str:
         """Send rules and wait for a non-move acknowledgment before the first turn.
@@ -311,10 +346,11 @@ class LLMPlayer:
         briefing_user = {"role": "user", "content": render_rules_briefing(llm_player)}
         self.requests += 1
         reply = self.client.complete(self._conversation + [briefing_user], timeout=None) or ""
+        reply = self._capture_client_reply(reply)
         self._conversation.append(briefing_user)
-        self._conversation.append({"role": "assistant", "content": reply})
+        self._conversation.append({"role": "assistant", "content": self.last_reply or reply})
         self.rules_acknowledged = True
-        return reply
+        return self.last_reply or reply
 
     def build_turn_user_message(self, state: GameState) -> Message:
         """Build the user message for the current turn."""
@@ -356,6 +392,7 @@ class LLMPlayer:
         for _ in range(self.max_attempts):
             self.requests += 1
             reply = self.client.complete(messages) or ""
+            reply = self._capture_client_reply(reply)
             move = parse_move(reply)
             if move is None:
                 self.unparseable += 1
@@ -415,6 +452,7 @@ class MockLLMClient:
         self._responses = list(responses) if responses is not None else None
         self._responder = responder
         self.calls: list[list[Message]] = []
+        self.last_thinking: str | None = None
 
     def complete(
         self,
@@ -499,6 +537,7 @@ class OpenAIClient:
         self.timeout = timeout
         resolved_key, resolved_base = resolve_openai_credentials(api_key, base_url)
         self._client = OpenAI(api_key=resolved_key, base_url=resolved_base)
+        self.last_thinking: str | None = None
 
     def list_models(self) -> list[str]:  # pragma: no cover - network
         """Return the sorted model ids exposed by the endpoint.
@@ -530,7 +569,15 @@ class OpenAIClient:
                 raise
             response = self._create_completion(adapted, call_timeout)
 
-        return response.choices[0].message.content or ""
+        message = response.choices[0].message
+        content = message.content or ""
+        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+        if reasoning:
+            self.last_thinking = str(reasoning).strip() or None
+            return content
+        thinking, remainder = extract_thinking(content)
+        self.last_thinking = thinking
+        return remainder
 
     def _create_completion(self, params: dict[str, object], timeout: float | None) -> object:
         if timeout is None:

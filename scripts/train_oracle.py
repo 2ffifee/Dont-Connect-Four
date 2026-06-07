@@ -29,9 +29,15 @@ from collections.abc import Sequence
 # Allow running directly from the repository without installation.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from connect4_mcts.game import GameState, GameStatus, Player
+from connect4_mcts.game import GameState, Player
 from connect4_mcts.players.mcts import MCTSPlayer
-from connect4_mcts.training import load_player, save_player
+from connect4_mcts.training import (
+    estimate_tree_ram_gb,
+    grow_player_to_memory_cap,
+    load_player,
+    max_nodes_from_memory_gb,
+    save_player,
+)
 
 
 def _optional_float(value: object) -> float | None:
@@ -47,10 +53,11 @@ def _optional_int(value: object) -> int | None:
 
 
 def _max_nodes_from_memory(memory: dict) -> int:
-    limit_gb = float(memory.get("limit_gb", 5.0))
-    bytes_per_node = float(memory.get("bytes_per_node_estimate", 2867))
-    safety = float(memory.get("safety_fraction", 0.85))
-    return int(limit_gb * (1024**3) * safety / bytes_per_node)
+    return max_nodes_from_memory_gb(
+        float(memory.get("limit_gb", 5.0)),
+        bytes_per_node=float(memory.get("bytes_per_node_estimate", 2867)),
+        safety_fraction=float(memory.get("safety_fraction", 0.85)),
+    )
 
 
 def _build_player(oracle: dict, build_iterations: int) -> MCTSPlayer:
@@ -68,6 +75,21 @@ def _build_player(oracle: dict, build_iterations: int) -> MCTSPlayer:
         max_rollout_moves=_optional_int(oracle.get("max_rollout_moves", "none")),
         seed=_optional_int(oracle.get("seed", 0)),
     )
+
+
+def _format_bytes(num_bytes: int) -> str:
+    if num_bytes >= 1024**3:
+        return f"{num_bytes / 1024**3:.2f} GB"
+    if num_bytes >= 1024**2:
+        return f"{num_bytes / 1024**2:.1f} MB"
+    return f"{num_bytes / 1024:.1f} KB"
+
+
+def _pickle_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 def _save_oracle(player: MCTSPlayer, path: str, eval_iterations: int, build_iterations: int) -> None:
@@ -117,45 +139,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  algorithm        : plain UCT (C={player.exploration}, p={player.power_mean_p}, fpu={player.fpu})")
     print(f"  build budget     : {build_iterations} iterations/move (temperature {temperature})")
     print(f"  eval budget      : {eval_iterations} iterations/position (stored in saved player)")
-    print(f"  memory cap       : ~{max_nodes:,} nodes (~{estimated_gb:.2f} GB at {bytes_per_node:.0f} B/node)")
+    print(
+        f"  memory cap       : ~{max_nodes:,} nodes "
+        f"(est. RAM ~{estimated_gb:.2f} GB at {bytes_per_node:.0f} B/node)"
+    )
     print(f"  stop conditions  : nodes>=cap OR games>={max_games} OR minutes>={max_minutes}")
     print(f"  output           : {output}")
+    print(
+        "  note             : states are cached positions in the persistent MCTS tree "
+        f"({build_iterations} iterations/move); expect ~50k-70k new states per game, "
+        "not one state per move. Pickle size on disk is much smaller than RAM."
+    )
     print(flush=True)
 
     start_time = time.perf_counter()
-    games_played = 0
 
-    while player.tree_size < max_nodes and games_played < max_games:
-        elapsed_minutes = (time.perf_counter() - start_time) / 60.0
-        if elapsed_minutes >= max_minutes:
-            print(f"Reached wall-clock limit ({max_minutes} min).")
-            break
-
-        first_player = Player.RED if games_played % 2 == 0 else Player.YELLOW
-        state = GameState.new(first_player=first_player)
-        while state.status is not GameStatus.FINISHED:
-            move = player.sample_move(state, temperature=temperature)
-            state = state.apply_move(move)
-        games_played += 1
-
-        if games_played % 5 == 0 or player.tree_size >= max_nodes:
-            mem_gb = player.tree_size * bytes_per_node / (1024**3)
-            print(
-                f"  games {games_played:>6} | states {player.tree_size:>12,} "
-                f"(~{mem_gb:.2f} GB) | {elapsed_minutes:6.1f} min",
-                flush=True,
-            )
-
+    def on_progress(games_played: int, tree_size: int, elapsed_minutes: float) -> None:
+        mem_gb = estimate_tree_ram_gb(tree_size, bytes_per_node=bytes_per_node)
+        print(
+            f"  games {games_played:>6} | states {tree_size:>12,} "
+            f"(est. RAM ~{mem_gb:.2f} GB) | {elapsed_minutes:6.1f} min",
+            flush=True,
+        )
         if checkpoint_every > 0 and games_played % checkpoint_every == 0:
             _save_oracle(player, output, eval_iterations, build_iterations)
-            print(f"  checkpoint saved to {output}", flush=True)
+            on_disk = _pickle_size(output)
+            disk_note = f" ({_format_bytes(on_disk)} on disk)" if on_disk is not None else ""
+            print(f"  checkpoint saved to {output}{disk_note}", flush=True)
+
+    games_played = grow_player_to_memory_cap(
+        player,
+        max_nodes=max_nodes,
+        temperature=temperature,
+        max_games=max_games,
+        max_minutes=max_minutes,
+        progress_every=5,
+        on_progress=on_progress,
+    )
+
+    if games_played >= max_games:
+        print(f"Reached game limit ({max_games}).")
+    elif (time.perf_counter() - start_time) / 60.0 >= max_minutes:
+        print(f"Reached wall-clock limit ({max_minutes} min).")
 
     _save_oracle(player, output, eval_iterations, build_iterations)
     total_minutes = (time.perf_counter() - start_time) / 60.0
     final_gb = player.tree_size * bytes_per_node / (1024**3)
+    on_disk = _pickle_size(output)
+    disk_note = f", pickle {_format_bytes(on_disk)} on disk" if on_disk is not None else ""
     print(
-        f"Done. {games_played} games, {player.tree_size:,} states (~{final_gb:.2f} GB) "
-        f"in {total_minutes:.1f} min. Saved to {output} (eval budget {eval_iterations})."
+        f"Done. {games_played} games, {player.tree_size:,} states "
+        f"(est. RAM ~{final_gb:.2f} GB{disk_note}) in {total_minutes:.1f} min. "
+        f"Saved to {output} (eval budget {eval_iterations})."
     )
     return 0
 

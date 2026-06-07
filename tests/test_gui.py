@@ -70,22 +70,18 @@ def test_main_passes_initial_gui_config(monkeypatch) -> None:
     assert configs == [gui.GuiConfig(human=Player.YELLOW, agent_name="minimax", seed=9, depth=2)]
 
 
-def test_human_move_refreshes_display_before_agent_turn(monkeypatch) -> None:
+def test_human_move_schedules_agent_turn(monkeypatch) -> None:
     events = []
     game = object.__new__(gui.HumanVsAgentGui)
     game.config = gui.GuiConfig(human=Player.RED, agent_name="random")
     game.state = GameState.new()
     game.message = ""
 
-    def fake_refresh_display() -> None:
-        events.append(("refresh", game.state.move_count))
-
-    def fake_play_agent_turn() -> None:
+    def fake_schedule_agent_turn() -> None:
         events.append(("agent", game.state.move_count))
 
-    monkeypatch.setattr(game, "_refresh_display", fake_refresh_display)
-    monkeypatch.setattr(game, "_play_agent_turn", fake_play_agent_turn)
+    monkeypatch.setattr(game, "_schedule_agent_turn", fake_schedule_agent_turn)
 
     game._apply_human_move(Move(MoveType.DROP, 0))
 
-    assert events == [("refresh", 1), ("agent", 1)]
+    assert events == [("agent", 1)]

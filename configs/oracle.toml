@@ -33,12 +33,13 @@ checkpoint_every_games = 25      # periodically persist progress to `output`
 output                 = "models/oracle_uct.pkl"
 
 [memory]
-# 5 GB is interpreted as a RAM limit (the binding constraint for a usable tree).
-# Measured cost in this implementation is ~2.8 KB per node, so 5 GB ~= 1.8M
-# nodes; a safety fraction leaves headroom for the interpreter and fragmentation.
+# 16 GB in-RAM budget for the oracle tree (fits 32 GB host with one 7 GB opponent).
+# Measured cost in this implementation is ~2.1-2.9 KB per cached state in RAM;
+# the pickle on disk is much smaller (~200 B/state) because Python objects are not
+# stored verbatim. Expect ~50k-70k new states per self-play game (1000 iters/move).
 # The script stops self-play once the estimated node count reaches the cap:
 #   max_nodes = limit_gb * 1024^3 * safety_fraction / bytes_per_node_estimate
-limit_gb                = 5.0
+limit_gb                = 16.0
 bytes_per_node_estimate = 2867
 safety_fraction         = 0.85
 

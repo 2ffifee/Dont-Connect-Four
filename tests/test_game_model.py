@@ -10,8 +10,7 @@ from connect4_mcts.game import (
     Move,
     MoveType,
     Player,
-    _line_lengths,
-    _winner_from_counts_and_lengths,
+    _winner_from_counts,
     empty_board,
 )
 
@@ -285,7 +284,7 @@ def test_fair_turn_equal_line_counts_on_full_board_finishes_game() -> None:
     assert finished.legal_moves() == ()
     assert finished.result is not None
     assert finished.line_counts() == {Player.RED: 3, Player.YELLOW: 3}
-    assert finished.result.winner is Player.YELLOW
+    assert finished.result.winner is None
 
 
 def test_fair_turn_equal_line_counts_let_game_continue() -> None:
@@ -312,54 +311,24 @@ def test_fair_turn_equal_line_counts_let_game_continue() -> None:
     assert continued.result is None
 
 
-def test_line_lengths_list_matches_line_count() -> None:
+def test_count_lines_six_in_a_row_counts_as_three_segments() -> None:
     board = board_from_rows(
         "........",
         "........",
         "........",
         "........",
         "........",
-        "RRRRR...",
-    )
-    state = GameState(board=board)
-
-    assert len(state.line_lengths(Player.RED)) == state.count_lines(Player.RED)
-
-
-def test_line_lengths_track_full_run_size() -> None:
-    board = board_from_rows(
-        "........",
-        "........",
-        "........",
-        "........",
-        "........",
-        "RRRRR...",
+        "RRRRRR..",
     )
 
-    assert _line_lengths(board, Player.RED) == [5, 5]
+    assert GameState(board=board).count_lines(Player.RED) == 3
 
 
-def test_length_tiebreak_longer_line_loses_when_counts_match() -> None:
-    winner = _winner_from_counts_and_lengths(
-        {Player.RED: 3, Player.YELLOW: 3},
-        [6, 5, 5],
-        [6, 5, 4],
-    )
-
-    assert winner is Player.YELLOW
+def test_equal_line_counts_is_draw() -> None:
+    assert _winner_from_counts({Player.RED: 3, Player.YELLOW: 3}) is None
 
 
-def test_length_tiebreak_returns_none_when_all_lengths_match() -> None:
-    winner = _winner_from_counts_and_lengths(
-        {Player.RED: 2, Player.YELLOW: 2},
-        [5, 4],
-        [5, 4],
-    )
-
-    assert winner is None
-
-
-def test_game_continues_when_counts_and_lengths_fully_match_after_line() -> None:
+def test_game_continues_when_equal_line_counts_after_line() -> None:
     state = GameState(
         board=board_from_rows(
             "........",

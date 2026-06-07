@@ -1,0 +1,27 @@
+# LLM players for the round-robin tournament (optional).
+#
+# Loaded by scripts/run_tournament.py via --llm-config (default path below).
+# Each [[models]] entry becomes one tournament contestant: llm-<id>.
+#
+# For a local Ollama server leave api_key empty. For OpenAI set base_url to ""
+# or omit it and provide a real api_key (or set OPENAI_API_KEY in the environment).
+
+[server]
+base_url = "http://localhost:11434/v1"
+api_key = ""
+timeout = 300.0
+
+[[models]]
+id = "llama32"
+model = "llama3.2"
+
+[[models]]
+id = "qwen25"
+model = "qwen2.5:7b"
+
+# Uncomment/add more models as needed:
+# [[models]]
+# id = "gpt4o-mini"
+# model = "gpt-4o-mini"
+# base_url = ""
+# api_key = "sk-..."

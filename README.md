@@ -4,16 +4,16 @@ Projekt badawczy dla zmodyfikowanej gry Connect4 z agentami opartymi o MCTS/UCT.
 
 ## Zasady wariantu
 
-Gramy na planszy `6x8`. Celem nie jest ulozenie czterech swoich zetonow w linii, tylko unikniecie tego. Po zakonczeniu gry liczone sa wszystkie linie dlugosci 4+ w obu kolorach, a przegrywa gracz, ktory ma ich wiecej.
+Gramy na planszy `6x8`. Celem nie jest ulozenie czterech swoich zetonow w linii, tylko unikniecie tego. Po zakonczeniu gry liczone sa wszystkie segmenty czterech zetonow w rzedzie (poziomo, pionowo, po przekatnej) dla kazdego koloru; nakladajace sie segmenty licza sie osobno (np. szesc zetonow w rzedzie to trzy segmenty). Przegrywa gracz z wieksza liczba segmentow.
 
 Dostepne sa dwa typy ruchow:
 
 - `drop` - klasyczne wrzucenie zetonu do kolumny,
 - `push` - wlozenie zetonu od spodu niezapelnionej kolumny; pozostale zetony w tej kolumnie przesuwaja sie o jedno pole w gore.
 
-Obowiazuje sprawiedliwosc turowa: jesli linia pojawi sie po ruchu gracza rozpoczynajacego, drugi gracz dostaje jeszcze jeden ruch. Jesli po tym ruchu obaj gracze maja **ta sama liczbe** linii, gra toczy sie dalej. W przeciwnym razie wygrywa gracz z mniejsza liczba linii.
+Obowiazuje sprawiedliwosc turowa: jesli segment czterech zetonow pojawi sie po ruchu gracza rozpoczynajacego, drugi gracz dostaje jeszcze jeden ruch. Jesli po tym ruchu obaj gracze maja **ta sama liczbe** segmentow, gra toczy sie dalej. W przeciwnym razie wygrywa gracz z mniejsza liczba segmentow.
 
-Remis liczby linii (poza fair turnem): porownywane sa dlugosci linii (pelna dlugosc kazdego odcinka, np. 4, 5, 6...). Dla kazdego gracza bierzemy liste dlugosci posortowana malejaco i porownujemy kolejne pozycje (listy maja ta sama dlugosc, bo liczba linii jest rowna); gracz z dluzsza linia na pierwszej roznej pozycji przegrywa. Jesli wszystkie dlugosci sa rowne, gra toczy sie dalej (albo remis, gdy plansza jest pelna).
+Remis: gdy liczba segmentow jest rowna, gra toczy sie dalej (albo konczy sie remisem, gdy plansza jest pelna).
 
 ## Zakres implementacji
 

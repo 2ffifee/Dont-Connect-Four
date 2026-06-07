@@ -14,7 +14,9 @@ from connect4_mcts.players.llm import (
     LLMPlayer,
     OpenAIClient,
     _USE_CLIENT_TIMEOUT,
+    extract_thinking,
     parse_move,
+    render_rules_briefing,
     render_turn,
     resolve_openai_credentials,
 )
@@ -22,8 +24,10 @@ from connect4_mcts.runner import play_game
 
 
 def _first_legal_responder(messages):
-    """A 'competent' mock LLM: replies with the first legal move it is offered."""
+    """A 'competent' mock LLM: rules ack + first legal move from the turn prompt."""
     user_text = messages[-1]["content"]
+    if "Do NOT reply with JSON" in user_text:
+        return "I understand the rules and will wait for my turn."
     match = re.search(r"-\s*(drop|push) column (\d+)", user_text)
     assert match, "turn prompt should list legal moves"
     return f'{{"move_type": "{match.group(1)}", "column": {match.group(2)}}}'
@@ -101,6 +105,34 @@ def test_rules_briefing_asks_for_acknowledgment_not_a_move():
     assert "YELLOW" in messages[1]["content"]
     assert "Do NOT reply with JSON" in messages[1]["content"]
     assert player._conversation[2]["role"] == "assistant"
+
+
+def test_rules_briefing_for_red_first_player():
+    client = MockLLMClient(responses=["Ready to play as RED."])
+    player = LLMPlayer(client)
+
+    reply = player.send_rules_briefing(Player.RED)
+
+    assert "Ready" in reply
+    assert "FIRST player" in client.calls[0][1]["content"]
+    assert "RED" in client.calls[0][1]["content"]
+
+
+def test_extract_thinking_splits_tagged_reasoning():
+    thinking, remainder = extract_thinking(
+        "Reasoning here\n"
+        '{"move_type": "drop", "column": 2}'
+    )
+    assert thinking is not None
+    assert "Reasoning here" in thinking
+    assert '"move_type"' in remainder
+
+
+def test_extract_thinking_splits_think_tags():
+    tagged = "<think>Hidden reasoning</think>\n" + '{"move_type": "drop", "column": 1}'
+    thinking, remainder = extract_thinking(tagged)
+    assert thinking == "Hidden reasoning"
+    assert parse_move(remainder) == Move(MoveType.DROP, 1)
 
 
 def test_choose_move_after_briefing_reuses_opening_conversation():
