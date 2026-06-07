@@ -109,3 +109,34 @@ def test_scrollable_panel_follows_streaming_updates() -> None:
     assert panel._follow_bottom is False
     panel.set_text(long_text + "\nline 21")
     assert "line 21" in panel.text
+
+
+def test_scrollbar_drag_moves_content() -> None:
+    pygame.font.init()
+    font = pygame.font.SysFont("Arial", 18)
+    panel = gui.ScrollableTextPanel()
+    panel.rect = pygame.Rect(0, 0, 220, 120)
+    panel.set_text("\n".join(f"line {index}" for index in range(30)))
+
+    layout = panel._scroll_layout(font)
+    assert layout is not None
+    assert layout.max_scroll > 0
+
+    thumb_center = layout.thumb.center
+    assert panel.handle_mouse_down(thumb_center, font)
+    panel.handle_mouse_motion((thumb_center[0], layout.track.top + 4), font)
+    assert panel.scroll_y == 0
+    assert panel._dragging_scrollbar is True
+
+    at_top = panel._scroll_layout(font)
+    assert at_top is not None
+    bottom_thumb_top = at_top.track.bottom - at_top.thumb.height
+    panel.handle_mouse_motion(
+        (thumb_center[0], bottom_thumb_top + panel._drag_grab_offset),
+        font,
+    )
+    assert panel.scroll_y == layout.max_scroll
+    assert panel._follow_bottom is True
+
+    assert panel.handle_mouse_up()
+    assert panel._dragging_scrollbar is False

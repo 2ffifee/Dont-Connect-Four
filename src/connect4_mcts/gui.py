@@ -32,6 +32,11 @@ THINKING_PANEL_GAP = 20
 THINKING_PANEL_PADDING = 10
 THINKING_LINE_HEIGHT = 20
 THINKING_PANEL_MIN_WIDTH = 180
+SCROLLBAR_WIDTH = 12
+SCROLLBAR_MARGIN = 8
+SCROLLBAR_MIN_THUMB_HEIGHT = 32
+SCROLLBAR_HIT_PAD_X = 6
+SCROLLBAR_HIT_PAD_Y = 4
 MIN_CELL_SIZE = 28
 BUTTON_WIDTH = 96
 BUTTON_HEIGHT = 38
@@ -57,6 +62,17 @@ ERROR = (171, 39, 50)
 ScreenMode = str
 
 
+@dataclass(frozen=True, slots=True)
+class _ScrollLayout:
+    content_rect: pygame.Rect
+    content_height: int
+    visible: int
+    max_scroll: int
+    scroll_y: int
+    track: pygame.Rect
+    thumb: pygame.Rect
+
+
 class ScrollableTextPanel:
     """Scrollable read-only text area with optional auto-follow while streaming."""
 
@@ -67,11 +83,15 @@ class ScrollableTextPanel:
         self.text = ""
         self.scroll_y = 0
         self._follow_bottom = True
+        self._dragging_scrollbar = False
+        self._drag_grab_offset = 0
 
     def clear(self) -> None:
         self.text = ""
         self.scroll_y = 0
         self._follow_bottom = True
+        self._dragging_scrollbar = False
+        self._drag_grab_offset = 0
 
     def set_text(self, text: str | None) -> None:
         new = text or ""
@@ -81,28 +101,150 @@ class ScrollableTextPanel:
         if self._follow_bottom:
             self.scroll_y = 10**9
 
-    def handle_wheel(self, delta_y: int, font: pygame.font.Font) -> None:
-        content_height = self._content_height(font)
-        visible = self._content_viewport_height()
-        max_scroll = max(0, content_height - visible)
-        self._follow_bottom = False
-        current = min(max_scroll, self.scroll_y)
-        self.scroll_y = max(0, min(max_scroll, current - delta_y * THINKING_LINE_HEIGHT))
-        if max_scroll > 0 and self.scroll_y >= max_scroll:
-            self._follow_bottom = True
-
     def _content_viewport_height(self) -> int:
         heading_space = 28
         return max(0, self.rect.height - 2 * THINKING_PANEL_PADDING - heading_space)
 
-    def _layout_lines(self, font: pygame.font.Font) -> list[str]:
-        inner_width = max(1, self.rect.width - 2 * THINKING_PANEL_PADDING)
-        return _wrap_text_preserve_newlines(self.text, font, inner_width)
+    def _layout_lines(self, font: pygame.font.Font, content_width: int) -> list[str]:
+        return _wrap_text_preserve_newlines(self.text, font, max(1, content_width))
 
-    def _content_height(self, font: pygame.font.Font) -> int:
-        if not self.text:
-            return 0
-        return len(self._layout_lines(font)) * THINKING_LINE_HEIGHT
+    def _display_lines(self, font: pygame.font.Font, content_width: int, placeholder: str | None) -> list[str]:
+        display_text = self.text or placeholder or ""
+        if not display_text:
+            return []
+        return _wrap_text_preserve_newlines(display_text, font, max(1, content_width))
+
+    def _sync_scroll(self, max_scroll: int) -> int:
+        if self._follow_bottom:
+            self.scroll_y = max_scroll
+        else:
+            self.scroll_y = max(0, min(max_scroll, self.scroll_y))
+        if max_scroll > 0 and self.scroll_y >= max_scroll:
+            self._follow_bottom = True
+        return self.scroll_y
+
+    def _scroll_layout(self, font: pygame.font.Font, *, placeholder: str | None = None) -> _ScrollLayout | None:
+        if self.rect.width <= 0 or self.rect.height <= 0:
+            return None
+
+        content_top = self.rect.y + THINKING_PANEL_PADDING + 28
+        gutter = SCROLLBAR_WIDTH + SCROLLBAR_MARGIN + 4
+        content_width = self.rect.width - 2 * THINKING_PANEL_PADDING - gutter
+        content_rect = pygame.Rect(
+            self.rect.x + THINKING_PANEL_PADDING,
+            content_top,
+            max(1, content_width),
+            self._content_viewport_height(),
+        )
+        lines = self._display_lines(font, content_rect.width, placeholder)
+        content_height = len(lines) * THINKING_LINE_HEIGHT
+        visible = content_rect.height
+        max_scroll = max(0, content_height - visible)
+        scroll_y = self._sync_scroll(max_scroll)
+
+        track = pygame.Rect(
+            self.rect.right - SCROLLBAR_MARGIN - SCROLLBAR_WIDTH,
+            content_rect.top,
+            SCROLLBAR_WIDTH,
+            content_rect.height,
+        )
+        if max_scroll <= 0:
+            thumb = pygame.Rect(track.x, track.top, track.width, track.height)
+        else:
+            thumb_height = max(
+                SCROLLBAR_MIN_THUMB_HEIGHT,
+                int(content_rect.height * visible / content_height),
+            )
+            thumb_height = min(thumb_height, track.height)
+            thumb_travel = max(1, track.height - thumb_height)
+            thumb_y = track.top + int(thumb_travel * scroll_y / max_scroll)
+            thumb = pygame.Rect(track.x, thumb_y, track.width, thumb_height)
+
+        return _ScrollLayout(
+            content_rect=content_rect,
+            content_height=content_height,
+            visible=visible,
+            max_scroll=max_scroll,
+            scroll_y=scroll_y,
+            track=track,
+            thumb=thumb,
+        )
+
+    def _thumb_hit_rect(self, layout: _ScrollLayout) -> pygame.Rect:
+        return layout.thumb.inflate(SCROLLBAR_HIT_PAD_X, SCROLLBAR_HIT_PAD_Y)
+
+    def _track_hit_rect(self, layout: _ScrollLayout) -> pygame.Rect:
+        return layout.track.inflate(SCROLLBAR_HIT_PAD_X, 0)
+
+    def _set_scroll_from_thumb_top(self, layout: _ScrollLayout, thumb_top: int) -> None:
+        if layout.max_scroll <= 0:
+            return
+        thumb_height = layout.thumb.height
+        thumb_travel = max(1, layout.track.height - thumb_height)
+        relative = max(0, min(thumb_travel, thumb_top - layout.track.top))
+        self._follow_bottom = False
+        self.scroll_y = int(relative * layout.max_scroll / thumb_travel)
+        if self.scroll_y >= layout.max_scroll:
+            self._follow_bottom = True
+
+    def handle_wheel(self, delta_y: int, font: pygame.font.Font, *, placeholder: str | None = None) -> None:
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None or layout.max_scroll <= 0:
+            return
+        self._follow_bottom = False
+        current = min(layout.max_scroll, self.scroll_y)
+        self.scroll_y = max(0, min(layout.max_scroll, current - delta_y * THINKING_LINE_HEIGHT))
+        if self.scroll_y >= layout.max_scroll:
+            self._follow_bottom = True
+
+    def handle_mouse_down(
+        self,
+        position: tuple[int, int],
+        font: pygame.font.Font,
+        *,
+        placeholder: str | None = None,
+    ) -> bool:
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None or layout.max_scroll <= 0:
+            return False
+
+        if self._thumb_hit_rect(layout).collidepoint(position):
+            self._dragging_scrollbar = True
+            self._follow_bottom = False
+            self._drag_grab_offset = position[1] - layout.thumb.top
+            return True
+
+        if self._track_hit_rect(layout).collidepoint(position):
+            self._dragging_scrollbar = True
+            self._follow_bottom = False
+            self._set_scroll_from_thumb_top(layout, position[1] - layout.thumb.height // 2)
+            updated = self._scroll_layout(font, placeholder=placeholder)
+            if updated is not None:
+                self._drag_grab_offset = position[1] - updated.thumb.top
+            return True
+
+        return False
+
+    def handle_mouse_motion(
+        self,
+        position: tuple[int, int],
+        font: pygame.font.Font,
+        *,
+        placeholder: str | None = None,
+    ) -> bool:
+        if not self._dragging_scrollbar:
+            return False
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None:
+            return False
+        self._set_scroll_from_thumb_top(layout, position[1] - self._drag_grab_offset)
+        return True
+
+    def handle_mouse_up(self) -> bool:
+        if not self._dragging_scrollbar:
+            return False
+        self._dragging_scrollbar = False
+        return True
 
     def draw(self, surface: pygame.Surface, font: pygame.font.Font, *, placeholder: str | None = None) -> None:
         if self.rect.width <= 0 or self.rect.height <= 0:
@@ -114,42 +256,30 @@ class ScrollableTextPanel:
         heading = font.render(f"{self.heading}:", True, TEXT)
         surface.blit(heading, (self.rect.x + THINKING_PANEL_PADDING, self.rect.y + THINKING_PANEL_PADDING))
 
-        content_top = self.rect.y + THINKING_PANEL_PADDING + 28
-        content_rect = pygame.Rect(
-            self.rect.x + THINKING_PANEL_PADDING,
-            content_top,
-            self.rect.width - 2 * THINKING_PANEL_PADDING,
-            self._content_viewport_height(),
-        )
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None:
+            return
 
         display_text = self.text or placeholder or ""
-        lines = _wrap_text_preserve_newlines(display_text, font, content_rect.width) if display_text else []
-        content_height = len(lines) * THINKING_LINE_HEIGHT
-        visible = content_rect.height
-        max_scroll = max(0, content_height - visible)
-        if self._follow_bottom:
-            self.scroll_y = max_scroll
-        else:
-            self.scroll_y = max(0, min(max_scroll, self.scroll_y))
+        lines = self._display_lines(font, layout.content_rect.width, placeholder) if display_text else []
+        content_top = layout.content_rect.top
 
         previous_clip = surface.get_clip()
-        surface.set_clip(content_rect)
-        y = content_top - self.scroll_y
+        surface.set_clip(layout.content_rect)
+        y = content_top - layout.scroll_y
         for line in lines:
-            if y + THINKING_LINE_HEIGHT >= content_rect.top and y <= content_rect.bottom:
+            if y + THINKING_LINE_HEIGHT >= layout.content_rect.top and y <= layout.content_rect.bottom:
                 if line:
                     line_surface = font.render(line, True, MUTED_TEXT)
-                    surface.blit(line_surface, (content_rect.x, y))
+                    surface.blit(line_surface, (layout.content_rect.x, y))
             y += THINKING_LINE_HEIGHT
         surface.set_clip(previous_clip)
 
-        if max_scroll > 0:
-            track = pygame.Rect(self.rect.right - 8, content_rect.top, 4, content_rect.height)
-            pygame.draw.rect(surface, BOARD_EDGE, track, border_radius=2)
-            thumb_height = max(16, int(content_rect.height * visible / content_height))
-            thumb_y = content_rect.top + int((content_rect.height - thumb_height) * self.scroll_y / max_scroll)
-            thumb = pygame.Rect(track.x, thumb_y, track.width, thumb_height)
-            pygame.draw.rect(surface, MUTED_TEXT, thumb, border_radius=2)
+        if layout.max_scroll > 0:
+            pygame.draw.rect(surface, BOARD_EDGE, layout.track, border_radius=6)
+            thumb_color = BUTTON_ACTIVE if self._dragging_scrollbar else MUTED_TEXT
+            pygame.draw.rect(surface, thumb_color, layout.thumb, border_radius=6)
+            pygame.draw.rect(surface, BUTTON_BORDER, layout.thumb, width=1, border_radius=6)
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,8 +406,12 @@ class HumanVsAgentGui:
                 elif event.type == pygame.KEYDOWN:
                     self._handle_key(event.key)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    self._handle_click(event.pos)
-
+                    if not self._handle_thinking_panel_mouse_down(event.pos):
+                        self._handle_click(event.pos)
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    self._handle_thinking_panel_mouse_up()
+                elif event.type == pygame.MOUSEMOTION:
+                    self._handle_thinking_panel_mouse_motion(event.pos)
                 elif event.type == pygame.MOUSEWHEEL:
                     self._handle_wheel(event.y)
 
@@ -682,12 +816,42 @@ class HumanVsAgentGui:
         if thinking:
             self.llm_thinking_panel.set_text(str(thinking))
 
+    def _thinking_panel_placeholder(self) -> str | None:
+        if self._agent_busy or self.llm_awaiting_rules_ack:
+            return "Waiting for response..."
+        return None
+
     def _handle_wheel(self, delta_y: int) -> None:
         if self.mode != "game" or self.config.agent_name != "llm":
             return
         if not self.llm_thinking_panel.rect.collidepoint(pygame.mouse.get_pos()):
             return
-        self.llm_thinking_panel.handle_wheel(delta_y, self.small_font)
+        self.llm_thinking_panel.handle_wheel(
+            delta_y,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
+
+    def _handle_thinking_panel_mouse_down(self, position: tuple[int, int]) -> bool:
+        if self.mode != "game" or self.config.agent_name != "llm":
+            return False
+        return self.llm_thinking_panel.handle_mouse_down(
+            position,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
+
+    def _handle_thinking_panel_mouse_motion(self, position: tuple[int, int]) -> None:
+        if self.mode != "game" or self.config.agent_name != "llm":
+            return
+        self.llm_thinking_panel.handle_mouse_motion(
+            position,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
+
+    def _handle_thinking_panel_mouse_up(self) -> None:
+        self.llm_thinking_panel.handle_mouse_up()
 
     def _toggle_move_type(self) -> None:
         self.selected_move_type = MoveType.PUSH if self.selected_move_type is MoveType.DROP else MoveType.DROP
@@ -827,10 +991,11 @@ class HumanVsAgentGui:
     def _draw_thinking_panel(self) -> None:
         if self.config.agent_name != "llm":
             return
-        placeholder = None
-        if self._agent_busy or self.llm_awaiting_rules_ack:
-            placeholder = "Waiting for response..."
-        self.llm_thinking_panel.draw(self.screen, self.small_font, placeholder=placeholder)
+        self.llm_thinking_panel.draw(
+            self.screen,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
 
     def _draw_footer(self) -> None:
         footer_y = self.layout.top + self.layout.height + 48
