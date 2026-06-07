@@ -1,5 +1,7 @@
-from connect4_mcts.game import GameResult, GameState, GameStatus, Move, MoveType, Player
+import pygame
+
 import connect4_mcts.gui as gui
+from connect4_mcts.game import GameResult, GameState, GameStatus, Move, MoveType, Player
 from connect4_mcts.gui import BoardLayout, cell_center, column_from_position, format_move, gui_status_message, result_text
 
 
@@ -85,3 +87,25 @@ def test_human_move_schedules_agent_turn(monkeypatch) -> None:
     game._apply_human_move(Move(MoveType.DROP, 0))
 
     assert events == [("agent", 1)]
+
+
+def test_wrap_text_preserve_newlines_keeps_paragraph_breaks() -> None:
+    pygame.font.init()
+    font = pygame.font.SysFont("Arial", 18)
+    lines = gui._wrap_text_preserve_newlines("first line\n\nsecond line", font, 400)
+    assert "" in lines
+    assert any("first line" in line for line in lines)
+    assert any("second line" in line for line in lines)
+
+
+def test_scrollable_panel_follows_streaming_updates() -> None:
+    pygame.font.init()
+    font = pygame.font.SysFont("Arial", 18)
+    panel = gui.ScrollableTextPanel()
+    panel.rect = pygame.Rect(0, 0, 200, 80)
+    long_text = "\n".join(f"line {index}" for index in range(20))
+    panel.set_text(long_text)
+    panel.handle_wheel(1, font)
+    assert panel._follow_bottom is False
+    panel.set_text(long_text + "\nline 21")
+    assert "line 21" in panel.text

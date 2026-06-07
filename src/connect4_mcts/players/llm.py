@@ -46,6 +46,7 @@ class LLMClient(Protocol):
         messages: Sequence[Message],
         *,
         timeout: float | None | object = _USE_CLIENT_TIMEOUT,
+        on_thinking_update: Callable[[str], None] | None = None,
     ) -> str: ...
 
 
@@ -319,12 +320,28 @@ class LLMPlayer:
         self.last_reply: str | None = None
         self.last_thinking: str | None = None
 
+    def _emit_thinking(self, text: str) -> None:
+        self.last_thinking = text
+
+    def _request_completion(
+        self,
+        messages: Sequence[Message],
+        *,
+        timeout: float | None | object = _USE_CLIENT_TIMEOUT,
+    ) -> str:
+        complete = self.client.complete
+        try:
+            return complete(messages, timeout=timeout, on_thinking_update=self._emit_thinking) or ""
+        except TypeError:
+            return complete(messages, timeout=timeout) or ""
+
     def _capture_client_reply(self, reply: str) -> str:
         """Store the latest raw reply and any exposed chain-of-thought."""
         self.last_reply = reply
         client_thinking = getattr(self.client, "last_thinking", None)
         thinking, remainder = extract_thinking(reply)
-        self.last_thinking = client_thinking or thinking
+        if client_thinking or thinking:
+            self.last_thinking = client_thinking or thinking
         return remainder or reply
 
     def begin_new_game(self) -> None:
@@ -345,7 +362,7 @@ class LLMPlayer:
         self._conversation = [{"role": "system", "content": self.system_prompt}]
         briefing_user = {"role": "user", "content": render_rules_briefing(llm_player)}
         self.requests += 1
-        reply = self.client.complete(self._conversation + [briefing_user], timeout=None) or ""
+        reply = self._request_completion(self._conversation + [briefing_user], timeout=None)
         reply = self._capture_client_reply(reply)
         self._conversation.append(briefing_user)
         self._conversation.append({"role": "assistant", "content": self.last_reply or reply})
@@ -391,7 +408,7 @@ class LLMPlayer:
 
         for _ in range(self.max_attempts):
             self.requests += 1
-            reply = self.client.complete(messages) or ""
+            reply = self._request_completion(messages)
             reply = self._capture_client_reply(reply)
             move = parse_move(reply)
             if move is None:
@@ -459,7 +476,9 @@ class MockLLMClient:
         messages: Sequence[Message],
         *,
         timeout: float | None | object = _USE_CLIENT_TIMEOUT,
+        on_thinking_update: Callable[[str], None] | None = None,
     ) -> str:
+        del timeout, on_thinking_update
         self.calls.append(list(messages))
         if self._responder is not None:
             return self._responder(messages)
@@ -553,6 +572,7 @@ class OpenAIClient:
         messages: Sequence[Message],
         *,
         timeout: float | None | object = _USE_CLIENT_TIMEOUT,
+        on_thinking_update: Callable[[str], None] | None = None,
     ) -> str:
         params: dict[str, object] = {"model": self.model, "messages": list(messages)}
         if self.temperature is not None:
@@ -560,6 +580,9 @@ class OpenAIClient:
         if self.max_tokens is not None:
             params["max_tokens"] = self.max_tokens
         call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
+
+        if on_thinking_update is not None:
+            return self._complete_streaming(params, call_timeout, on_thinking_update)
 
         try:
             response = self._create_completion(params, call_timeout)
@@ -569,14 +592,71 @@ class OpenAIClient:
                 raise
             response = self._create_completion(adapted, call_timeout)
 
-        message = response.choices[0].message
-        content = message.content or ""
-        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
-        if reasoning:
-            self.last_thinking = str(reasoning).strip() or None
+        return self._finalize_message(response.choices[0].message, on_thinking_update)
+
+    def _complete_streaming(
+        self,
+        params: dict[str, object],
+        timeout: float | None,
+        on_thinking_update: Callable[[str], None],
+    ) -> str:
+        stream_params = dict(params)
+        stream_params["stream"] = True
+        try:
+            stream = self._create_completion(stream_params, timeout)
+        except Exception as exc:  # noqa: BLE001 - adapt to model-specific parameter rules
+            adapted = self._adapt_params(stream_params, exc)
+            if adapted is None:
+                raise
+            stream = self._create_completion(adapted, timeout)
+
+        reasoning_parts: list[str] = []
+        content_parts: list[str] = []
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+                thinking = "".join(reasoning_parts)
+                self.last_thinking = thinking
+                on_thinking_update(thinking)
+            if delta.content:
+                content_parts.append(delta.content)
+                content = "".join(content_parts)
+                thinking, _ = extract_thinking(content)
+                if thinking and not reasoning_parts:
+                    self.last_thinking = thinking
+                    on_thinking_update(thinking)
+
+        content = "".join(content_parts)
+        if reasoning_parts:
+            self.last_thinking = "".join(reasoning_parts).strip() or None
             return content
         thinking, remainder = extract_thinking(content)
         self.last_thinking = thinking
+        if thinking:
+            on_thinking_update(thinking)
+        return remainder
+
+    def _finalize_message(
+        self,
+        message: object,
+        on_thinking_update: Callable[[str], None] | None,
+    ) -> str:
+        content = message.content or ""
+        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+        if reasoning:
+            thinking = str(reasoning).strip() or None
+            self.last_thinking = thinking
+            if thinking and on_thinking_update is not None:
+                on_thinking_update(thinking)
+            return content
+        thinking, remainder = extract_thinking(content)
+        self.last_thinking = thinking
+        if thinking and on_thinking_update is not None:
+            on_thinking_update(thinking)
         return remainder
 
     def _create_completion(self, params: dict[str, object], timeout: float | None) -> object:

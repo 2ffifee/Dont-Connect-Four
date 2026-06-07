@@ -33,6 +33,35 @@ def _first_legal_responder(messages):
     return f'{{"move_type": "{match.group(1)}", "column": {match.group(2)}}}'
 
 
+def test_llm_player_forwards_streaming_thinking_updates() -> None:
+    class StreamingMock(MockLLMClient):
+        def __init__(self) -> None:
+            super().__init__(responses=[""])
+
+        def complete(self, messages, *, timeout=_USE_CLIENT_TIMEOUT, on_thinking_update=None):
+            del messages, timeout
+            if on_thinking_update is not None:
+                on_thinking_update("part one")
+                on_thinking_update("part one part two")
+            return '{"move_type": "drop", "column": 0}'
+
+    player = LLMPlayer(StreamingMock())
+    player.send_rules_briefing(Player.YELLOW)
+
+    assert player.last_thinking == "part one part two"
+
+    player = LLMPlayer(StreamingMock())
+    captured: list[str] = []
+
+    def capture(text: str) -> None:
+        captured.append(text)
+
+    player._emit_thinking = capture  # type: ignore[method-assign]
+    player.choose_move(GameState.new())
+
+    assert captured == ["part one", "part one part two"]
+
+
 def test_parse_move_accepts_plain_json():
     assert parse_move('{"move_type": "drop", "column": 3}') == Move(MoveType.DROP, 3)
 

@@ -27,7 +27,11 @@ BOARD_TOP = 118
 MARGIN = 24
 TOP_BAR_HEIGHT = 104
 FOOTER_RESERVE = 76
-THINKING_PANEL_HEIGHT = 88
+THINKING_PANEL_WIDTH = 272
+THINKING_PANEL_GAP = 20
+THINKING_PANEL_PADDING = 10
+THINKING_LINE_HEIGHT = 20
+THINKING_PANEL_MIN_WIDTH = 180
 MIN_CELL_SIZE = 28
 BUTTON_WIDTH = 96
 BUTTON_HEIGHT = 38
@@ -51,6 +55,101 @@ WHITE = (255, 255, 255)
 ERROR = (171, 39, 50)
 
 ScreenMode = str
+
+
+class ScrollableTextPanel:
+    """Scrollable read-only text area with optional auto-follow while streaming."""
+
+    heading = "LLM chain-of-thought"
+
+    def __init__(self) -> None:
+        self.rect = pygame.Rect(0, 0, 0, 0)
+        self.text = ""
+        self.scroll_y = 0
+        self._follow_bottom = True
+
+    def clear(self) -> None:
+        self.text = ""
+        self.scroll_y = 0
+        self._follow_bottom = True
+
+    def set_text(self, text: str | None) -> None:
+        new = text or ""
+        if new == self.text:
+            return
+        self.text = new
+        if self._follow_bottom:
+            self.scroll_y = 10**9
+
+    def handle_wheel(self, delta_y: int, font: pygame.font.Font) -> None:
+        content_height = self._content_height(font)
+        visible = self._content_viewport_height()
+        max_scroll = max(0, content_height - visible)
+        self._follow_bottom = False
+        current = min(max_scroll, self.scroll_y)
+        self.scroll_y = max(0, min(max_scroll, current - delta_y * THINKING_LINE_HEIGHT))
+        if max_scroll > 0 and self.scroll_y >= max_scroll:
+            self._follow_bottom = True
+
+    def _content_viewport_height(self) -> int:
+        heading_space = 28
+        return max(0, self.rect.height - 2 * THINKING_PANEL_PADDING - heading_space)
+
+    def _layout_lines(self, font: pygame.font.Font) -> list[str]:
+        inner_width = max(1, self.rect.width - 2 * THINKING_PANEL_PADDING)
+        return _wrap_text_preserve_newlines(self.text, font, inner_width)
+
+    def _content_height(self, font: pygame.font.Font) -> int:
+        if not self.text:
+            return 0
+        return len(self._layout_lines(font)) * THINKING_LINE_HEIGHT
+
+    def draw(self, surface: pygame.Surface, font: pygame.font.Font, *, placeholder: str | None = None) -> None:
+        if self.rect.width <= 0 or self.rect.height <= 0:
+            return
+
+        pygame.draw.rect(surface, BUTTON, self.rect, border_radius=6)
+        pygame.draw.rect(surface, BUTTON_BORDER, self.rect, width=1, border_radius=6)
+
+        heading = font.render(f"{self.heading}:", True, TEXT)
+        surface.blit(heading, (self.rect.x + THINKING_PANEL_PADDING, self.rect.y + THINKING_PANEL_PADDING))
+
+        content_top = self.rect.y + THINKING_PANEL_PADDING + 28
+        content_rect = pygame.Rect(
+            self.rect.x + THINKING_PANEL_PADDING,
+            content_top,
+            self.rect.width - 2 * THINKING_PANEL_PADDING,
+            self._content_viewport_height(),
+        )
+
+        display_text = self.text or placeholder or ""
+        lines = _wrap_text_preserve_newlines(display_text, font, content_rect.width) if display_text else []
+        content_height = len(lines) * THINKING_LINE_HEIGHT
+        visible = content_rect.height
+        max_scroll = max(0, content_height - visible)
+        if self._follow_bottom:
+            self.scroll_y = max_scroll
+        else:
+            self.scroll_y = max(0, min(max_scroll, self.scroll_y))
+
+        previous_clip = surface.get_clip()
+        surface.set_clip(content_rect)
+        y = content_top - self.scroll_y
+        for line in lines:
+            if y + THINKING_LINE_HEIGHT >= content_rect.top and y <= content_rect.bottom:
+                if line:
+                    line_surface = font.render(line, True, MUTED_TEXT)
+                    surface.blit(line_surface, (content_rect.x, y))
+            y += THINKING_LINE_HEIGHT
+        surface.set_clip(previous_clip)
+
+        if max_scroll > 0:
+            track = pygame.Rect(self.rect.right - 8, content_rect.top, 4, content_rect.height)
+            pygame.draw.rect(surface, BOARD_EDGE, track, border_radius=2)
+            thumb_height = max(16, int(content_rect.height * visible / content_height))
+            thumb_y = content_rect.top + int((content_rect.height - thumb_height) * self.scroll_y / max_scroll)
+            thumb = pygame.Rect(track.x, thumb_y, track.width, thumb_height)
+            pygame.draw.rect(surface, MUTED_TEXT, thumb, border_radius=2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +258,7 @@ class HumanVsAgentGui:
         self.selected_move_type = MoveType.DROP
         self.message = ""
         self.llm_awaiting_rules_ack = False
-        self.llm_thinking_text: str | None = None
+        self.llm_thinking_panel = ScrollableTextPanel()
         self._agent_busy = False
         self._async_generation = 0
         self._async_lock = threading.Lock()
@@ -179,6 +278,10 @@ class HumanVsAgentGui:
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self._handle_click(event.pos)
 
+                elif event.type == pygame.MOUSEWHEEL:
+                    self._handle_wheel(event.y)
+
+            self._poll_llm_thinking()
             self._process_async_results()
             self._draw()
             pygame.display.flip()
@@ -227,7 +330,7 @@ class HumanVsAgentGui:
             self._invalidate_async_work()
             self.mode = "setup"
             self.message = ""
-            self.llm_thinking_text = None
+            self.llm_thinking_panel.clear()
             return
 
         if self.state.status is GameStatus.FINISHED:
@@ -278,7 +381,7 @@ class HumanVsAgentGui:
             self.message = f"LLM ready: {_shorten(ack, 72)}"
             thinking = getattr(self.agent, "last_thinking", None)
             if thinking:
-                self.llm_thinking_text = thinking
+                self.llm_thinking_panel.set_text(str(thinking))
             self._maybe_schedule_agent_turn()
             return
 
@@ -316,7 +419,7 @@ class HumanVsAgentGui:
             self.message = f"{name}: {format_move(move)}"
 
         if thinking:
-            self.llm_thinking_text = str(thinking)
+            self.llm_thinking_panel.set_text(str(thinking))
 
         self.state = self.state.apply_move(move)
         self._maybe_schedule_agent_turn()
@@ -345,6 +448,7 @@ class HumanVsAgentGui:
 
         self._agent_busy = True
         self.message = f"{self._opponent_label()} thinking..."
+        self.llm_thinking_panel.clear()
         state = self.state
         agent = self.agent
         generation = self._async_generation
@@ -375,7 +479,7 @@ class HumanVsAgentGui:
         llm_color = self._llm_agent_color()
         self.llm_awaiting_rules_ack = True
         self.message = "Sending rules to LLM..."
-        self.llm_thinking_text = None
+        self.llm_thinking_panel.clear()
         agent = self.agent
         generation = self._async_generation
 
@@ -410,7 +514,7 @@ class HumanVsAgentGui:
         self.selected_move_type = MoveType.DROP
         self.mode = "game"
         self.message = ""
-        self.llm_thinking_text = None
+        self.llm_thinking_panel.clear()
         self.layout = self._compute_board_layout()
         if self._needs_llm_rules_briefing():
             self._schedule_rules_briefing()
@@ -569,22 +673,50 @@ class HumanVsAgentGui:
         if rects["start"].collidepoint(position):
             self._start_game()
 
+    def _poll_llm_thinking(self) -> None:
+        if self.config.agent_name != "llm" or self.mode != "game":
+            return
+        if not self._agent_busy and not self.llm_awaiting_rules_ack:
+            return
+        thinking = getattr(self.agent, "last_thinking", None)
+        if thinking:
+            self.llm_thinking_panel.set_text(str(thinking))
+
+    def _handle_wheel(self, delta_y: int) -> None:
+        if self.mode != "game" or self.config.agent_name != "llm":
+            return
+        if not self.llm_thinking_panel.rect.collidepoint(pygame.mouse.get_pos()):
+            return
+        self.llm_thinking_panel.handle_wheel(delta_y, self.small_font)
+
     def _toggle_move_type(self) -> None:
         self.selected_move_type = MoveType.PUSH if self.selected_move_type is MoveType.DROP else MoveType.DROP
 
-    def _bottom_reserve(self) -> int:
-        reserve = FOOTER_RESERVE
-        if self.config.agent_name == "llm" and self.llm_thinking_text:
-            reserve += THINKING_PANEL_HEIGHT
-        return reserve
+    def _thinking_panel_width(self) -> int:
+        if self.config.agent_name != "llm" or self.mode != "game":
+            return 0
+        max_panel = max(THINKING_PANEL_MIN_WIDTH, (self.width - 2 * MARGIN) // 3)
+        return min(THINKING_PANEL_WIDTH, max_panel)
 
     def _compute_board_layout(self) -> BoardLayout:
-        available_width = self.width - 2 * MARGIN
-        available_height = self.height - TOP_BAR_HEIGHT - self._bottom_reserve()
-        cell_size = min(available_width // COLUMNS, available_height // ROWS)
+        available_height = self.height - TOP_BAR_HEIGHT - FOOTER_RESERVE
+        panel_width = self._thinking_panel_width()
+        board_area_width = self.width - 2 * MARGIN - panel_width - (THINKING_PANEL_GAP if panel_width else 0)
+        cell_size = min(board_area_width // COLUMNS, available_height // ROWS)
         cell_size = max(MIN_CELL_SIZE, cell_size)
         board_width = cell_size * COLUMNS
-        left = (self.width - board_width) // 2
+        if panel_width:
+            left = MARGIN + panel_width + THINKING_PANEL_GAP + max(0, (board_area_width - board_width) // 2)
+        else:
+            left = (self.width - board_width) // 2
+
+        panel_height = available_height
+        self.llm_thinking_panel.rect = pygame.Rect(
+            MARGIN,
+            TOP_BAR_HEIGHT,
+            panel_width,
+            panel_height,
+        )
         return BoardLayout(left=left, top=TOP_BAR_HEIGHT, cell_size=cell_size)
 
     def _draw(self) -> None:
@@ -693,31 +825,15 @@ class HumanVsAgentGui:
             self.screen.blit(label, label.get_rect(center=(x, self.layout.top + self.layout.height + 22)))
 
     def _draw_thinking_panel(self) -> None:
-        if self.config.agent_name != "llm" or not self.llm_thinking_text:
+        if self.config.agent_name != "llm":
             return
-
-        panel_top = self.layout.top + self.layout.height + 36
-        panel_rect = pygame.Rect(MARGIN, panel_top, self.width - 2 * MARGIN, THINKING_PANEL_HEIGHT - 12)
-        pygame.draw.rect(self.screen, BUTTON, panel_rect, border_radius=6)
-        pygame.draw.rect(self.screen, BUTTON_BORDER, panel_rect, width=1, border_radius=6)
-
-        heading = self.small_font.render("LLM chain-of-thought:", True, TEXT)
-        self.screen.blit(heading, (panel_rect.x + 10, panel_rect.y + 6))
-
-        wrapped = _wrap_text(self.llm_thinking_text, self.small_font, panel_rect.width - 20)
-        y = panel_rect.y + 28
-        for line in wrapped[:3]:
-            surface = self.small_font.render(line, True, MUTED_TEXT)
-            self.screen.blit(surface, (panel_rect.x + 10, y))
-            y += 18
-        if len(wrapped) > 3:
-            more = self.small_font.render("...", True, MUTED_TEXT)
-            self.screen.blit(more, (panel_rect.x + 10, y))
+        placeholder = None
+        if self._agent_busy or self.llm_awaiting_rules_ack:
+            placeholder = "Waiting for response..."
+        self.llm_thinking_panel.draw(self.screen, self.small_font, placeholder=placeholder)
 
     def _draw_footer(self) -> None:
         footer_y = self.layout.top + self.layout.height + 48
-        if self.config.agent_name == "llm" and self.llm_thinking_text:
-            footer_y += THINKING_PANEL_HEIGHT - 8
         if self.state.status is GameStatus.FINISHED:
             text = result_text(self.state.result)
             color = TEXT
@@ -989,6 +1105,17 @@ def _chat_models_first(models: Sequence[str]) -> list[str]:
         return list(models)
     others = [model for model in models if model not in set(chat)]
     return chat + others
+
+
+def _wrap_text_preserve_newlines(text: str, font: pygame.font.Font, max_width: int) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.splitlines():
+        stripped = paragraph.strip()
+        if not stripped:
+            lines.append("")
+            continue
+        lines.extend(_wrap_text(stripped, font, max_width))
+    return lines
 
 
 def _wrap_text(text: str, font: pygame.font.Font, max_width: int) -> list[str]:
