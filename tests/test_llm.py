@@ -189,6 +189,35 @@ def test_extract_thinking_joins_multiple_tag_blocks():
     assert parse_move(remainder) == Move(MoveType.DROP, 1)
 
 
+def test_extract_thinking_ignores_markdown_fence_before_json():
+    text = '```json\n{"move_type": "drop", "column": 2}'
+    thinking, remainder = extract_thinking(text)
+    assert thinking is None
+    assert parse_move(remainder) == Move(MoveType.DROP, 2)
+
+
+def test_extract_thinking_keeps_prose_and_strips_fence_marker():
+    text = 'Column 4 looks safest.\n```json\n{"move_type": "push", "column": 4}\n```'
+    thinking, remainder = extract_thinking(text)
+    assert thinking == "Column 4 looks safest."
+    assert parse_move(remainder) == Move(MoveType.PUSH, 4)
+
+
+def test_extract_thinking_ignores_single_quote_fence_marker():
+    text = "'''json\n{\"move_type\": \"drop\", \"column\": 1}"
+    thinking, remainder = extract_thinking(text)
+    assert thinking is None
+    assert parse_move(remainder) == Move(MoveType.DROP, 1)
+
+
+def test_normalize_thinking_text_drops_fence_only_reasoning():
+    from connect4_mcts.players.llm import _normalize_thinking_text
+
+    assert _normalize_thinking_text("```json") is None
+    assert _normalize_thinking_text("'''json") is None
+    assert _normalize_thinking_text("Actual reasoning") == "Actual reasoning"
+
+
 def test_uses_structured_reasoning_detects_common_model_ids() -> None:
     assert uses_structured_reasoning("o3-mini")
     assert uses_structured_reasoning("deepseek-reasoner")

@@ -248,7 +248,7 @@ def _read_reasoning_from_part(part: object) -> str | None:
     for attr in ("reasoning_content", "reasoning", "thinking"):
         value = getattr(part, attr, None)
         if value:
-            text = str(value).strip()
+            text = _normalize_thinking_text(str(value))
             if text:
                 return text
 
@@ -262,10 +262,53 @@ def _read_reasoning_from_part(part: object) -> str | None:
             for key in ("reasoning_content", "reasoning", "thinking"):
                 value = data.get(key)
                 if value:
-                    text = str(value).strip()
+                    text = _normalize_thinking_text(str(value))
                     if text:
                         return text
     return None
+
+
+_FENCE_MARKER_PATTERN = re.compile(r"^[`'\"]{3,}(?:json|JSON)?\s*$")
+_FENCED_JSON_BLOCK = re.compile(
+    r"^[`'\"]{3,}(?:json|JSON)?\s*\n(\{.*?\})\s*(?:\n[`'\"]{3,}\s*)?$",
+    re.DOTALL | re.IGNORECASE,
+)
+_MOVE_JSON_PATTERN = re.compile(r'\{[^{}]*"move_type"', re.DOTALL)
+
+
+def _normalize_thinking_text(text: str | None) -> str | None:
+    """Drop markdown fence markers and other non-reasoning noise from CoT text."""
+    if not text:
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    if _FENCE_MARKER_PATTERN.fullmatch(cleaned):
+        return None
+
+    cleaned = re.sub(r"^[`'\"]{3,}(?:json|JSON)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[`'\"]{3,}\s*$", "", cleaned)
+    cleaned = re.sub(r"\n[`'\"]{3,}(?:json|JSON)?\s*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+    if not cleaned or _FENCE_MARKER_PATTERN.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
+def _extract_move_json_remainder(text: str) -> str:
+    """Return the move JSON substring, stripping surrounding markdown fences."""
+    stripped = text.strip()
+    fenced = _FENCED_JSON_BLOCK.match(stripped)
+    if fenced:
+        return fenced.group(1).strip()
+
+    json_start = _MOVE_JSON_PATTERN.search(stripped)
+    if json_start is None:
+        return stripped
+
+    remainder = stripped[json_start.start() :].strip()
+    remainder = re.sub(r"\n[`'\"]{3,}\s*$", "", remainder)
+    return remainder
 
 
 def extract_thinking(text: str) -> tuple[str | None, str]:
@@ -280,19 +323,28 @@ def extract_thinking(text: str) -> tuple[str | None, str]:
             match = pattern.search(remainder)
             if not match:
                 break
-            segment = match.group(1).strip()
+            segment = _normalize_thinking_text(match.group(1))
             if segment:
                 thinking_parts.append(segment)
             remainder = pattern.sub("", remainder, count=1).strip()
 
     if thinking_parts:
-        return "\n\n".join(thinking_parts), remainder
+        return "\n\n".join(thinking_parts), _extract_move_json_remainder(remainder)
 
-    json_start = re.search(r'\{[^{}]*"move_type"', text, re.DOTALL)
-    if json_start and json_start.start() > 0:
-        prefix = text[: json_start.start()].strip()
-        if prefix and not prefix.startswith("{"):
-            return prefix, text[json_start.start() :].strip()
+    fenced = _FENCED_JSON_BLOCK.match(text.strip())
+    if fenced:
+        before = text[: fenced.start()].strip()
+        thinking = _normalize_thinking_text(before)
+        return thinking, fenced.group(1).strip()
+
+    json_start = _MOVE_JSON_PATTERN.search(text)
+    if json_start is not None:
+        remainder = _extract_move_json_remainder(text)
+        if json_start.start() > 0:
+            thinking = _normalize_thinking_text(text[: json_start.start()])
+            if thinking:
+                return thinking, remainder
+        return None, remainder
 
     return None, text.strip()
 
@@ -934,6 +986,7 @@ class OpenAIClient:
         thinking: str | None,
         on_thinking_update: Callable[[str], None] | None,
     ) -> None:
+        thinking = _normalize_thinking_text(thinking)
         if not thinking:
             return
         self.last_thinking = thinking
@@ -999,11 +1052,13 @@ class OpenAIClient:
         if reasoning:
             thinking = reasoning
             if tagged_thinking and tagged_thinking not in reasoning:
-                thinking = f"{reasoning.strip()}\n\n{tagged_thinking.strip()}".strip()
+                thinking = _normalize_thinking_text(f"{reasoning.strip()}\n\n{tagged_thinking.strip()}")
+            else:
+                thinking = reasoning
             self._publish_thinking(thinking, on_thinking_update)
-            return tagged_remainder or content
+            return tagged_remainder or _extract_move_json_remainder(content)
         self._publish_thinking(tagged_thinking, on_thinking_update)
-        return tagged_remainder or content
+        return tagged_remainder or _extract_move_json_remainder(content)
 
     def _apply_provider_params(self, params: dict[str, object]) -> dict[str, object]:
         """Add provider-specific request fields."""

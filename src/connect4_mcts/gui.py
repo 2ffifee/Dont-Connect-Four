@@ -1139,8 +1139,9 @@ def _prompt_player_file() -> str | None:
 def _prompt_llm_connection() -> tuple[str, str] | None:
     """Prompt for the LLM endpoint and API key.
 
-    Endpoint URLs are remembered locally and suggested with autocomplete as the
-    user types. API keys are **not** saved to disk.
+    Uses a listbox plus editable URL field instead of a combobox popdown,
+    which is unreliable on some Wayland compositors (e.g. Hyprland).
+    API keys are **not** saved to disk.
     """
     try:
         import tkinter
@@ -1154,44 +1155,72 @@ def _prompt_llm_connection() -> tuple[str, str] | None:
         endpoint_dropdown_values,
         load_endpoints,
         resolve_endpoint_input,
-        suggest_endpoints,
     )
 
     saved_endpoints = load_endpoints()
     dropdown_values = endpoint_dropdown_values()
     initial_url = saved_endpoints[0] if saved_endpoints else ""
     initial_display = display_for_url(initial_url)
+    initial_entry = initial_display if initial_display in dropdown_values else initial_url
     chosen: dict[str, tuple[str, str] | None] = {"value": None}
 
     try:
         root = tkinter.Tk()
         root.title("LLM connection")
-        root.geometry("620x250")
-        root.resizable(False, False)
+        list_height = min(max(len(dropdown_values), 4), 10)
+        root.geometry(f"620x{280 + list_height * 18}")
+        root.resizable(True, False)
 
         tkinter.Label(
             root,
-            text="API provider (pick a preset or type a custom OpenAI-compatible base URL):",
+            text="Select an API provider (click a row) or edit the base URL below:",
             anchor="w",
         ).pack(fill="x", padx=14, pady=(14, 4))
 
-        url_var = tkinter.StringVar(value=initial_display if initial_display in dropdown_values else initial_url)
-        url_combo = ttk.Combobox(root, textvariable=url_var, values=dropdown_values)
-        url_combo.pack(fill="x", padx=14)
+        list_frame = tkinter.Frame(root)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
 
-        def refresh_endpoint_suggestions(_event: object | None = None) -> None:
-            url_combo["values"] = suggest_endpoints(url_var.get())
+        listbox = tkinter.Listbox(list_frame, height=list_height, exportselection=False, activestyle="dotbox")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-        url_combo.bind("<KeyRelease>", refresh_endpoint_suggestions)
-        url_combo.bind("<Button-1>", refresh_endpoint_suggestions)
+        for value in dropdown_values:
+            listbox.insert("end", value)
+
+        tkinter.Label(root, text="Base URL:", anchor="w").pack(fill="x", padx=14, pady=(0, 4))
+        url_var = tkinter.StringVar(value=initial_entry)
+        url_entry = tkinter.Entry(root, textvariable=url_var)
+        url_entry.pack(fill="x", padx=14)
 
         api_key_label = tkinter.Label(root, text=api_key_hint(resolve_endpoint_input(url_var.get())), anchor="w")
 
         def refresh_api_key_hint(_event: object | None = None) -> None:
             api_key_label.config(text=api_key_hint(resolve_endpoint_input(url_var.get())))
 
-        url_combo.bind("<<ComboboxSelected>>", refresh_api_key_hint)
-        url_combo.bind("<KeyRelease>", refresh_api_key_hint, add="+")
+        def select_listbox_item(index: int) -> None:
+            if 0 <= index < listbox.size():
+                listbox.selection_clear(0, "end")
+                listbox.selection_set(index)
+                listbox.activate(index)
+                listbox.see(index)
+
+        def apply_listbox_selection(_event: object | None = None) -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            url_var.set(listbox.get(selection[0]))
+            refresh_api_key_hint()
+
+        for index, value in enumerate(dropdown_values):
+            if value == initial_entry:
+                select_listbox_item(index)
+                break
+
+        listbox.bind("<<ListboxSelect>>", apply_listbox_selection)
+        listbox.bind("<Double-Button-1>", apply_listbox_selection)
+        url_entry.bind("<KeyRelease>", refresh_api_key_hint)
 
         api_key_label.pack(fill="x", padx=14, pady=(12, 4))
 
@@ -1212,7 +1241,7 @@ def _prompt_llm_connection() -> tuple[str, str] | None:
         tkinter.Button(buttons, text="Connect", width=10, command=confirm).pack(side="left", padx=8)
         tkinter.Button(buttons, text="Cancel", width=10, command=cancel).pack(side="left", padx=8)
         root.protocol("WM_DELETE_WINDOW", cancel)
-        url_combo.focus_set()
+        listbox.focus_set()
         root.mainloop()
         return chosen["value"]
     except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
@@ -1220,7 +1249,7 @@ def _prompt_llm_connection() -> tuple[str, str] | None:
 
 
 def _prompt_model_choice(models: Sequence[str]) -> str | None:
-    """Show a dropdown of ``models`` and return the chosen id (or ``None``)."""
+    """Show a model picker and return the chosen id (or ``None``)."""
     if not models:
         return None
     try:
@@ -1233,13 +1262,38 @@ def _prompt_model_choice(models: Sequence[str]) -> str | None:
     try:
         root = tkinter.Tk()
         root.title("Choose LLM model")
-        root.geometry("420x150")
+        list_height = min(max(len(models), 4), 12)
+        root.geometry(f"420x{180 + list_height * 18}")
 
-        tkinter.Label(root, text="Select a model to play against:").pack(padx=14, pady=(16, 6))
+        tkinter.Label(root, text="Select a model (click a row) or edit the name below:").pack(
+            padx=14, pady=(16, 6)
+        )
+
+        list_frame = tkinter.Frame(root)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        listbox = tkinter.Listbox(list_frame, height=list_height, exportselection=False, activestyle="dotbox")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for model in models:
+            listbox.insert("end", model)
+        listbox.selection_set(0)
+        listbox.activate(0)
+
         selected = tkinter.StringVar(value=models[0])
-        # Editable so an advanced user can still type a model not in the list.
-        combo = ttk.Combobox(root, textvariable=selected, values=list(models))
-        combo.pack(fill="x", padx=14)
+        entry = tkinter.Entry(root, textvariable=selected)
+        entry.pack(fill="x", padx=14)
+
+        def apply_listbox_selection(_event: object | None = None) -> None:
+            selection = listbox.curselection()
+            if selection:
+                selected.set(listbox.get(selection[0]))
+
+        listbox.bind("<<ListboxSelect>>", apply_listbox_selection)
+        listbox.bind("<Double-Button-1>", lambda _event: confirm())
 
         def confirm() -> None:
             chosen["value"] = selected.get().strip() or None
@@ -1254,7 +1308,7 @@ def _prompt_model_choice(models: Sequence[str]) -> str | None:
         tkinter.Button(buttons, text="Play", width=10, command=confirm).pack(side="left", padx=8)
         tkinter.Button(buttons, text="Cancel", width=10, command=cancel).pack(side="left", padx=8)
         root.protocol("WM_DELETE_WINDOW", cancel)
-        combo.focus_set()
+        listbox.focus_set()
         root.mainloop()
         return chosen["value"]
     except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
