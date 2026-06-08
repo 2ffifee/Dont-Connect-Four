@@ -1,0 +1,53 @@
+# Configuration for the Blunder Rate reference engine ("oracle").
+#
+# Read by: scripts/train_oracle.py
+#
+# The oracle is the neutral, strong MCTS engine used to compute the Blunder Rate
+# metric from the project report: a move is a "blunder" if the win-probability
+# (state value in [0, 1]) it leads to is more than `blunder_threshold` below the
+# value of the oracle's best move in the same position.
+
+[oracle]
+# Deliberately PLAIN UCT. The oracle must be an unbiased reference, so it does
+# NOT use the modifications that are being evaluated (PMBp / FPU / LGR);
+# otherwise it would systematically favour one experimental variant.
+algorithm      = "uct"      # documentation/validation only (use "uct" for the oracle)
+exploration    = 1.0        # UCT exploration constant C
+power_mean_p   = 1.0        # 1.0 = arithmetic mean = unbiased Monte Carlo value (do not change)
+fpu            = "none"     # "none" = standard UCT; or a float to enable First Play Urgency
+rollout_policy = "random"   # neutral, uniform rollouts
+final_move     = "robust"   # report the most-visited move as the best move
+seed           = 0
+
+[training]
+# The oracle "tree" is grown by self-play and reused afterwards as a persistent
+# transposition cache. A moderate per-move budget combined with many games gives
+# broad coverage of positions (better for scoring foreign tournament games) than
+# a few very deep lines.
+selfplay_iterations    = 1000    # per-move search budget while building the tree
+selfplay_temperature   = 1.0     # >0 samples moves proportional to visits (keeps games diverse)
+max_rollout_moves      = "none"  # "none" = full rollouts; the oracle should stay accurate (no cap)
+max_selfplay_games     = 100000  # hard upper bound (the memory cap usually stops the run first)
+max_minutes            = 480     # wall-clock safety stop (8 hours)
+checkpoint_every_games = 25      # periodically persist progress to `output`
+output                 = "models/oracle_uct.pkl"
+
+[memory]
+# 16 GB in-RAM budget for the oracle tree (fits 32 GB host with one 7 GB opponent).
+# Measured cost in this implementation is ~2.1-2.9 KB per cached state in RAM;
+# the pickle on disk is much smaller (~200 B/state) because Python objects are not
+# stored verbatim. Expect ~50k-70k new states per self-play game (1000 iters/move).
+# The script stops self-play once the estimated node count reaches the cap:
+#   max_nodes = limit_gb * 1024^3 * safety_fraction / bytes_per_node_estimate
+limit_gb                = 16.0
+bytes_per_node_estimate = 2867
+safety_fraction         = 0.85
+
+[evaluation]
+# Budget used LATER, when the (saved) oracle scores individual tournament
+# positions for Blunder Rate. Chosen large enough that the root value is stable
+# relative to the 0.3 threshold (Monte Carlo error << 0.3 and the search is deep
+# enough to avoid shallow-search bias). The saved player's `iterations` is set to
+# this value so it is ready to evaluate out of the box.
+iterations_per_position = 20000
+blunder_threshold       = 0.3

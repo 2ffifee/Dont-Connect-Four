@@ -66,6 +66,41 @@ class LGRMemory:
         return len(self.replies)
 
 
+@dataclass(frozen=True, slots=True)
+class SearchEvaluation:
+    """Result of evaluating a position with the search tree.
+
+    All values are win probabilities in ``[0, 1]`` from the perspective of
+    ``player_to_move`` (the side that is about to move in the evaluated state).
+
+    * ``root_value`` - value of the position under best play (the value of the
+      best move); this is the "state value" used by the Blunder Rate metric.
+    * ``move_values`` - value of each evaluated move, i.e. the win probability
+      for ``player_to_move`` after playing that move.
+    * ``move_visits`` - how many simulations backed each move (search support).
+    """
+
+    player_to_move: Player
+    root_value: float
+    best_move: Move
+    move_values: dict[Move, float]
+    move_visits: dict[Move, int]
+
+    def value_of(self, move: Move) -> float | None:
+        return self.move_values.get(move)
+
+    def regret_of(self, move: Move) -> float | None:
+        """How much worse ``move`` is than the best move (``0`` for the best)."""
+        value = self.move_values.get(move)
+        if value is None:
+            return None
+        return self.root_value - value
+
+    def is_blunder(self, move: Move, threshold: float = 0.3) -> bool:
+        regret = self.regret_of(move)
+        return regret is not None and regret > threshold
+
+
 @dataclass(slots=True)
 class _Node:
     """Statistics for a single game state in the transposition table.
@@ -183,6 +218,55 @@ class MCTSPlayer:
             return self._best_move(state)
         return self._sample_move(state, temperature)
 
+    def evaluate(self, root_state: GameState, run_search: bool = True) -> SearchEvaluation:
+        """Search ``root_state`` and report the root value and per-move values.
+
+        Intended for use as a reference/oracle engine (e.g. for the Blunder Rate
+        metric): it returns the win probability of the position under best play
+        plus the win probability of every candidate move, all from the
+        perspective of the player about to move.
+
+        With ``run_search=False`` no new iterations are run and only the
+        statistics already cached in the tree are reported, which is useful for
+        reusing a pre-built oracle tree.
+        """
+        legal_moves = root_state.legal_moves()
+        if not legal_moves:
+            raise MoveSelectionError("cannot evaluate a state with no legal moves")
+
+        if run_search:
+            self.search(root_state)
+        root = self._node(root_state)
+
+        move_values: dict[Move, float] = {}
+        move_visits: dict[Move, int] = {}
+        for move, child_state in root.children.items():
+            child = self._node(child_state)
+            if child.visits > 0:
+                move_values[move] = child.value_sum / child.visits
+                move_visits[move] = child.visits
+
+        if not move_values:
+            # No move was simulated (e.g. iterations exhausted on a single
+            # forced branch); fall back to a neutral, uninformative estimate.
+            fallback = legal_moves[0]
+            return SearchEvaluation(
+                player_to_move=root_state.current_player,
+                root_value=DRAW_REWARD,
+                best_move=fallback,
+                move_values={move: DRAW_REWARD for move in legal_moves},
+                move_visits={move: 0 for move in legal_moves},
+            )
+
+        best_move = max(move_values, key=lambda move: (move_values[move], move_visits[move]))
+        return SearchEvaluation(
+            player_to_move=root_state.current_player,
+            root_value=move_values[best_move],
+            best_move=best_move,
+            move_values=move_values,
+            move_visits=move_visits,
+        )
+
     def search(self, root_state: GameState) -> None:
         """Run ``iterations`` MCTS iterations from ``root_state`` into the tree."""
         root = self._node(root_state)
@@ -197,7 +281,7 @@ class MCTSPlayer:
         while True:
             node = self._node(state)
             path.append(state)
-            if state.status is GameStatus.FINISHED or not node.expanded:
+            if state.status is GameStatus.FINISHED or not node.expanded or not node.children:
                 break
             move = self._select_move(node)
             state = node.children[move]
@@ -205,9 +289,10 @@ class MCTSPlayer:
         node = self._node(state)
         if state.status is not GameStatus.FINISHED and node.visits > 0 and not node.expanded:
             self._expand(node, state)
-            move = self._select_move(node)
-            state = node.children[move]
-            path.append(state)
+            if node.children:
+                move = self._select_move(node)
+                state = node.children[move]
+                path.append(state)
 
         result, history = self._simulate(state)
 
@@ -269,6 +354,8 @@ class MCTSPlayer:
             if self.max_rollout_moves is not None and steps >= self.max_rollout_moves:
                 break
             legal_moves = sim.legal_moves()
+            if not legal_moves:
+                break
             chosen = self._rollout_move(sim, last_move, legal_moves)
             if self.rollout_policy == "lgr":
                 history.append((sim.current_player, last_move, chosen))
@@ -276,7 +363,7 @@ class MCTSPlayer:
             sim = sim.apply_move(chosen)
             steps += 1
 
-        result = sim.result if sim.result is not None else GameResult.from_line_counts(sim.line_counts())
+        result = sim.result if sim.result is not None else GameResult.from_board(sim.board)
         return result, history
 
     def _rollout_move(self, state: GameState, last_move: Move | None, legal_moves: tuple[Move, ...]) -> Move:

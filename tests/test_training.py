@@ -3,7 +3,9 @@ import pytest
 from connect4_mcts.game import GameState
 from connect4_mcts.players.mcts import LGRMemory, MCTSPlayer
 from connect4_mcts.training import (
+    grow_player_to_memory_cap,
     load_player,
+    max_nodes_from_memory_gb,
     save_player,
     selfplay_train,
     train_fpu,
@@ -11,6 +13,18 @@ from connect4_mcts.training import (
     train_pmbp,
     train_uct,
 )
+
+
+def test_max_nodes_from_memory_gb_respects_zero_budget() -> None:
+    assert max_nodes_from_memory_gb(0.0) == 0
+    assert max_nodes_from_memory_gb(7.0) > max_nodes_from_memory_gb(2.0)
+
+
+def test_grow_player_to_memory_cap_skips_when_cap_is_zero() -> None:
+    player = train_uct(iterations=20, seed=1)
+    games = grow_player_to_memory_cap(player, max_nodes=0)
+    assert games == 0
+    assert player.tree_size == 0
 
 
 def test_train_uct_sets_hyperparameters() -> None:

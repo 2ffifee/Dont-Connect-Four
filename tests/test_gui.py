@@ -1,5 +1,7 @@
-from connect4_mcts.game import GameResult, GameState, GameStatus, Move, MoveType, Player
+import pygame
+
 import connect4_mcts.gui as gui
+from connect4_mcts.game import GameResult, GameState, GameStatus, Move, MoveType, Player
 from connect4_mcts.gui import BoardLayout, cell_center, column_from_position, format_move, gui_status_message, result_text
 
 
@@ -70,22 +72,71 @@ def test_main_passes_initial_gui_config(monkeypatch) -> None:
     assert configs == [gui.GuiConfig(human=Player.YELLOW, agent_name="minimax", seed=9, depth=2)]
 
 
-def test_human_move_refreshes_display_before_agent_turn(monkeypatch) -> None:
+def test_human_move_schedules_agent_turn(monkeypatch) -> None:
     events = []
     game = object.__new__(gui.HumanVsAgentGui)
     game.config = gui.GuiConfig(human=Player.RED, agent_name="random")
     game.state = GameState.new()
     game.message = ""
 
-    def fake_refresh_display() -> None:
-        events.append(("refresh", game.state.move_count))
-
-    def fake_play_agent_turn() -> None:
+    def fake_schedule_agent_turn() -> None:
         events.append(("agent", game.state.move_count))
 
-    monkeypatch.setattr(game, "_refresh_display", fake_refresh_display)
-    monkeypatch.setattr(game, "_play_agent_turn", fake_play_agent_turn)
+    monkeypatch.setattr(game, "_schedule_agent_turn", fake_schedule_agent_turn)
 
     game._apply_human_move(Move(MoveType.DROP, 0))
 
-    assert events == [("refresh", 1), ("agent", 1)]
+    assert events == [("agent", 1)]
+
+
+def test_wrap_text_preserve_newlines_keeps_paragraph_breaks() -> None:
+    pygame.font.init()
+    font = pygame.font.SysFont("Arial", 18)
+    lines = gui._wrap_text_preserve_newlines("first line\n\nsecond line", font, 400)
+    assert "" in lines
+    assert any("first line" in line for line in lines)
+    assert any("second line" in line for line in lines)
+
+
+def test_scrollable_panel_follows_streaming_updates() -> None:
+    pygame.font.init()
+    font = pygame.font.SysFont("Arial", 18)
+    panel = gui.ScrollableTextPanel()
+    panel.rect = pygame.Rect(0, 0, 200, 80)
+    long_text = "\n".join(f"line {index}" for index in range(20))
+    panel.set_text(long_text)
+    panel.handle_wheel(1, font)
+    assert panel._follow_bottom is False
+    panel.set_text(long_text + "\nline 21")
+    assert "line 21" in panel.text
+
+
+def test_scrollbar_drag_moves_content() -> None:
+    pygame.font.init()
+    font = pygame.font.SysFont("Arial", 18)
+    panel = gui.ScrollableTextPanel()
+    panel.rect = pygame.Rect(0, 0, 220, 120)
+    panel.set_text("\n".join(f"line {index}" for index in range(30)))
+
+    layout = panel._scroll_layout(font)
+    assert layout is not None
+    assert layout.max_scroll > 0
+
+    thumb_center = layout.thumb.center
+    assert panel.handle_mouse_down(thumb_center, font)
+    panel.handle_mouse_motion((thumb_center[0], layout.track.top + 4), font)
+    assert panel.scroll_y == 0
+    assert panel._dragging_scrollbar is True
+
+    at_top = panel._scroll_layout(font)
+    assert at_top is not None
+    bottom_thumb_top = at_top.track.bottom - at_top.thumb.height
+    panel.handle_mouse_motion(
+        (thumb_center[0], bottom_thumb_top + panel._drag_grab_offset),
+        font,
+    )
+    assert panel.scroll_y == layout.max_scroll
+    assert panel._follow_bottom is True
+
+    assert panel.handle_mouse_up()
+    assert panel._dragging_scrollbar is False

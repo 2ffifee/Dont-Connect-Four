@@ -35,6 +35,7 @@ def play_game(
     initial_state: GameState | None = None,
     max_moves: int | None = None,
 ) -> PlayedGame:
+    prepare_agents_for_game(red, yellow)
     state = initial_state or GameState.new(first_player=Player.RED)
     agents = {
         Player.RED: red,
@@ -55,3 +56,20 @@ def play_game(
         state = state.apply_move(move)
 
     return PlayedGame(final_state=state, moves=tuple(records))
+
+
+def prepare_agents_for_game(red: Agent, yellow: Agent) -> None:
+    """Reset per-game agent state and run LLM rules briefings when needed."""
+    _begin_new_game_for_agents(red, yellow)
+    for agent, llm_player in ((red, Player.RED), (yellow, Player.YELLOW)):
+        send_briefing = getattr(agent, "send_rules_briefing", None)
+        if callable(send_briefing):
+            send_briefing(llm_player)
+
+
+def _begin_new_game_for_agents(*agents: Agent) -> None:
+    """Notify reused agents that a game ended (LLM players reset per-game state)."""
+    for agent in agents:
+        begin_new_game = getattr(agent, "begin_new_game", None)
+        if callable(begin_new_game):
+            begin_new_game()

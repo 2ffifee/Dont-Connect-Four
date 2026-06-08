@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -25,6 +27,16 @@ BOARD_TOP = 118
 MARGIN = 24
 TOP_BAR_HEIGHT = 104
 FOOTER_RESERVE = 76
+THINKING_PANEL_WIDTH = 272
+THINKING_PANEL_GAP = 20
+THINKING_PANEL_PADDING = 10
+THINKING_LINE_HEIGHT = 20
+THINKING_PANEL_MIN_WIDTH = 180
+SCROLLBAR_WIDTH = 12
+SCROLLBAR_MARGIN = 8
+SCROLLBAR_MIN_THUMB_HEIGHT = 32
+SCROLLBAR_HIT_PAD_X = 6
+SCROLLBAR_HIT_PAD_Y = 4
 MIN_CELL_SIZE = 28
 BUTTON_WIDTH = 96
 BUTTON_HEIGHT = 38
@@ -48,6 +60,226 @@ WHITE = (255, 255, 255)
 ERROR = (171, 39, 50)
 
 ScreenMode = str
+
+
+@dataclass(frozen=True, slots=True)
+class _ScrollLayout:
+    content_rect: pygame.Rect
+    content_height: int
+    visible: int
+    max_scroll: int
+    scroll_y: int
+    track: pygame.Rect
+    thumb: pygame.Rect
+
+
+class ScrollableTextPanel:
+    """Scrollable read-only text area with optional auto-follow while streaming."""
+
+    heading = "LLM chain-of-thought"
+
+    def __init__(self) -> None:
+        self.rect = pygame.Rect(0, 0, 0, 0)
+        self.text = ""
+        self.scroll_y = 0
+        self._follow_bottom = True
+        self._dragging_scrollbar = False
+        self._drag_grab_offset = 0
+
+    def clear(self) -> None:
+        self.text = ""
+        self.scroll_y = 0
+        self._follow_bottom = True
+        self._dragging_scrollbar = False
+        self._drag_grab_offset = 0
+
+    def set_text(self, text: str | None) -> None:
+        new = text or ""
+        if new == self.text:
+            return
+        self.text = new
+        if self._follow_bottom:
+            self.scroll_y = 10**9
+
+    def _content_viewport_height(self) -> int:
+        heading_space = 28
+        return max(0, self.rect.height - 2 * THINKING_PANEL_PADDING - heading_space)
+
+    def _layout_lines(self, font: pygame.font.Font, content_width: int) -> list[str]:
+        return _wrap_text_preserve_newlines(self.text, font, max(1, content_width))
+
+    def _display_lines(self, font: pygame.font.Font, content_width: int, placeholder: str | None) -> list[str]:
+        display_text = self.text or placeholder or ""
+        if not display_text:
+            return []
+        return _wrap_text_preserve_newlines(display_text, font, max(1, content_width))
+
+    def _sync_scroll(self, max_scroll: int) -> int:
+        if self._follow_bottom:
+            self.scroll_y = max_scroll
+        else:
+            self.scroll_y = max(0, min(max_scroll, self.scroll_y))
+        if max_scroll > 0 and self.scroll_y >= max_scroll:
+            self._follow_bottom = True
+        return self.scroll_y
+
+    def _scroll_layout(self, font: pygame.font.Font, *, placeholder: str | None = None) -> _ScrollLayout | None:
+        if self.rect.width <= 0 or self.rect.height <= 0:
+            return None
+
+        content_top = self.rect.y + THINKING_PANEL_PADDING + 28
+        gutter = SCROLLBAR_WIDTH + SCROLLBAR_MARGIN + 4
+        content_width = self.rect.width - 2 * THINKING_PANEL_PADDING - gutter
+        content_rect = pygame.Rect(
+            self.rect.x + THINKING_PANEL_PADDING,
+            content_top,
+            max(1, content_width),
+            self._content_viewport_height(),
+        )
+        lines = self._display_lines(font, content_rect.width, placeholder)
+        content_height = len(lines) * THINKING_LINE_HEIGHT
+        visible = content_rect.height
+        max_scroll = max(0, content_height - visible)
+        scroll_y = self._sync_scroll(max_scroll)
+
+        track = pygame.Rect(
+            self.rect.right - SCROLLBAR_MARGIN - SCROLLBAR_WIDTH,
+            content_rect.top,
+            SCROLLBAR_WIDTH,
+            content_rect.height,
+        )
+        if max_scroll <= 0:
+            thumb = pygame.Rect(track.x, track.top, track.width, track.height)
+        else:
+            thumb_height = max(
+                SCROLLBAR_MIN_THUMB_HEIGHT,
+                int(content_rect.height * visible / content_height),
+            )
+            thumb_height = min(thumb_height, track.height)
+            thumb_travel = max(1, track.height - thumb_height)
+            thumb_y = track.top + int(thumb_travel * scroll_y / max_scroll)
+            thumb = pygame.Rect(track.x, thumb_y, track.width, thumb_height)
+
+        return _ScrollLayout(
+            content_rect=content_rect,
+            content_height=content_height,
+            visible=visible,
+            max_scroll=max_scroll,
+            scroll_y=scroll_y,
+            track=track,
+            thumb=thumb,
+        )
+
+    def _thumb_hit_rect(self, layout: _ScrollLayout) -> pygame.Rect:
+        return layout.thumb.inflate(SCROLLBAR_HIT_PAD_X, SCROLLBAR_HIT_PAD_Y)
+
+    def _track_hit_rect(self, layout: _ScrollLayout) -> pygame.Rect:
+        return layout.track.inflate(SCROLLBAR_HIT_PAD_X, 0)
+
+    def _set_scroll_from_thumb_top(self, layout: _ScrollLayout, thumb_top: int) -> None:
+        if layout.max_scroll <= 0:
+            return
+        thumb_height = layout.thumb.height
+        thumb_travel = max(1, layout.track.height - thumb_height)
+        relative = max(0, min(thumb_travel, thumb_top - layout.track.top))
+        self._follow_bottom = False
+        self.scroll_y = int(relative * layout.max_scroll / thumb_travel)
+        if self.scroll_y >= layout.max_scroll:
+            self._follow_bottom = True
+
+    def handle_wheel(self, delta_y: int, font: pygame.font.Font, *, placeholder: str | None = None) -> None:
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None or layout.max_scroll <= 0:
+            return
+        self._follow_bottom = False
+        current = min(layout.max_scroll, self.scroll_y)
+        self.scroll_y = max(0, min(layout.max_scroll, current - delta_y * THINKING_LINE_HEIGHT))
+        if self.scroll_y >= layout.max_scroll:
+            self._follow_bottom = True
+
+    def handle_mouse_down(
+        self,
+        position: tuple[int, int],
+        font: pygame.font.Font,
+        *,
+        placeholder: str | None = None,
+    ) -> bool:
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None or layout.max_scroll <= 0:
+            return False
+
+        if self._thumb_hit_rect(layout).collidepoint(position):
+            self._dragging_scrollbar = True
+            self._follow_bottom = False
+            self._drag_grab_offset = position[1] - layout.thumb.top
+            return True
+
+        if self._track_hit_rect(layout).collidepoint(position):
+            self._dragging_scrollbar = True
+            self._follow_bottom = False
+            self._set_scroll_from_thumb_top(layout, position[1] - layout.thumb.height // 2)
+            updated = self._scroll_layout(font, placeholder=placeholder)
+            if updated is not None:
+                self._drag_grab_offset = position[1] - updated.thumb.top
+            return True
+
+        return False
+
+    def handle_mouse_motion(
+        self,
+        position: tuple[int, int],
+        font: pygame.font.Font,
+        *,
+        placeholder: str | None = None,
+    ) -> bool:
+        if not self._dragging_scrollbar:
+            return False
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None:
+            return False
+        self._set_scroll_from_thumb_top(layout, position[1] - self._drag_grab_offset)
+        return True
+
+    def handle_mouse_up(self) -> bool:
+        if not self._dragging_scrollbar:
+            return False
+        self._dragging_scrollbar = False
+        return True
+
+    def draw(self, surface: pygame.Surface, font: pygame.font.Font, *, placeholder: str | None = None) -> None:
+        if self.rect.width <= 0 or self.rect.height <= 0:
+            return
+
+        pygame.draw.rect(surface, BUTTON, self.rect, border_radius=6)
+        pygame.draw.rect(surface, BUTTON_BORDER, self.rect, width=1, border_radius=6)
+
+        heading = font.render(f"{self.heading}:", True, TEXT)
+        surface.blit(heading, (self.rect.x + THINKING_PANEL_PADDING, self.rect.y + THINKING_PANEL_PADDING))
+
+        layout = self._scroll_layout(font, placeholder=placeholder)
+        if layout is None:
+            return
+
+        display_text = self.text or placeholder or ""
+        lines = self._display_lines(font, layout.content_rect.width, placeholder) if display_text else []
+        content_top = layout.content_rect.top
+
+        previous_clip = surface.get_clip()
+        surface.set_clip(layout.content_rect)
+        y = content_top - layout.scroll_y
+        for line in lines:
+            if y + THINKING_LINE_HEIGHT >= layout.content_rect.top and y <= layout.content_rect.bottom:
+                if line:
+                    line_surface = font.render(line, True, MUTED_TEXT)
+                    surface.blit(line_surface, (layout.content_rect.x, y))
+            y += THINKING_LINE_HEIGHT
+        surface.set_clip(previous_clip)
+
+        if layout.max_scroll > 0:
+            pygame.draw.rect(surface, BOARD_EDGE, layout.track, border_radius=6)
+            thumb_color = BUTTON_ACTIVE if self._dragging_scrollbar else MUTED_TEXT
+            pygame.draw.rect(surface, thumb_color, layout.thumb, border_radius=6)
+            pygame.draw.rect(surface, BUTTON_BORDER, layout.thumb, width=1, border_radius=6)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,9 +310,21 @@ class GuiConfig:
     two_player: bool = False
     loaded_agent: Agent | None = None
     loaded_label: str | None = None
+    llm_agent: Agent | None = None
+    llm_model: str | None = None
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_label: str | None = None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from connect4_mcts.players.llm import llm_debug_enabled
+
+    if llm_debug_enabled():
+        import logging
+
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
     parser = argparse.ArgumentParser(description="Play Don't Connect 4 against an agent.")
     parser.add_argument("--seed", type=int, default=None, help="Seed for the random player.")
     parser.add_argument("--human", choices=("red", "yellow"), default="red", help="Human player color.")
@@ -88,6 +332,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--depth", type=int, default=3, help="Search depth for minimax.")
     parser.add_argument("--two-player", action="store_true", help="Start in local two-player mode.")
     parser.add_argument("--load", default=None, help="Path to a pickled trained player to use as opponent.")
+    parser.add_argument("--llm", action="store_true", help="Use an LLM (OpenAI-compatible) opponent.")
+    parser.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model name (with --llm).")
+    parser.add_argument(
+        "--llm-base-url",
+        default=None,
+        help="Base URL of an OpenAI-compatible server, e.g. http://localhost:11434/v1 (with --llm). "
+        "API key is read from OPENAI_API_KEY.",
+    )
     args = parser.parse_args(argv)
 
     config = GuiConfig(
@@ -103,6 +355,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.loaded_agent = load_player(args.load)
         config.loaded_label = os.path.basename(args.load)
         config.agent_name = "loaded"
+
+    if args.llm:
+        from connect4_mcts.players.llm import create_llm_player
+
+        config.llm_model = args.llm_model
+        config.llm_base_url = args.llm_base_url
+        config.llm_agent = create_llm_player(args.llm_model, base_url=args.llm_base_url)
+        config.llm_label = f"LLM: {args.llm_model}"
+        config.agent_name = "llm"
 
     HumanVsAgentGui(config=config).run()
     return 0
@@ -133,6 +394,12 @@ class HumanVsAgentGui:
         self.agent: Agent = self._make_agent()
         self.selected_move_type = MoveType.DROP
         self.message = ""
+        self.llm_awaiting_rules_ack = False
+        self.llm_thinking_panel = ScrollableTextPanel()
+        self._agent_busy = False
+        self._async_generation = 0
+        self._async_lock = threading.Lock()
+        self._async_result: tuple[str, object] | None = None
         self.layout = self._compute_board_layout()
 
     def run(self) -> None:
@@ -146,8 +413,17 @@ class HumanVsAgentGui:
                 elif event.type == pygame.KEYDOWN:
                     self._handle_key(event.key)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    self._handle_click(event.pos)
+                    if not self._handle_thinking_panel_mouse_down(event.pos):
+                        self._handle_click(event.pos)
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    self._handle_thinking_panel_mouse_up()
+                elif event.type == pygame.MOUSEMOTION:
+                    self._handle_thinking_panel_mouse_motion(event.pos)
+                elif event.type == pygame.MOUSEWHEEL:
+                    self._handle_wheel(event.y)
 
+            self._poll_llm_thinking()
+            self._process_async_results()
             self._draw()
             pygame.display.flip()
             self.clock.tick(60)
@@ -192,11 +468,15 @@ class HumanVsAgentGui:
             self._reset()
             return
         if self._menu_button_rect().collidepoint(position):
+            self._invalidate_async_work()
             self.mode = "setup"
             self.message = ""
+            self.llm_thinking_panel.clear()
             return
 
         if self.state.status is GameStatus.FINISHED:
+            return
+        if self._llm_rules_gate_active():
             return
         if not self.config.two_player and self.state.current_player is not self.config.human:
             return
@@ -218,38 +498,212 @@ class HumanVsAgentGui:
             return
 
         if self.state.status is not GameStatus.FINISHED and self.state.current_player is not self.config.human:
-            self._refresh_display()
-            self._play_agent_turn()
+            self._schedule_agent_turn()
+
+    def _invalidate_async_work(self) -> None:
+        self._async_generation += 1
+        self._agent_busy = False
+        with self._async_lock:
+            self._async_result = None
+
+    def _process_async_results(self) -> None:
+        with self._async_lock:
+            result = self._async_result
+            self._async_result = None
+        if result is None:
+            return
+
+        self._agent_busy = False
+        self.llm_awaiting_rules_ack = False
+        kind, payload = result
+
+        if kind == "briefing":
+            ack = str(payload)
+            self.message = f"LLM ready: {_shorten(ack, 72)}"
+            thinking = getattr(self.agent, "last_thinking", None)
+            if thinking:
+                self.llm_thinking_panel.set_text(str(thinking))
+            self._maybe_schedule_agent_turn()
+            return
+
+        if kind == "briefing_error":
+            self.message = f"LLM rules briefing failed ({_llm_error_detail(payload, self.agent)})"
+            return
+
+        if kind == "error":
+            exc = payload
+            legal_moves = self.state.legal_moves()
+            if not legal_moves:
+                self.message = f"Agent error ({_llm_error_detail(exc, self.agent)})"
+                return
+            move = random.choice(legal_moves)
+            self.state = self.state.apply_move(move)
+            name = self._opponent_label()
+            self.message = f"{name} error ({_llm_error_detail(exc, self.agent)}) - played random {format_move(move)}"
+            self._maybe_schedule_agent_turn()
+            return
+
+        move, thinking = payload
+        try:
+            if not self.state.is_legal_move(move):
+                raise IllegalMoveError(f"agent returned illegal move: {move}")
+        except IllegalMoveError as exc:
+            legal_moves = self.state.legal_moves()
+            if not legal_moves:
+                self.message = str(exc)
+                return
+            move = random.choice(legal_moves)
+            name = self._opponent_label()
+            self.message = f"{name} illegal move - played random {format_move(move)}"
+        else:
+            name = self._opponent_label()
+            self.message = f"{name}: {format_move(move)}"
+
+        if thinking:
+            self.llm_thinking_panel.set_text(str(thinking))
+
+        self.state = self.state.apply_move(move)
+        self._maybe_schedule_agent_turn()
+
+    def _opponent_label(self) -> str:
+        if self.config.agent_name == "loaded" and self.config.loaded_label:
+            return _shorten(self.config.loaded_label, 28)
+        if self.config.agent_name == "llm" and self.config.llm_label:
+            return _shorten(self.config.llm_label, 28)
+        return format_agent_name(self.config.agent_name)
+
+    def _maybe_schedule_agent_turn(self) -> None:
+        if self.config.two_player or self.state.status is GameStatus.FINISHED:
+            return
+        if self.state.current_player is self.config.human:
+            return
+        if self._agent_busy:
+            return
+        self._schedule_agent_turn()
+
+    def _schedule_agent_turn(self) -> None:
+        if self._agent_busy or self.state.status is GameStatus.FINISHED:
+            return
+        if self.config.two_player or self.state.current_player is self.config.human:
+            return
+
+        self._agent_busy = True
+        self.message = f"{self._opponent_label()} thinking..."
+        self.llm_thinking_panel.clear()
+        state = self.state
+        agent = self.agent
+        generation = self._async_generation
+
+        def worker() -> tuple[str, object]:
+            try:
+                move = agent.choose_move(state)
+                thinking = getattr(agent, "last_thinking", None)
+                return ("move", (move, thinking))
+            except Exception as exc:  # noqa: BLE001 - report in the UI thread
+                return ("error", exc)
+
+        def run() -> None:
+            result = worker()
+            if generation != self._async_generation:
+                return
+            with self._async_lock:
+                self._async_result = result
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _schedule_rules_briefing(self) -> None:
+        send_briefing = getattr(self.agent, "send_rules_briefing", None)
+        if not callable(send_briefing):
+            self._maybe_schedule_agent_turn()
+            return
+
+        llm_color = self._llm_agent_color()
+        self.llm_awaiting_rules_ack = True
+        self.message = "Sending rules to LLM..."
+        self.llm_thinking_panel.clear()
+        agent = self.agent
+        generation = self._async_generation
+
+        def worker() -> tuple[str, object]:
+            try:
+                ack = send_briefing(llm_color)
+                return ("briefing", ack)
+            except Exception as exc:  # noqa: BLE001 - report in the UI thread
+                return ("briefing_error", exc)
+
+        def run() -> None:
+            result = worker()
+            if generation != self._async_generation:
+                return
+            with self._async_lock:
+                self._async_result = result
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _refresh_display(self) -> None:
         self._draw()
         pygame.display.flip()
 
-    def _play_agent_turn(self) -> None:
-        if self.state.status is GameStatus.FINISHED:
-            return
-
-        move = self.agent.choose_move(self.state)
-        self.state = self.state.apply_move(move)
-        self.message = f"{format_agent_name(self.config.agent_name)}: {format_move(move)}"
-
     def _reset(self) -> None:
         self._start_game()
 
     def _start_game(self) -> None:
+        self._invalidate_async_work()
         self.state = GameState.new(first_player=Player.RED)
         self.agent = self._make_agent()
+        self._reset_llm_conversation()
         self.selected_move_type = MoveType.DROP
         self.mode = "game"
         self.message = ""
+        self.llm_thinking_panel.clear()
         self.layout = self._compute_board_layout()
-        if not self.config.two_player and self.state.current_player is not self.config.human:
-            self._play_agent_turn()
+        if self._needs_llm_rules_briefing():
+            self._schedule_rules_briefing()
+            return
+        self._maybe_schedule_agent_turn()
+
+    def _llm_agent_color(self) -> Player:
+        return self.config.human.opponent
+
+    def _needs_llm_rules_briefing(self) -> bool:
+        return self.config.agent_name == "llm" and not self.config.two_player
+
+    def _llm_rules_gate_active(self) -> bool:
+        if not self._needs_llm_rules_briefing():
+            return False
+        if self.llm_awaiting_rules_ack:
+            return True
+        if not getattr(self.agent, "rules_acknowledged", True):
+            # Human RED waits for YELLOW LLM briefing before the opening move.
+            return self.config.human is Player.RED and self._llm_agent_color() is Player.YELLOW
+        return False
 
     def _make_agent(self) -> Agent:
         if self.config.agent_name == "loaded" and self.config.loaded_agent is not None:
             return self.config.loaded_agent
+        if self.config.agent_name == "llm":
+            if self.config.llm_agent is None and self.config.llm_model is not None:
+                self.config.llm_agent = self._make_llm_agent()
+            if self.config.llm_agent is not None:
+                return self.config.llm_agent
         return create_agent(self.config.agent_name, seed=self.config.seed, depth=self.config.depth)
+
+    def _make_llm_agent(self) -> Agent:
+        from connect4_mcts.players.llm import create_llm_player
+
+        return create_llm_player(
+            self.config.llm_model,
+            api_key=self.config.llm_api_key,
+            base_url=self.config.llm_base_url,
+            seed=self.config.seed,
+        )
+
+    def _reset_llm_conversation(self) -> None:
+        if self.config.agent_name != "llm":
+            return
+        begin_new_game = getattr(self.agent, "begin_new_game", None)
+        if callable(begin_new_game):
+            begin_new_game()
 
     def _load_player_from_file(self) -> None:
         path = _prompt_player_file()
@@ -270,6 +724,61 @@ class HumanVsAgentGui:
         self.config.agent_name = "loaded"
         self.message = ""
 
+    def _configure_llm_opponent(self) -> None:
+        connection = _prompt_llm_connection()
+        if connection is None:
+            self.message = "LLM setup cancelled"
+            return
+        base_url, api_key = connection
+
+        try:
+            from connect4_mcts.players.llm import OpenAIClient, create_llm_player
+            from connect4_mcts.llm_settings import endpoint_provider_label, remember_endpoint
+        except ImportError:
+            self._notify_llm(False, "Install 'openai' to play vs LLM (pip install openai)")
+            return
+
+        endpoint = endpoint_provider_label(base_url)
+        self.message = f"Connecting to {endpoint}..."
+        self._refresh_display()
+
+        try:
+            client = OpenAIClient(api_key=api_key or None, base_url=base_url or None)
+            models = client.list_models()
+        except Exception as exc:  # noqa: BLE001 - surface any connection/auth failure
+            self._notify_llm(False, f"Connection to {endpoint} failed:\n{_short_error(exc)}")
+            return
+
+        if not models:
+            self._notify_llm(False, f"Connected to {endpoint}, but it returned no models.")
+            return
+
+        self._notify_llm(True, f"Connected to {endpoint}.\n{len(models)} model(s) available.")
+
+        model = _prompt_model_choice(_chat_models_first(models, base_url=base_url or client.base_url))
+        if not model:
+            self.message = "LLM model selection cancelled"
+            return
+
+        self.config.llm_model = model
+        self.config.llm_base_url = client.base_url
+        self.config.llm_api_key = api_key or None
+        self.config.llm_agent = create_llm_player(
+            model,
+            api_key=api_key or None,
+            base_url=client.base_url,
+            seed=self.config.seed,
+        )
+
+        remember_endpoint(base_url)
+        self.config.llm_label = f"LLM: {model}"
+        self.config.agent_name = "llm"
+        self.message = f"LLM ready: {model}"
+
+    def _notify_llm(self, success: bool, text: str) -> None:
+        self.message = text.replace("\n", " ")
+        _notify(success, "LLM connection" if success else "LLM connection failed", text)
+
     def _handle_setup_click(self, position: tuple[int, int]) -> None:
         rects = self._setup_rects()
         if rects["mode_single"].collidepoint(position):
@@ -278,10 +787,10 @@ class HumanVsAgentGui:
         if rects["mode_multiplayer"].collidepoint(position):
             self.config.two_player = True
             return
-        if rects["human_red"].collidepoint(position):
+        if rects["human_red"].collidepoint(position) and not self.config.two_player:
             self.config.human = Player.RED
             return
-        if rects["human_yellow"].collidepoint(position):
+        if rects["human_yellow"].collidepoint(position) and not self.config.two_player:
             self.config.human = Player.YELLOW
             return
         if rects["agent_random"].collidepoint(position):
@@ -293,6 +802,9 @@ class HumanVsAgentGui:
         if rects["load"].collidepoint(position):
             self._load_player_from_file()
             return
+        if rects["llm"].collidepoint(position):
+            self._configure_llm_opponent()
+            return
         if rects["depth_minus"].collidepoint(position):
             self.config.depth = max(1, self.config.depth - 1)
             return
@@ -302,16 +814,80 @@ class HumanVsAgentGui:
         if rects["start"].collidepoint(position):
             self._start_game()
 
+    def _poll_llm_thinking(self) -> None:
+        if self.config.agent_name != "llm" or self.mode != "game":
+            return
+        if not self._agent_busy and not self.llm_awaiting_rules_ack:
+            return
+        thinking = getattr(self.agent, "last_thinking", None)
+        if thinking:
+            self.llm_thinking_panel.set_text(str(thinking))
+
+    def _thinking_panel_placeholder(self) -> str | None:
+        if self._agent_busy or self.llm_awaiting_rules_ack:
+            return "Waiting for response..."
+        return None
+
+    def _handle_wheel(self, delta_y: int) -> None:
+        if self.mode != "game" or self.config.agent_name != "llm":
+            return
+        if not self.llm_thinking_panel.rect.collidepoint(pygame.mouse.get_pos()):
+            return
+        self.llm_thinking_panel.handle_wheel(
+            delta_y,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
+
+    def _handle_thinking_panel_mouse_down(self, position: tuple[int, int]) -> bool:
+        if self.mode != "game" or self.config.agent_name != "llm":
+            return False
+        return self.llm_thinking_panel.handle_mouse_down(
+            position,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
+
+    def _handle_thinking_panel_mouse_motion(self, position: tuple[int, int]) -> None:
+        if self.mode != "game" or self.config.agent_name != "llm":
+            return
+        self.llm_thinking_panel.handle_mouse_motion(
+            position,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
+
+    def _handle_thinking_panel_mouse_up(self) -> None:
+        self.llm_thinking_panel.handle_mouse_up()
+
     def _toggle_move_type(self) -> None:
         self.selected_move_type = MoveType.PUSH if self.selected_move_type is MoveType.DROP else MoveType.DROP
 
+    def _thinking_panel_width(self) -> int:
+        if self.config.agent_name != "llm" or self.mode != "game":
+            return 0
+        max_panel = max(THINKING_PANEL_MIN_WIDTH, (self.width - 2 * MARGIN) // 3)
+        return min(THINKING_PANEL_WIDTH, max_panel)
+
     def _compute_board_layout(self) -> BoardLayout:
-        available_width = self.width - 2 * MARGIN
         available_height = self.height - TOP_BAR_HEIGHT - FOOTER_RESERVE
-        cell_size = min(available_width // COLUMNS, available_height // ROWS)
+        panel_width = self._thinking_panel_width()
+        board_area_width = self.width - 2 * MARGIN - panel_width - (THINKING_PANEL_GAP if panel_width else 0)
+        cell_size = min(board_area_width // COLUMNS, available_height // ROWS)
         cell_size = max(MIN_CELL_SIZE, cell_size)
         board_width = cell_size * COLUMNS
-        left = (self.width - board_width) // 2
+        if panel_width:
+            left = MARGIN + panel_width + THINKING_PANEL_GAP + max(0, (board_area_width - board_width) // 2)
+        else:
+            left = (self.width - board_width) // 2
+
+        panel_height = available_height
+        self.llm_thinking_panel.rect = pygame.Rect(
+            MARGIN,
+            TOP_BAR_HEIGHT,
+            panel_width,
+            panel_height,
+        )
         return BoardLayout(left=left, top=TOP_BAR_HEIGHT, cell_size=cell_size)
 
     def _draw(self) -> None:
@@ -323,17 +899,22 @@ class HumanVsAgentGui:
         self._draw_header()
         self._draw_controls()
         self._draw_board()
+        self._draw_thinking_panel()
         self._draw_footer()
 
     def _draw_header(self) -> None:
         title = self.large_font.render("Don't Connect 4", True, TEXT)
         self.screen.blit(title, (MARGIN, 22))
 
-        status = self.font.render(
-            gui_status_message(self.state, self.config.human, self.config.agent_name, self.config.two_player),
-            True,
-            TEXT,
-        )
+        if self._llm_rules_gate_active():
+            status_line = "Waiting for LLM to acknowledge the rules..."
+        elif self._agent_busy:
+            status_line = f"{self._opponent_label()} thinking..."
+        else:
+            status_line = gui_status_message(
+                self.state, self.config.human, self.config.agent_name, self.config.two_player
+            )
+        status = self.font.render(status_line, True, TEXT)
         self.screen.blit(status, (MARGIN, 62))
 
     def _draw_controls(self) -> None:
@@ -356,9 +937,12 @@ class HumanVsAgentGui:
         self._draw_button(rects["mode_single"], "Single", not self.config.two_player)
         self._draw_button(rects["mode_multiplayer"], "2 Players", self.config.two_player)
 
-        self._draw_setup_label("Your color", rects["color_label_y"], center_x)
-        self._draw_button(rects["human_red"], "Red", self.config.human is Player.RED)
-        self._draw_button(rects["human_yellow"], "Yellow", self.config.human is Player.YELLOW)
+        if not self.config.two_player:
+            self._draw_setup_label("Your color (Red moves first)", rects["color_label_y"], center_x)
+            self._draw_button(rects["human_red"], "Red", self.config.human is Player.RED)
+            self._draw_button(rects["human_yellow"], "Yellow", self.config.human is Player.YELLOW)
+        else:
+            self._draw_setup_label("Local two-player (Red moves first)", rects["color_label_y"], center_x)
 
         self._draw_setup_label("Opponent", rects["opponent_label_y"], center_x)
         self._draw_button(rects["agent_random"], "Random", self.config.agent_name == "random")
@@ -367,6 +951,9 @@ class HumanVsAgentGui:
         load_label = _shorten(self.config.loaded_label) if self.config.loaded_label else "Load player..."
         self._draw_button(rects["load"], load_label, self.config.agent_name == "loaded")
 
+        llm_label = _shorten(self.config.llm_label) if self.config.llm_label else "Play vs LLM..."
+        self._draw_button(rects["llm"], llm_label, self.config.agent_name == "llm")
+
         self._draw_setup_label("Minimax depth", rects["depth_label_y"], center_x)
         self._draw_button(rects["depth_minus"], "-", False)
         depth = self.font.render(str(self.config.depth), True, TEXT)
@@ -374,6 +961,11 @@ class HumanVsAgentGui:
         self._draw_button(rects["depth_plus"], "+", False)
 
         self._draw_button(rects["start"], "Start", True)
+
+        if self.message:
+            color = ERROR if "fail" in self.message.lower() else MUTED_TEXT
+            status = self.small_font.render(self.message, True, color)
+            self.screen.blit(status, status.get_rect(center=(center_x, rects["start"].bottom + 26)))
 
     def _draw_setup_label(self, label: str, y: int, center_x: int) -> None:
         surface = self.font.render(label, True, TEXT)
@@ -403,14 +995,27 @@ class HumanVsAgentGui:
             x = self.layout.left + column * self.layout.cell_size + self.layout.cell_size // 2
             self.screen.blit(label, label.get_rect(center=(x, self.layout.top + self.layout.height + 22)))
 
+    def _draw_thinking_panel(self) -> None:
+        if self.config.agent_name != "llm":
+            return
+        self.llm_thinking_panel.draw(
+            self.screen,
+            self.small_font,
+            placeholder=self._thinking_panel_placeholder(),
+        )
+
     def _draw_footer(self) -> None:
         footer_y = self.layout.top + self.layout.height + 48
         if self.state.status is GameStatus.FINISHED:
             text = result_text(self.state.result)
             color = TEXT
+        elif self._llm_rules_gate_active():
+            text = "Waiting for LLM to acknowledge the rules..."
+            color = MUTED_TEXT
         elif self.message:
             text = self.message
-            color = ERROR if self.message == "Illegal move" else MUTED_TEXT
+            lowered = self.message.lower()
+            color = ERROR if "error" in lowered or "illegal" in lowered or "fail" in lowered else MUTED_TEXT
         else:
             text = "Space toggles move type. R resets."
             color = MUTED_TEXT
@@ -445,7 +1050,7 @@ class HumanVsAgentGui:
         pair_left = center_x - pair_width // 2
         pair_right_left = pair_left + SETUP_BUTTON_WIDTH + SETUP_BUTTON_GAP
 
-        block_height = 640
+        block_height = 700
         top = max(16, (self.height - block_height) // 2)
         label_to_button = 28
         row_gap = 22
@@ -471,6 +1076,8 @@ class HumanVsAgentGui:
         agent_random, agent_minimax = pair(cursor + label_to_button)
         cursor += label_to_button + SETUP_BUTTON_HEIGHT + 10
         load = pygame.Rect(pair_left, cursor, pair_width, SETUP_BUTTON_HEIGHT)
+        cursor += SETUP_BUTTON_HEIGHT + 10
+        llm = pygame.Rect(pair_left, cursor, pair_width, SETUP_BUTTON_HEIGHT)
         cursor += SETUP_BUTTON_HEIGHT + row_gap
 
         depth_label_y = cursor
@@ -495,6 +1102,7 @@ class HumanVsAgentGui:
             "agent_random": agent_random,
             "agent_minimax": agent_minimax,
             "load": load,
+            "llm": llm,
             "depth_label_y": depth_label_y,
             "depth_minus": depth_minus,
             "depth_value": depth_value,
@@ -526,6 +1134,267 @@ def _prompt_player_file() -> str | None:
         return path or None
     except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
         return None
+
+
+def _prompt_llm_connection() -> tuple[str, str] | None:
+    """Prompt for the LLM endpoint and API key.
+
+    Uses a listbox plus editable URL field instead of a combobox popdown,
+    which is unreliable on some Wayland compositors (e.g. Hyprland).
+    API keys are **not** saved to disk.
+    """
+    try:
+        import tkinter
+        from tkinter import ttk
+    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
+        return None
+
+    from connect4_mcts.llm_settings import (
+        api_key_hint,
+        display_for_url,
+        endpoint_dropdown_values,
+        load_endpoints,
+        resolve_endpoint_input,
+    )
+
+    saved_endpoints = load_endpoints()
+    dropdown_values = endpoint_dropdown_values()
+    initial_url = saved_endpoints[0] if saved_endpoints else ""
+    initial_display = display_for_url(initial_url)
+    initial_entry = initial_display if initial_display in dropdown_values else initial_url
+    chosen: dict[str, tuple[str, str] | None] = {"value": None}
+
+    try:
+        root = tkinter.Tk()
+        root.title("LLM connection")
+        list_height = min(max(len(dropdown_values), 4), 10)
+        root.geometry(f"620x{280 + list_height * 18}")
+        root.resizable(True, False)
+
+        tkinter.Label(
+            root,
+            text="Select an API provider (click a row) or edit the base URL below:",
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(14, 4))
+
+        list_frame = tkinter.Frame(root)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        listbox = tkinter.Listbox(list_frame, height=list_height, exportselection=False, activestyle="dotbox")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for value in dropdown_values:
+            listbox.insert("end", value)
+
+        tkinter.Label(root, text="Base URL:", anchor="w").pack(fill="x", padx=14, pady=(0, 4))
+        url_var = tkinter.StringVar(value=initial_entry)
+        url_entry = tkinter.Entry(root, textvariable=url_var)
+        url_entry.pack(fill="x", padx=14)
+
+        api_key_label = tkinter.Label(root, text=api_key_hint(resolve_endpoint_input(url_var.get())), anchor="w")
+
+        def refresh_api_key_hint(_event: object | None = None) -> None:
+            api_key_label.config(text=api_key_hint(resolve_endpoint_input(url_var.get())))
+
+        def select_listbox_item(index: int) -> None:
+            if 0 <= index < listbox.size():
+                listbox.selection_clear(0, "end")
+                listbox.selection_set(index)
+                listbox.activate(index)
+                listbox.see(index)
+
+        def apply_listbox_selection(_event: object | None = None) -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            url_var.set(listbox.get(selection[0]))
+            refresh_api_key_hint()
+
+        for index, value in enumerate(dropdown_values):
+            if value == initial_entry:
+                select_listbox_item(index)
+                break
+
+        listbox.bind("<<ListboxSelect>>", apply_listbox_selection)
+        listbox.bind("<Double-Button-1>", apply_listbox_selection)
+        url_entry.bind("<KeyRelease>", refresh_api_key_hint)
+
+        api_key_label.pack(fill="x", padx=14, pady=(12, 4))
+
+        api_key_var = tkinter.StringVar()
+        api_key_entry = tkinter.Entry(root, textvariable=api_key_var, show="*")
+        api_key_entry.pack(fill="x", padx=14)
+
+        def confirm() -> None:
+            chosen["value"] = (resolve_endpoint_input(url_var.get()), api_key_var.get().strip())
+            root.destroy()
+
+        def cancel() -> None:
+            chosen["value"] = None
+            root.destroy()
+
+        buttons = tkinter.Frame(root)
+        buttons.pack(pady=16)
+        tkinter.Button(buttons, text="Connect", width=10, command=confirm).pack(side="left", padx=8)
+        tkinter.Button(buttons, text="Cancel", width=10, command=cancel).pack(side="left", padx=8)
+        root.protocol("WM_DELETE_WINDOW", cancel)
+        listbox.focus_set()
+        root.mainloop()
+        return chosen["value"]
+    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
+        return None
+
+
+def _prompt_model_choice(models: Sequence[str]) -> str | None:
+    """Show a model picker and return the chosen id (or ``None``)."""
+    if not models:
+        return None
+    try:
+        import tkinter
+        from tkinter import ttk
+    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
+        return None
+
+    chosen: dict[str, str | None] = {"value": None}
+    try:
+        root = tkinter.Tk()
+        root.title("Choose LLM model")
+        list_height = min(max(len(models), 4), 12)
+        root.geometry(f"420x{180 + list_height * 18}")
+
+        tkinter.Label(root, text="Select a model (click a row) or edit the name below:").pack(
+            padx=14, pady=(16, 6)
+        )
+
+        list_frame = tkinter.Frame(root)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        listbox = tkinter.Listbox(list_frame, height=list_height, exportselection=False, activestyle="dotbox")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for model in models:
+            listbox.insert("end", model)
+        listbox.selection_set(0)
+        listbox.activate(0)
+
+        selected = tkinter.StringVar(value=models[0])
+        entry = tkinter.Entry(root, textvariable=selected)
+        entry.pack(fill="x", padx=14)
+
+        def apply_listbox_selection(_event: object | None = None) -> None:
+            selection = listbox.curselection()
+            if selection:
+                selected.set(listbox.get(selection[0]))
+
+        listbox.bind("<<ListboxSelect>>", apply_listbox_selection)
+        listbox.bind("<Double-Button-1>", lambda _event: confirm())
+
+        def confirm() -> None:
+            chosen["value"] = selected.get().strip() or None
+            root.destroy()
+
+        def cancel() -> None:
+            chosen["value"] = None
+            root.destroy()
+
+        buttons = tkinter.Frame(root)
+        buttons.pack(pady=16)
+        tkinter.Button(buttons, text="Play", width=10, command=confirm).pack(side="left", padx=8)
+        tkinter.Button(buttons, text="Cancel", width=10, command=cancel).pack(side="left", padx=8)
+        root.protocol("WM_DELETE_WINDOW", cancel)
+        listbox.focus_set()
+        root.mainloop()
+        return chosen["value"]
+    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
+        return None
+
+
+def _notify(success: bool, title: str, message: str) -> None:
+    """Pop a native info/error dialog (best effort, headless-safe)."""
+    try:
+        import tkinter
+        from tkinter import messagebox
+    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
+        return
+
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            show = messagebox.showinfo if success else messagebox.showerror
+            show(title, message, parent=root)
+        finally:
+            root.destroy()
+    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
+        return
+
+
+_CHAT_MODEL_PREFIXES = ("gpt-", "gpt", "o1", "o3", "o4", "chatgpt")
+
+
+def _chat_models_first(models: Sequence[str], *, base_url: str | None = None) -> list[str]:
+    """Surface likely chat models first; keep the rest available below them."""
+    try:
+        from connect4_mcts.llm_settings import prefer_models_for_endpoint
+
+        return prefer_models_for_endpoint(base_url, list(models))
+    except Exception:  # noqa: BLE001 - GUI should stay usable if import fails
+        chat = [model for model in models if model.lower().startswith(_CHAT_MODEL_PREFIXES)]
+        if not chat:
+            return list(models)
+        others = [model for model in models if model not in set(chat)]
+        return chat + others
+
+
+def _wrap_text_preserve_newlines(text: str, font: pygame.font.Font, max_width: int) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.splitlines():
+        stripped = paragraph.strip()
+        if not stripped:
+            lines.append("")
+            continue
+        lines.extend(_wrap_text(stripped, font, max_width))
+    return lines
+
+
+def _wrap_text(text: str, font: pygame.font.Font, max_width: int) -> list[str]:
+    words = text.replace("\n", " ").split()
+    if not words:
+        return []
+
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if font.size(candidate)[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _short_error(exc: Exception, max_length: int = 200) -> str:
+    text = str(exc).strip() or exc.__class__.__name__
+    if len(text) > max_length:
+        text = text[: max_length - 3] + "..."
+    return text
+
+
+def _llm_error_detail(exc: Exception, agent: Agent) -> str:
+    text = _short_error(exc)
+    client = getattr(agent, "client", None)
+    debug = getattr(client, "last_completion_debug", None)
+    if debug:
+        return f"{text} | {debug}"
+    return text
 
 
 def _shorten(text: str, max_length: int = 22) -> str:

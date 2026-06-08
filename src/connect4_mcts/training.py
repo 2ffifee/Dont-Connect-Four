@@ -20,6 +20,8 @@ from __future__ import annotations
 import math
 import os
 import pickle
+import time
+from collections.abc import Callable
 from typing import Any
 
 from connect4_mcts.game import GameState, GameStatus, Player
@@ -32,6 +34,68 @@ DEFAULT_EXPLORATION = math.sqrt(2.0)
 DEFAULT_FPU = 1.0
 DEFAULT_POWER_MEAN_P = 2.0
 DEFAULT_SELFPLAY_TEMPERATURE = 1.0
+DEFAULT_BYTES_PER_NODE = 2867.0
+DEFAULT_MEMORY_SAFETY = 0.85
+
+
+def max_nodes_from_memory_gb(
+    limit_gb: float,
+    *,
+    bytes_per_node: float = DEFAULT_BYTES_PER_NODE,
+    safety_fraction: float = DEFAULT_MEMORY_SAFETY,
+) -> int:
+    """Translate a RAM budget into a node cap for persistent MCTS trees."""
+    if limit_gb <= 0:
+        return 0
+    return int(limit_gb * (1024**3) * safety_fraction / bytes_per_node)
+
+
+def estimate_tree_ram_gb(
+    tree_size: int,
+    *,
+    bytes_per_node: float = DEFAULT_BYTES_PER_NODE,
+) -> float:
+    return tree_size * bytes_per_node / (1024**3)
+
+
+def grow_player_to_memory_cap(
+    player: MCTSPlayer,
+    *,
+    max_nodes: int,
+    temperature: float = DEFAULT_SELFPLAY_TEMPERATURE,
+    max_games: int = 100_000,
+    max_minutes: float = 480.0,
+    progress_every: int = 5,
+    on_progress: Callable[[int, int, float], None] | None = None,
+) -> int:
+    """Grow ``player``'s tree by self-play until the node cap or a safety stop.
+
+    Returns the number of self-play games completed.
+    """
+    if max_nodes <= 0:
+        return 0
+
+    start_time = time.perf_counter()
+    games_played = 0
+
+    while player.tree_size < max_nodes and games_played < max_games:
+        elapsed_minutes = (time.perf_counter() - start_time) / 60.0
+        if elapsed_minutes >= max_minutes:
+            break
+
+        first_player = Player.RED if games_played % 2 == 0 else Player.YELLOW
+        state = GameState.new(first_player=first_player)
+        while state.status is not GameStatus.FINISHED:
+            move = player.sample_move(state, temperature=temperature)
+            state = state.apply_move(move)
+        games_played += 1
+
+        if on_progress is not None and (
+            games_played % progress_every == 0 or player.tree_size >= max_nodes
+        ):
+            on_progress(games_played, player.tree_size, elapsed_minutes)
+
+    return games_played
 
 
 def selfplay_train(

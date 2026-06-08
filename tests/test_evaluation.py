@@ -35,7 +35,7 @@ def test_terminal_draw_is_scored_neutral() -> None:
     assert evaluate_position(state, Player.YELLOW) == 0
 
 
-def test_terminal_score_uses_line_count_margin() -> None:
+def test_terminal_score_depends_on_winner_not_line_margin() -> None:
     narrow_win = GameState(
         board=empty_board(),
         status=GameStatus.FINISHED,
@@ -47,8 +47,8 @@ def test_terminal_score_uses_line_count_margin() -> None:
         result=GameResult(winner=Player.RED, red_lines=0, yellow_lines=3),
     )
 
-    assert evaluate_position(larger_win, Player.RED) > evaluate_position(narrow_win, Player.RED)
-    assert evaluate_position(larger_win, Player.YELLOW) < evaluate_position(narrow_win, Player.YELLOW)
+    assert evaluate_position(narrow_win, Player.RED) == evaluate_position(larger_win, Player.RED)
+    assert evaluate_position(narrow_win, Player.YELLOW) == evaluate_position(larger_win, Player.YELLOW)
 
 
 def test_fair_turn_score_resolves_required_response() -> None:
