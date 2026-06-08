@@ -19,5 +19,6 @@ build/
 dist/
 
 results/
+models/
 *.csv
 *.log
