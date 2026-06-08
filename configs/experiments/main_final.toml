@@ -1,0 +1,73 @@
+# Final compact tournament after choosing representative variants.
+#
+# Intended for the stronger machine. Uses the same model output directory as
+# configs/tournament_grid.toml, so previously trained pickles can be reused.
+
+[defaults]
+play_iterations = 1000
+build_iterations = 1000
+selfplay_temperature = 1.0
+exploration = 1.4142135623730951
+power_mean_p = 1.0
+final_move = "robust"
+rollout_policy = "random"
+seed = 0
+bytes_per_node = 2867.0
+safety_fraction = 0.85
+max_selfplay_games = 100000
+max_minutes = 480.0
+checkpoint_every_games = 25
+output_dir = "models/tournament"
+
+[[players]]
+id = "random"
+kind = "builtin"
+builtin = "random"
+
+[[players]]
+id = "minimax-d4"
+kind = "builtin"
+builtin = "minimax"
+depth = 4
+
+[[players]]
+id = "minimax-d6"
+kind = "builtin"
+builtin = "minimax"
+depth = 6
+
+[[players]]
+id = "uct-m7"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 7.0
+
+[[players]]
+id = "fpu-1.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 1.0
+
+[[players]]
+id = "pmbp-2.5-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 2.5
+
+[[players]]
+id = "lgr-m7"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 7.0
+rollout_policy = "lgr"
+
+[[players]]
+id = "oracle"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 16.0
+exploration = 1.0
+power_mean_p = 1.0
+play_iterations = 1000

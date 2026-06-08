@@ -1,0 +1,129 @@
+# Memory/training-size ablation for the main MCTS variants.
+
+[defaults]
+play_iterations = 1000
+build_iterations = 1000
+selfplay_temperature = 1.0
+exploration = 1.4142135623730951
+power_mean_p = 1.0
+final_move = "robust"
+rollout_policy = "random"
+seed = 0
+bytes_per_node = 2867.0
+safety_fraction = 0.85
+max_selfplay_games = 100000
+max_minutes = 480.0
+checkpoint_every_games = 25
+output_dir = "models/tournament"
+
+[[players]]
+id = "random"
+kind = "builtin"
+builtin = "random"
+
+[[players]]
+id = "minimax-d4"
+kind = "builtin"
+builtin = "minimax"
+depth = 4
+
+[[players]]
+id = "uct-m0"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 0.0
+
+[[players]]
+id = "uct-m2"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 2.0
+
+[[players]]
+id = "uct-m4"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 4.0
+
+[[players]]
+id = "uct-m7"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 7.0
+
+[[players]]
+id = "fpu-1.0-m0"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 0.0
+fpu = 1.0
+
+[[players]]
+id = "fpu-1.0-m2"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 2.0
+fpu = 1.0
+
+[[players]]
+id = "fpu-1.0-m4"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 4.0
+fpu = 1.0
+
+[[players]]
+id = "fpu-1.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 1.0
+
+[[players]]
+id = "pmbp-2.5-m0"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 0.0
+power_mean_p = 2.5
+
+[[players]]
+id = "pmbp-2.5-m2"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 2.0
+power_mean_p = 2.5
+
+[[players]]
+id = "pmbp-2.5-m4"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 4.0
+power_mean_p = 2.5
+
+[[players]]
+id = "pmbp-2.5-m7"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 7.0
+power_mean_p = 2.5
+
+[[players]]
+id = "lgr-m0"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 0.0
+rollout_policy = "lgr"
+
+[[players]]
+id = "lgr-m4"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 4.0
+rollout_policy = "lgr"
+
+[[players]]
+id = "lgr-m7"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 7.0
+rollout_policy = "lgr"

@@ -1,0 +1,61 @@
+# Minimal experiment for validating the tournament pipeline locally.
+#
+# Train the empty MCTS pickles first:
+#   python scripts/train_tournament_grid.py --config configs/experiments/smoke.toml --resume
+#
+# Then run a tiny tournament:
+#   python scripts/run_tournament.py --config configs/experiments/smoke.toml --games-per-pair 2 --base-seed 0 --no-llm --output-dir results/smoke
+
+[defaults]
+play_iterations = 50
+build_iterations = 50
+selfplay_temperature = 1.0
+exploration = 1.4142135623730951
+power_mean_p = 1.0
+final_move = "robust"
+rollout_policy = "random"
+seed = 0
+bytes_per_node = 2867.0
+safety_fraction = 0.85
+max_selfplay_games = 1
+max_minutes = 5.0
+checkpoint_every_games = 1
+output_dir = "models/experiments/smoke"
+
+[[players]]
+id = "random"
+kind = "builtin"
+builtin = "random"
+
+[[players]]
+id = "minimax-d2"
+kind = "builtin"
+builtin = "minimax"
+depth = 2
+
+[[players]]
+id = "uct-m0"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 0.0
+
+[[players]]
+id = "fpu-1.0-m0"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 0.0
+fpu = 1.0
+
+[[players]]
+id = "pmbp-2.5-m0"
+kind = "mcts"
+algorithm = "pmbp"
+memory_gb = 0.0
+power_mean_p = 2.5
+
+[[players]]
+id = "lgr-m0"
+kind = "mcts"
+algorithm = "lgr"
+memory_gb = 0.0
+rollout_policy = "lgr"
