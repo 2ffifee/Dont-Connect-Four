@@ -6,7 +6,7 @@
 #
 # Usage:
 #   python scripts/train_oracle.py --config configs/experiments/oracle_smoke.toml
-#   python scripts/score_blunders.py --oracle models/experiments/oracle_smoke.pkl --input-dir results/smoke --max-positions 100
+#   python scripts/score_blunders.py --oracle models/experiments/oracle_smoke.pkl --input-dir results/smoke --max-positions 150
 
 [oracle]
 algorithm      = "uct"
@@ -15,11 +15,11 @@ power_mean_p   = 1.0
 fpu            = "none"
 rollout_policy = "random"
 final_move     = "robust"
-max_rollout_moves = 80
+max_rollout_moves = 100
 seed           = 0
 
 [training]
-selfplay_iterations    = 100
+selfplay_iterations    = 150
 selfplay_temperature   = 1.0
 max_selfplay_games     = 5
 max_minutes            = 5
@@ -27,10 +27,10 @@ checkpoint_every_games = 1
 output                 = "models/experiments/oracle_smoke.pkl"
 
 [memory]
-limit_gb                = 0.05
+limit_gb                = 0.2
 bytes_per_node_estimate = 2867
 safety_fraction         = 0.85
 
 [evaluation]
-iterations_per_position = 200
+iterations_per_position = 300
 blunder_threshold       = 0.3
