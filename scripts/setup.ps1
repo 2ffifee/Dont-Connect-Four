@@ -10,4 +10,4 @@ if (-not (Test-Path $VenvPython)) {
 }
 
 & $VenvPython -m pip install --upgrade pip
-& $VenvPython -m pip install -e ".[dev]"
+& $VenvPython -m pip install -e ".[dev,analysis]"
