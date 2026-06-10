@@ -46,7 +46,7 @@ chmod +x scripts/setup.sh
 ./scripts/setup.sh
 ```
 
-Skrypty tworza lokalne srodowisko `.venv`, aktualizuja `pip` i instaluja projekt z zaleznosciami developerskimi.
+Skrypty tworza lokalne srodowisko `.venv`, aktualizuja `pip` i instaluja projekt z zaleznosciami developerskimi oraz analitycznymi do notebookow.
 
 Aktywacja srodowiska na Windows:
 
@@ -287,7 +287,7 @@ modyfikacji. Jej trwale drzewo transpozycji jest rozbudowywane przez self-play i
 pelni potem role cache wartosci przy ocenianiu pozycji turniejowych.
 
 Konfiguracja znajduje sie w `configs/oracle.toml` (wypelniona zaproponowanymi
-wartosciami: limit pamieci `5 GB` ~= 1,8 mln wezlow, budzet budowania 1000
+wartosciami: limit pamieci `16 GB` ~= 5,1 mln wezlow, budzet budowania 1000
 iteracji/ruch, budzet oceny 20000 iteracji/pozycje, prog blundera 0.3).
 
 ```bash
@@ -299,7 +299,55 @@ python scripts/train_oracle.py --resume              # dorozbuduj istniejace drz
 Trening zatrzymuje sie po osiagnieciu limitu pamieci (przeliczonego na liczbe
 wezlow), liczby gier albo limitu czasu, zapisujac po drodze checkpointy. Po
 optymalizacji rdzenia gry przeszukiwanie osiaga ~4000 iteracji/s (zob.
-"Wydajnosc rdzenia"), wiec zapelnienie drzewa do 5 GB to rzad kilkunastu minut.
+"Wydajnosc rdzenia"), wiec zapelnienie pelnego drzewa 16 GB nalezy uruchamiac
+na mocniejszej maszynie.
+
+### Pelny eksperyment bez LLM
+
+Skrypt `scripts/run_full_experiment.py` uruchamia caly wewnetrzny pipeline bez
+LLM-ow:
+
+1. trening wyroczni z `configs/oracle.toml`,
+2. przygotowanie tej samej wyroczni jako zawodnika turniejowego `oracle`,
+3. trening pozostalych graczy MCTS z `configs/experiments/main_final.toml`,
+4. turniej round-robin,
+5. agregacje CSV,
+6. Blunder Rate wzgledem wytrenowanej wyroczni.
+
+Domyslny pelny run:
+
+```bash
+python scripts/run_full_experiment.py
+```
+
+Przed dlugim uruchomieniem mozna wypisac dokladne komendy bez wykonywania:
+
+```bash
+python scripts/run_full_experiment.py --dry-run
+```
+
+Jesli modele sa juz wytrenowane i trzeba powtorzyc tylko turniej, analize oraz
+Blunder Rate:
+
+```bash
+python scripts/run_full_experiment.py --skip-training
+```
+
+Najwazniejsze opcje:
+
+- `--resume-training` - kontynuuje trening z istniejacych plikow `.pkl`,
+- `--games-per-pair N` - liczba partii dla kazdej pary graczy,
+- `--output-dir results/main_final` - katalog wynikow czytany pozniej w notebooku,
+- `--blunder-max-positions N` - ogranicza liczbe ocenianych ruchow przy probnym runie,
+- `--config PATH` - inny config turnieju, np. smoke albo ablation,
+- `--oracle-config PATH` - inny config wyroczni.
+
+Po zakonczeniu pelnego runu notebook `notebooks/tournament_results_analysis.ipynb`
+powinien wskazywac na ten sam katalog:
+
+```python
+RESULTS_DIR = PROJECT_ROOT / "results" / "main_final"
+```
 
 ### Ocena pozycji (wartosc korzenia i ruchow)
 

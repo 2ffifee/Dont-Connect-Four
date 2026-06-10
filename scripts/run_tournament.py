@@ -1,12 +1,17 @@
-"""Round-robin tournament for agents defined in ``configs/tournament_grid.toml``.
+"""Round-robin tournament for agents defined in TOML configs.
 
-Each pair plays ``games_per_pair`` games. Game ``i`` uses seed ``base_seed + offset``
-where ``offset`` is unique per pairing and game index, so there is no need for
-duplicate players with different training seeds.
+Each pair plays ``games_per_pair`` games. Game ``i`` uses seed
+``base_seed + offset`` where ``offset`` is unique per pairing and game index, so
+there is no need for duplicate players with different evaluation seeds.
 
-LLM contestants are listed in ``configs/tournament_llm.toml`` (or another file
-passed via ``--llm-config``). They join the same round-robin as MCTS/builtin
-agents.
+The script writes report-oriented outputs to ``--output-dir``:
+
+* ``games.csv`` - one row per game;
+* ``moves.jsonl`` - one JSON object per move, including the state before the
+  move for later oracle/Blunder Rate scoring;
+* ``pair_summary.csv`` - one row per matchup;
+* ``standings.csv`` - aggregate standings per player;
+* ``run_metadata.json`` - config and run metadata.
 
 Usage::
 
@@ -18,25 +23,30 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
+import time
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from connect4_mcts.experiments import play_timed_game, summarize_games
-from connect4_mcts.game import GameState, Player
+from connect4_mcts.experiments import SimulatedGame, TimedMoveRecord, summarize_games
+from connect4_mcts.game import GameState, GameStatus, IllegalMoveError, Move, Player
 from connect4_mcts.players.base import Agent
 from connect4_mcts.players.llm import create_llm_player
 from connect4_mcts.players.minimax import MinimaxPlayer
 from connect4_mcts.players.random import RandomPlayer
-from connect4_mcts.runner import prepare_agents_for_game
+from connect4_mcts.runner import GameRunnerError, prepare_agents_for_game
 from connect4_mcts.tournament_config import load_llm_tournament_entries
 from connect4_mcts.training import estimate_tree_ram_gb, load_player
+
+
+LLM_COUNTER_FIELDS = ("requests", "unparseable", "illegal", "fallbacks", "moves")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +126,84 @@ def _instantiate_agent(
     return agent
 
 
+def _play_instrumented_game(
+    *,
+    game_id: str,
+    pair_id: str,
+    pair_index: int,
+    game_index: int,
+    seed: int,
+    red_agent_name: str,
+    yellow_agent_name: str,
+    red: Agent,
+    yellow: Agent,
+    max_moves: int | None = None,
+) -> tuple[SimulatedGame, list[dict[str, Any]]]:
+    state = GameState.new(first_player=Player.RED)
+    agents = {
+        Player.RED: (red_agent_name, red),
+        Player.YELLOW: (yellow_agent_name, yellow),
+    }
+    records: list[TimedMoveRecord] = []
+    move_rows: list[dict[str, Any]] = []
+
+    while state.status is not GameStatus.FINISHED:
+        if max_moves is not None and len(records) >= max_moves:
+            raise GameRunnerError(f"game exceeded max_moves={max_moves}")
+
+        player = state.current_player
+        agent_name, agent = agents[player]
+        legal_moves = state.legal_moves()
+        state_before = _serialize_state(state)
+
+        started_at = time.perf_counter()
+        move = agent.choose_move(state)
+        elapsed = time.perf_counter() - started_at
+        if not state.is_legal_move(move):
+            raise IllegalMoveError(f"{player.value} agent returned illegal move: {move}")
+
+        move_number = state.move_count + 1
+        records.append(
+            TimedMoveRecord(
+                player=player,
+                agent_name=agent_name,
+                move=move,
+                move_number=move_number,
+                decision_time_seconds=elapsed,
+            )
+        )
+        move_rows.append(
+            {
+                "game_id": game_id,
+                "pair_id": pair_id,
+                "pair_index": pair_index,
+                "game_index": game_index,
+                "seed": seed,
+                "move_number": move_number,
+                "player": player.value,
+                "agent": agent_name,
+                "move_type": move.move_type.value,
+                "column": move.column,
+                "decision_time_seconds": elapsed,
+                "legal_move_count": len(legal_moves),
+                "legal_moves": [_serialize_move(candidate) for candidate in legal_moves],
+                "state_before": state_before,
+            }
+        )
+        state = state.apply_move(move)
+
+    return (
+        SimulatedGame(
+            red_agent=red_agent_name,
+            yellow_agent=yellow_agent_name,
+            final_state=state,
+            moves=tuple(records),
+            seed=seed,
+        ),
+        move_rows,
+    )
+
+
 def _pair_seed(base_seed: int, left_index: int, right_index: int, game_index: int) -> int:
     pair_key = left_index * 1000 + right_index
     return base_seed + pair_key * 100 + game_index
@@ -124,6 +212,197 @@ def _pair_seed(base_seed: int, left_index: int, right_index: int, game_index: in
 def _read_toml(path: str) -> dict[str, Any]:
     with open(path, "rb") as config_file:
         return tomllib.load(config_file)
+
+
+def _serialize_move(move: Move) -> dict[str, Any]:
+    return {"move_type": move.move_type.value, "column": move.column}
+
+
+def _serialize_state(state: GameState) -> dict[str, Any]:
+    return {
+        "board": [
+            "".join("." if cell is None else cell.value[0].upper() for cell in row)
+            for row in state.board
+        ],
+        "current_player": state.current_player.value,
+        "first_player": state.first_player.value,
+        "status": state.status.value,
+        "move_count": state.move_count,
+        "protected_segments": [
+            [[row, column] for row, column in segment]
+            for segment in sorted(state.protected_segments)
+        ],
+    }
+
+
+def _agent_counters(agent: Agent) -> dict[str, int]:
+    counters: dict[str, int] = {}
+    for field in LLM_COUNTER_FIELDS:
+        value = getattr(agent, field, 0)
+        counters[field] = int(value) if isinstance(value, int) else 0
+    return counters
+
+
+def _counter_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    return {field: after.get(field, 0) - before.get(field, 0) for field in LLM_COUNTER_FIELDS}
+
+
+def _tree_size(agent: Agent) -> int | None:
+    value = getattr(agent, "tree_size", None)
+    return value if isinstance(value, int) else None
+
+
+def _game_metrics_row(
+    game: SimulatedGame,
+    *,
+    game_id: str,
+    pair_id: str,
+    pair_index: int,
+    game_index: int,
+    seed: int,
+    red_kind: str,
+    yellow_kind: str,
+    red_counters: dict[str, int],
+    yellow_counters: dict[str, int],
+    red_tree_size_before: int | None,
+    red_tree_size_after: int | None,
+    yellow_tree_size_before: int | None,
+    yellow_tree_size_after: int | None,
+) -> dict[str, Any]:
+    result = game.final_state.result
+    if result is None:
+        raise ValueError("simulated game ended without result")
+
+    red_moves = [move for move in game.moves if move.player is Player.RED]
+    yellow_moves = [move for move in game.moves if move.player is Player.YELLOW]
+    red_total = sum(move.decision_time_seconds for move in red_moves)
+    yellow_total = sum(move.decision_time_seconds for move in yellow_moves)
+    red_invalid = red_counters["unparseable"] + red_counters["illegal"]
+    yellow_invalid = yellow_counters["unparseable"] + yellow_counters["illegal"]
+
+    return {
+        "game_id": game_id,
+        "pair_id": pair_id,
+        "pair_index": pair_index,
+        "game_index": game_index,
+        "seed": seed,
+        "red_agent": game.red_agent,
+        "yellow_agent": game.yellow_agent,
+        "red_kind": red_kind,
+        "yellow_kind": yellow_kind,
+        "winner_agent": game.winner_agent or "",
+        "winner_color": "" if result.winner is None else result.winner.value,
+        "is_draw": result.winner is None,
+        "red_lines": result.red_lines,
+        "yellow_lines": result.yellow_lines,
+        "moves": len(game.moves),
+        "red_decisions": len(red_moves),
+        "yellow_decisions": len(yellow_moves),
+        "red_total_decision_seconds": red_total,
+        "yellow_total_decision_seconds": yellow_total,
+        "red_avg_decision_seconds": red_total / len(red_moves) if red_moves else 0.0,
+        "yellow_avg_decision_seconds": yellow_total / len(yellow_moves) if yellow_moves else 0.0,
+        "red_tree_size_before": "" if red_tree_size_before is None else red_tree_size_before,
+        "red_tree_size_after": "" if red_tree_size_after is None else red_tree_size_after,
+        "yellow_tree_size_before": "" if yellow_tree_size_before is None else yellow_tree_size_before,
+        "yellow_tree_size_after": "" if yellow_tree_size_after is None else yellow_tree_size_after,
+        "red_llm_requests": red_counters["requests"],
+        "red_llm_unparseable": red_counters["unparseable"],
+        "red_llm_illegal": red_counters["illegal"],
+        "red_llm_fallbacks": red_counters["fallbacks"],
+        "red_llm_moves": red_counters["moves"],
+        "red_llm_invalid_response_rate": red_invalid / red_counters["requests"] if red_counters["requests"] else 0.0,
+        "red_llm_fallback_rate": red_counters["fallbacks"] / red_counters["moves"] if red_counters["moves"] else 0.0,
+        "yellow_llm_requests": yellow_counters["requests"],
+        "yellow_llm_unparseable": yellow_counters["unparseable"],
+        "yellow_llm_illegal": yellow_counters["illegal"],
+        "yellow_llm_fallbacks": yellow_counters["fallbacks"],
+        "yellow_llm_moves": yellow_counters["moves"],
+        "yellow_llm_invalid_response_rate": (
+            yellow_invalid / yellow_counters["requests"] if yellow_counters["requests"] else 0.0
+        ),
+        "yellow_llm_fallback_rate": (
+            yellow_counters["fallbacks"] / yellow_counters["moves"] if yellow_counters["moves"] else 0.0
+        ),
+    }
+
+
+def _pair_summary_row(left: str, right: str, games: tuple[SimulatedGame, ...], games_per_pair: int) -> dict[str, Any]:
+    summary = summarize_games(games, agent_names=(left, right))
+    left_wins = summary.wins[left]
+    right_wins = summary.wins[right]
+    return {
+        "pair_id": f"{left}_vs_{right}",
+        "left": left,
+        "right": right,
+        "games": games_per_pair,
+        "left_wins": left_wins,
+        "right_wins": right_wins,
+        "draws": summary.draws,
+        "left_win_rate": left_wins / games_per_pair,
+        "right_win_rate": right_wins / games_per_pair,
+        "draw_rate": summary.draws / games_per_pair,
+        "avg_moves": summary.average_moves,
+        "left_avg_decision_seconds": summary.average_decision_time(left),
+        "right_avg_decision_seconds": summary.average_decision_time(right),
+    }
+
+
+def _standings_rows(games: tuple[SimulatedGame, ...], player_ids: Sequence[str]) -> list[dict[str, Any]]:
+    overall = summarize_games(games, agent_names=tuple(player_ids))
+    rows: list[dict[str, Any]] = []
+    for player_id in player_ids:
+        player_games = [
+            game for game in games if game.red_agent == player_id or game.yellow_agent == player_id
+        ]
+        draws = sum(1 for game in player_games if game.winner_agent is None)
+        wins = overall.wins.get(player_id, 0)
+        total = len(player_games)
+        losses = total - wins - draws
+        rows.append(
+            {
+                "player_id": player_id,
+                "games": total,
+                "wins": wins,
+                "losses": losses,
+                "draws": draws,
+                "win_rate": wins / total if total else 0.0,
+                "loss_rate": losses / total if total else 0.0,
+                "draw_rate": draws / total if total else 0.0,
+                "moves": overall.move_counts.get(player_id, 0),
+                "avg_decision_seconds": overall.average_decision_time(player_id),
+            }
+        )
+
+    rows.sort(key=lambda row: (row["wins"], row["draws"], -row["avg_decision_seconds"]), reverse=True)
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return rows
+
+
+def _write_csv(path: str, rows: Iterable[dict[str, Any]]) -> None:
+    row_list = list(rows)
+    if not row_list:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    fieldnames = list(row_list[0].keys())
+    with open(path, "w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(row_list)
+
+
+def _write_jsonl(path: str, rows: Iterable[dict[str, Any]]) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as output_file:
+        for row in rows:
+            output_file.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def _write_json(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, indent=2)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -137,7 +416,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-llm", action="store_true", help="Do not load LLM contestants.")
     parser.add_argument("--games-per-pair", type=int, default=10)
     parser.add_argument("--base-seed", type=int, default=0)
-    parser.add_argument("--output", default="", help="Optional JSON summary path.")
+    parser.add_argument("--max-moves", type=int, default=None, help="Optional safety cap per game.")
+    parser.add_argument("--output", default="", help="Optional legacy JSON summary path.")
+    parser.add_argument("--output-dir", default="results/tournament", help="Directory for tournament metric files.")
     args = parser.parse_args(argv)
 
     if args.games_per_pair < 1:
@@ -164,20 +445,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     defaults = config.get("defaults", {})
     entries = _load_entries(config, llm_config)
     player_ids = [entry.player_id for entry in entries]
+    if not entries:
+        raise SystemExit("tournament config must define at least one player")
 
     print(f"Round-robin: {len(entries)} players, {args.games_per_pair} games/pair.")
     max_ram = max(entry.est_ram_gb for entry in entries)
     if max_ram > 0:
         print(f"Largest MCTS tree: est. RAM ~{max_ram:.2f} GB (two agents loaded per game).")
 
-    all_games = []
-    pair_summaries = []
+    all_games: list[SimulatedGame] = []
+    all_game_rows: list[dict[str, Any]] = []
+    all_move_rows: list[dict[str, Any]] = []
+    pair_summaries: list[dict[str, Any]] = []
 
+    pair_index = 0
     for i, left in enumerate(entries):
         for j in range(i + 1, len(entries)):
             right = entries[j]
+            pair_id = f"{left.player_id}_vs_{right.player_id}"
             pair_cache: dict[str, Agent] = {}
-            pair_games = []
+            pair_games: list[SimulatedGame] = []
             for game_index in range(args.games_per_pair):
                 seed = _pair_seed(args.base_seed, i, j, game_index)
                 swap = game_index % 2 == 1
@@ -185,64 +472,106 @@ def main(argv: Sequence[str] | None = None) -> int:
                 yellow_entry = left if swap else right
                 red = _instantiate_agent(red_entry, defaults, seed, agent_cache=pair_cache)
                 yellow = _instantiate_agent(yellow_entry, defaults, seed + 1, agent_cache=pair_cache)
+
+                red_counters_before = _agent_counters(red)
+                yellow_counters_before = _agent_counters(yellow)
+                red_tree_before = _tree_size(red)
+                yellow_tree_before = _tree_size(yellow)
+
                 prepare_agents_for_game(red, yellow)
-                game = play_timed_game(
+                game_id = f"{pair_id}_g{game_index:04d}"
+                game, move_rows = _play_instrumented_game(
+                    game_id=game_id,
+                    pair_id=pair_id,
+                    pair_index=pair_index,
+                    game_index=game_index,
+                    seed=seed,
                     red_agent_name=red_entry.player_id,
                     yellow_agent_name=yellow_entry.player_id,
                     red=red,
                     yellow=yellow,
-                    initial_state=GameState.new(first_player=Player.RED),
-                    seed=seed,
+                    max_moves=args.max_moves,
                 )
+
+                red_counters = _counter_delta(red_counters_before, _agent_counters(red))
+                yellow_counters = _counter_delta(yellow_counters_before, _agent_counters(yellow))
+                all_game_rows.append(
+                    _game_metrics_row(
+                        game,
+                        game_id=game_id,
+                        pair_id=pair_id,
+                        pair_index=pair_index,
+                        game_index=game_index,
+                        seed=seed,
+                        red_kind=red_entry.kind,
+                        yellow_kind=yellow_entry.kind,
+                        red_counters=red_counters,
+                        yellow_counters=yellow_counters,
+                        red_tree_size_before=red_tree_before,
+                        red_tree_size_after=_tree_size(red),
+                        yellow_tree_size_before=yellow_tree_before,
+                        yellow_tree_size_after=_tree_size(yellow),
+                    )
+                )
+                all_move_rows.extend(move_rows)
                 pair_games.append(game)
                 all_games.append(game)
             pair_cache.clear()
 
-            summary = summarize_games(tuple(pair_games), agent_names=(left.player_id, right.player_id))
-            pair_summaries.append(
-                {
-                    "left": left.player_id,
-                    "right": right.player_id,
-                    "games": args.games_per_pair,
-                    "wins": summary.wins,
-                    "draws": summary.draws,
-                }
+            pair_summary = _pair_summary_row(
+                left.player_id,
+                right.player_id,
+                tuple(pair_games),
+                args.games_per_pair,
             )
+            pair_summaries.append(pair_summary)
             print(
                 f"{left.player_id:>16} vs {right.player_id:<16} | "
-                f"{summary.wins[left.player_id]} - {summary.wins[right.player_id]} "
-                f"(draws {summary.draws})",
+                f"{pair_summary['left_wins']} - {pair_summary['right_wins']} "
+                f"(draws {pair_summary['draws']})",
                 flush=True,
             )
+            pair_index += 1
 
-    overall = summarize_games(tuple(all_games), agent_names=tuple(player_ids))
-    standings = sorted(
-        player_ids,
-        key=lambda pid: (overall.wins.get(pid, 0), -overall.move_counts.get(pid, 0)),
-        reverse=True,
-    )
+    standings = _standings_rows(tuple(all_games), player_ids)
 
     print("\nStandings (wins across all pairings):")
-    for rank, player_id in enumerate(standings, start=1):
-        wins = overall.wins.get(player_id, 0)
-        print(f"  {rank:>2}. {player_id:<16} {wins} wins")
+    for row in standings:
+        print(f"  {row['rank']:>2}. {row['player_id']:<16} {row['wins']} wins")
 
+    metadata = {
+        "config": args.config,
+        "llm_config": None if llm_config is None else args.llm_config,
+        "players": player_ids,
+        "games_per_pair": args.games_per_pair,
+        "base_seed": args.base_seed,
+        "max_moves": args.max_moves,
+        "output_dir": args.output_dir,
+        "files": {
+            "games": "games.csv",
+            "moves": "moves.jsonl",
+            "pair_summary": "pair_summary.csv",
+            "standings": "standings.csv",
+        },
+    }
+    _write_csv(os.path.join(args.output_dir, "games.csv"), all_game_rows)
+    _write_jsonl(os.path.join(args.output_dir, "moves.jsonl"), all_move_rows)
+    _write_csv(os.path.join(args.output_dir, "pair_summary.csv"), pair_summaries)
+    _write_csv(os.path.join(args.output_dir, "standings.csv"), standings)
+    _write_json(os.path.join(args.output_dir, "run_metadata.json"), metadata)
+    print(f"\nSaved tournament metrics to {args.output_dir}")
+
+    legacy_payload = {
+        "players": player_ids,
+        "games_per_pair": args.games_per_pair,
+        "base_seed": args.base_seed,
+        "llm_config": None if llm_config is None else args.llm_config,
+        "standings": standings,
+        "pairs": pair_summaries,
+    }
     if args.output:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
-        payload = {
-            "players": player_ids,
-            "games_per_pair": args.games_per_pair,
-            "base_seed": args.base_seed,
-            "llm_config": None if llm_config is None else args.llm_config,
-            "standings": [
-                {"rank": rank, "player_id": player_id, "wins": overall.wins.get(player_id, 0)}
-                for rank, player_id in enumerate(standings, start=1)
-            ],
-            "pairs": pair_summaries,
-        }
-        with open(args.output, "w", encoding="utf-8") as output_file:
-            json.dump(payload, output_file, indent=2)
-        print(f"\nSaved summary to {args.output}")
+        _write_json(args.output, legacy_payload)
+        print(f"Saved legacy summary to {args.output}")
 
     return 0
 

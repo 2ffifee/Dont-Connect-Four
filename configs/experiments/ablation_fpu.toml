@@ -1,0 +1,78 @@
+# First Play Urgency parameter sweep at the 7 GB training budget.
+
+[defaults]
+play_iterations = 1000
+build_iterations = 1000
+selfplay_temperature = 1.0
+exploration = 1.4142135623730951
+power_mean_p = 1.0
+final_move = "robust"
+rollout_policy = "random"
+seed = 0
+bytes_per_node = 2867.0
+safety_fraction = 0.85
+max_selfplay_games = 100000
+max_minutes = 480.0
+checkpoint_every_games = 25
+output_dir = "models/tournament"
+
+[[players]]
+id = "minimax-d4"
+kind = "builtin"
+builtin = "minimax"
+depth = 4
+
+[[players]]
+id = "uct-m7"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 7.0
+
+[[players]]
+id = "fpu-0.1-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 0.1
+
+[[players]]
+id = "fpu-0.2-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 0.2
+
+[[players]]
+id = "fpu-0.5-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 0.5
+
+[[players]]
+id = "fpu-1.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 1.0
+
+[[players]]
+id = "fpu-2.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 2.0
+
+[[players]]
+id = "fpu-4.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 4.0
+
+[[players]]
+id = "fpu-8.0-m7"
+kind = "mcts"
+algorithm = "fpu"
+memory_gb = 7.0
+fpu = 8.0

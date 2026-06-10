@@ -11,4 +11,4 @@ if [ ! -x "$VENV_PYTHON" ]; then
 fi
 
 "$VENV_PYTHON" -m pip install --upgrade pip
-"$VENV_PYTHON" -m pip install -e ".[dev]"
+"$VENV_PYTHON" -m pip install -e ".[dev,analysis]"

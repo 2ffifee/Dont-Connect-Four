@@ -1,0 +1,35 @@
+# Small LLM comparison. LLM contestants are loaded separately from
+# configs/tournament_llm.toml with scripts/run_tournament.py --llm-config.
+
+[defaults]
+play_iterations = 100
+build_iterations = 100
+selfplay_temperature = 1.0
+exploration = 1.4142135623730951
+power_mean_p = 1.0
+final_move = "robust"
+rollout_policy = "random"
+seed = 0
+bytes_per_node = 2867.0
+safety_fraction = 0.85
+max_selfplay_games = 1
+max_minutes = 5.0
+checkpoint_every_games = 1
+output_dir = "models/experiments/llm_small"
+
+[[players]]
+id = "random"
+kind = "builtin"
+builtin = "random"
+
+[[players]]
+id = "minimax-d3"
+kind = "builtin"
+builtin = "minimax"
+depth = 3
+
+[[players]]
+id = "uct-m0"
+kind = "mcts"
+algorithm = "uct"
+memory_gb = 0.0
