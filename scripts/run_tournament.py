@@ -29,6 +29,7 @@ import os
 import sys
 import time
 import tomllib
+import traceback
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -43,6 +44,11 @@ from connect4_mcts.players.minimax import MinimaxPlayer
 from connect4_mcts.players.random import RandomPlayer
 from connect4_mcts.runner import GameRunnerError, prepare_agents_for_game
 from connect4_mcts.tournament_config import load_llm_tournament_entries
+from connect4_mcts.tournament_reporting import (
+    TournamentFailureContext,
+    format_failure_banner,
+    write_failure_report,
+)
 from connect4_mcts.training import estimate_tree_ram_gb, load_player
 
 
@@ -155,14 +161,26 @@ def _play_instrumented_game(
         agent_name, agent = agents[player]
         legal_moves = state.legal_moves()
         state_before = _serialize_state(state)
+        move_number = state.move_count + 1
 
         started_at = time.perf_counter()
-        move = agent.choose_move(state)
+        try:
+            move = agent.choose_move(state)
+        except Exception as exc:
+            exc.move_context = {  # type: ignore[attr-defined]
+                "move_number": move_number,
+                "player": player.value,
+                "agent": agent_name,
+                "legal_move_count": len(legal_moves),
+            }
+            raise
         elapsed = time.perf_counter() - started_at
         if not state.is_legal_move(move):
-            raise IllegalMoveError(f"{player.value} agent returned illegal move: {move}")
+            raise IllegalMoveError(
+                f"{player.value} agent {agent_name!r} returned illegal move {move!r} "
+                f"on move #{move_number} (seed={seed}, {len(legal_moves)} legal moves)"
+            )
 
-        move_number = state.move_count + 1
         records.append(
             TimedMoveRecord(
                 player=player,
@@ -202,6 +220,85 @@ def _play_instrumented_game(
         ),
         move_rows,
     )
+
+
+def _failure_context_from_exc(
+    exc: BaseException,
+    *,
+    pair_index: int,
+    pair_total: int,
+    pair_id: str,
+    left_player: str,
+    right_player: str,
+    game_index: int,
+    games_per_pair: int,
+    game_id: str,
+    seed: int,
+    red_agent: str,
+    yellow_agent: str,
+) -> TournamentFailureContext:
+    move_number: int | None = None
+    current_player: str | None = None
+    move_context = getattr(exc, "move_context", None)
+    if isinstance(move_context, dict):
+        raw_move_number = move_context.get("move_number")
+        if isinstance(raw_move_number, int):
+            move_number = raw_move_number
+        player = move_context.get("player")
+        if isinstance(player, str):
+            current_player = player
+    return TournamentFailureContext(
+        pair_index=pair_index,
+        pair_total=pair_total,
+        pair_id=pair_id,
+        left_player=left_player,
+        right_player=right_player,
+        game_index=game_index,
+        games_per_pair=games_per_pair,
+        game_id=game_id,
+        seed=seed,
+        red_agent=red_agent,
+        yellow_agent=yellow_agent,
+        move_number=move_number,
+        current_player=current_player,
+    )
+
+
+def _report_and_raise_game_failure(
+    exc: BaseException,
+    *,
+    output_dir: str,
+    pair_index: int,
+    pair_total: int,
+    pair_id: str,
+    left_player: str,
+    right_player: str,
+    game_index: int,
+    games_per_pair: int,
+    game_id: str,
+    seed: int,
+    red_agent: str,
+    yellow_agent: str,
+) -> None:
+    context = _failure_context_from_exc(
+        exc,
+        pair_index=pair_index,
+        pair_total=pair_total,
+        pair_id=pair_id,
+        left_player=left_player,
+        right_player=right_player,
+        game_index=game_index,
+        games_per_pair=games_per_pair,
+        game_id=game_id,
+        seed=seed,
+        red_agent=red_agent,
+        yellow_agent=yellow_agent,
+    )
+    report_path = write_failure_report(output_dir, context=context, exc=exc)
+    print(format_failure_banner(context, exc), file=sys.stderr, flush=True)
+    print(traceback.format_exc(), file=sys.stderr, flush=True)
+    print(f"Failure report written to {report_path}", file=sys.stderr, flush=True)
+    raise exc
 
 
 def _pair_seed(base_seed: int, left_index: int, right_index: int, game_index: int) -> int:
@@ -419,6 +516,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-moves", type=int, default=None, help="Optional safety cap per game.")
     parser.add_argument("--output", default="", help="Optional legacy JSON summary path.")
     parser.add_argument("--output-dir", default="results/tournament", help="Directory for tournament metric files.")
+    parser.add_argument(
+        "--verbose-games",
+        action="store_true",
+        help="Print one line before each individual game (useful when diagnosing hangs or crashes).",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pair < 1:
@@ -458,80 +560,116 @@ def main(argv: Sequence[str] | None = None) -> int:
     all_move_rows: list[dict[str, Any]] = []
     pair_summaries: list[dict[str, Any]] = []
 
+    total_pairs = len(entries) * (len(entries) - 1) // 2
     pair_index = 0
-    for i, left in enumerate(entries):
-        for j in range(i + 1, len(entries)):
-            right = entries[j]
-            pair_id = f"{left.player_id}_vs_{right.player_id}"
-            pair_cache: dict[str, Agent] = {}
-            pair_games: list[SimulatedGame] = []
-            for game_index in range(args.games_per_pair):
-                seed = _pair_seed(args.base_seed, i, j, game_index)
-                swap = game_index % 2 == 1
-                red_entry = right if swap else left
-                yellow_entry = left if swap else right
-                red = _instantiate_agent(red_entry, defaults, seed, agent_cache=pair_cache)
-                yellow = _instantiate_agent(yellow_entry, defaults, seed + 1, agent_cache=pair_cache)
-
-                red_counters_before = _agent_counters(red)
-                yellow_counters_before = _agent_counters(yellow)
-                red_tree_before = _tree_size(red)
-                yellow_tree_before = _tree_size(yellow)
-
-                prepare_agents_for_game(red, yellow)
-                game_id = f"{pair_id}_g{game_index:04d}"
-                game, move_rows = _play_instrumented_game(
-                    game_id=game_id,
-                    pair_id=pair_id,
-                    pair_index=pair_index,
-                    game_index=game_index,
-                    seed=seed,
-                    red_agent_name=red_entry.player_id,
-                    yellow_agent_name=yellow_entry.player_id,
-                    red=red,
-                    yellow=yellow,
-                    max_moves=args.max_moves,
+    try:
+        for i, left in enumerate(entries):
+            for j in range(i + 1, len(entries)):
+                right = entries[j]
+                pair_id = f"{left.player_id}_vs_{right.player_id}"
+                print(
+                    f"\nPair {pair_index + 1}/{total_pairs}: {left.player_id} vs {right.player_id}",
+                    flush=True,
                 )
+                pair_cache: dict[str, Agent] = {}
+                pair_games: list[SimulatedGame] = []
+                for game_index in range(args.games_per_pair):
+                    seed = _pair_seed(args.base_seed, i, j, game_index)
+                    swap = game_index % 2 == 1
+                    red_entry = right if swap else left
+                    yellow_entry = left if swap else right
+                    red = _instantiate_agent(red_entry, defaults, seed, agent_cache=pair_cache)
+                    yellow = _instantiate_agent(yellow_entry, defaults, seed + 1, agent_cache=pair_cache)
 
-                red_counters = _counter_delta(red_counters_before, _agent_counters(red))
-                yellow_counters = _counter_delta(yellow_counters_before, _agent_counters(yellow))
-                all_game_rows.append(
-                    _game_metrics_row(
-                        game,
-                        game_id=game_id,
-                        pair_id=pair_id,
-                        pair_index=pair_index,
-                        game_index=game_index,
-                        seed=seed,
-                        red_kind=red_entry.kind,
-                        yellow_kind=yellow_entry.kind,
-                        red_counters=red_counters,
-                        yellow_counters=yellow_counters,
-                        red_tree_size_before=red_tree_before,
-                        red_tree_size_after=_tree_size(red),
-                        yellow_tree_size_before=yellow_tree_before,
-                        yellow_tree_size_after=_tree_size(yellow),
+                    red_counters_before = _agent_counters(red)
+                    yellow_counters_before = _agent_counters(yellow)
+                    red_tree_before = _tree_size(red)
+                    yellow_tree_before = _tree_size(yellow)
+
+                    prepare_agents_for_game(red, yellow)
+                    game_id = f"{pair_id}_g{game_index:04d}"
+                    if args.verbose_games:
+                        print(
+                            f"  game {game_index + 1}/{args.games_per_pair}: {game_id} "
+                            f"seed={seed} red={red_entry.player_id} yellow={yellow_entry.player_id}",
+                            flush=True,
+                        )
+                    try:
+                        game, move_rows = _play_instrumented_game(
+                            game_id=game_id,
+                            pair_id=pair_id,
+                            pair_index=pair_index,
+                            game_index=game_index,
+                            seed=seed,
+                            red_agent_name=red_entry.player_id,
+                            yellow_agent_name=yellow_entry.player_id,
+                            red=red,
+                            yellow=yellow,
+                            max_moves=args.max_moves,
+                        )
+                    except Exception as exc:
+                        _report_and_raise_game_failure(
+                            exc,
+                            output_dir=args.output_dir,
+                            pair_index=pair_index,
+                            pair_total=total_pairs,
+                            pair_id=pair_id,
+                            left_player=left.player_id,
+                            right_player=right.player_id,
+                            game_index=game_index,
+                            games_per_pair=args.games_per_pair,
+                            game_id=game_id,
+                            seed=seed,
+                            red_agent=red_entry.player_id,
+                            yellow_agent=yellow_entry.player_id,
+                        )
+
+                    red_counters = _counter_delta(red_counters_before, _agent_counters(red))
+                    yellow_counters = _counter_delta(yellow_counters_before, _agent_counters(yellow))
+                    all_game_rows.append(
+                        _game_metrics_row(
+                            game,
+                            game_id=game_id,
+                            pair_id=pair_id,
+                            pair_index=pair_index,
+                            game_index=game_index,
+                            seed=seed,
+                            red_kind=red_entry.kind,
+                            yellow_kind=yellow_entry.kind,
+                            red_counters=red_counters,
+                            yellow_counters=yellow_counters,
+                            red_tree_size_before=red_tree_before,
+                            red_tree_size_after=_tree_size(red),
+                            yellow_tree_size_before=yellow_tree_before,
+                            yellow_tree_size_after=_tree_size(yellow),
+                        )
                     )
-                )
-                all_move_rows.extend(move_rows)
-                pair_games.append(game)
-                all_games.append(game)
-            pair_cache.clear()
+                    all_move_rows.extend(move_rows)
+                    pair_games.append(game)
+                    all_games.append(game)
+                pair_cache.clear()
 
-            pair_summary = _pair_summary_row(
-                left.player_id,
-                right.player_id,
-                tuple(pair_games),
-                args.games_per_pair,
-            )
-            pair_summaries.append(pair_summary)
-            print(
-                f"{left.player_id:>16} vs {right.player_id:<16} | "
-                f"{pair_summary['left_wins']} - {pair_summary['right_wins']} "
-                f"(draws {pair_summary['draws']})",
-                flush=True,
-            )
-            pair_index += 1
+                pair_summary = _pair_summary_row(
+                    left.player_id,
+                    right.player_id,
+                    tuple(pair_games),
+                    args.games_per_pair,
+                )
+                pair_summaries.append(pair_summary)
+                print(
+                    f"  result {left.player_id:>16} vs {right.player_id:<16} | "
+                    f"{pair_summary['left_wins']} - {pair_summary['right_wins']} "
+                    f"(draws {pair_summary['draws']})",
+                    flush=True,
+                )
+                pair_index += 1
+    except Exception:
+        print(
+            f"\nTournament aborted after completing {pair_index}/{total_pairs} pairings.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
 
     standings = _standings_rows(tuple(all_games), player_ids)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -19,12 +20,16 @@ from connect4_mcts.players.llm import (
     gemini_supports_visible_thoughts,
     normalize_llm_endpoint,
     parse_move,
+    openrouter_should_request_reasoning,
+    cot_streams_live,
+    model_exposes_thinking,
     prefers_blocking_completion,
     render_rules_briefing,
     render_turn,
     resolve_llm_credentials,
     resolve_openai_credentials,
     uses_structured_reasoning,
+    _extract_reasoning_details,
     _read_reasoning_from_part,
 )
 from connect4_mcts.runner import play_game
@@ -218,6 +223,37 @@ def test_normalize_thinking_text_drops_fence_only_reasoning():
     assert _normalize_thinking_text("Actual reasoning") == "Actual reasoning"
 
 
+def test_extract_thinking_splits_ministral_think_tags():
+    tagged = (
+        "[THINK]Column 3 avoids creating a new segment.[/THINK]\n"
+        '```json\n{"move_type": "drop", "column": 3}\n```'
+    )
+    thinking, remainder = extract_thinking(tagged)
+    assert thinking == "Column 3 avoids creating a new segment."
+    assert parse_move(remainder) == Move(MoveType.DROP, 3)
+
+
+def test_read_reasoning_from_part_supports_openrouter_reasoning_details() -> None:
+    message = type(
+        "Message",
+        (),
+        {
+            "content": '{"move_type": "drop", "column": 1}',
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "Scan legal moves first."},
+                {"type": "reasoning.text", "text": "Prefer a safe drop."},
+            ],
+        },
+    )()
+    assert _read_reasoning_from_part(message) == "Scan legal moves first.\n\nPrefer a safe drop."
+
+
+def test_openrouter_should_request_reasoning_for_ministral() -> None:
+    assert openrouter_should_request_reasoning("mistralai/ministral-14b-2512")
+    assert openrouter_should_request_reasoning("deepseek/deepseek-r1")
+    assert not openrouter_should_request_reasoning("openai/gpt-4o-mini")
+
+
 def test_uses_structured_reasoning_detects_common_model_ids() -> None:
     assert uses_structured_reasoning("o3-mini")
     assert uses_structured_reasoning("deepseek-reasoner")
@@ -225,11 +261,49 @@ def test_uses_structured_reasoning_detects_common_model_ids() -> None:
     assert not uses_structured_reasoning("gpt-4o-mini")
 
 
-def test_prefers_blocking_for_local_and_structured_reasoning() -> None:
-    assert prefers_blocking_completion("http://localhost:11434/v1", "llama3")
+def test_prefers_blocking_for_cloud_reasoning_models_not_local() -> None:
+    assert not prefers_blocking_completion("http://localhost:11434/v1", "llama3")
     assert prefers_blocking_completion("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.5-flash")
     assert prefers_blocking_completion("https://api.openai.com/v1", "o3-mini")
+    assert prefers_blocking_completion(
+        "https://openrouter.ai/api/v1",
+        "mistralai/ministral-14b-2512",
+    )
     assert not prefers_blocking_completion("https://api.openai.com/v1", "gpt-4o-mini")
+
+
+def test_cot_streams_live_only_for_local_reasoning_models() -> None:
+    assert cot_streams_live("http://localhost:11434/v1", "qwen3:8b")
+    assert cot_streams_live("http://127.0.0.1:1234/v1", "deepseek-r1:8b")
+    assert not cot_streams_live("http://localhost:11434/v1", "llama3")
+    assert not cot_streams_live("https://api.openai.com/v1", "gpt-4o-mini")
+    assert not cot_streams_live("https://openrouter.ai/api/v1", "mistralai/ministral-14b-2512")
+
+
+def test_model_exposes_thinking_detects_supported_models() -> None:
+    assert model_exposes_thinking("https://openrouter.ai/api/v1", "mistralai/ministral-14b-2512")
+    assert model_exposes_thinking(
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "gemini-2.5-flash",
+    )
+    assert not model_exposes_thinking("https://api.openai.com/v1", "o3-mini")
+    assert model_exposes_thinking("http://localhost:11434/v1", "qwen3:8b")
+    assert not model_exposes_thinking("https://api.openai.com/v1", "gpt-4o-mini")
+    assert not model_exposes_thinking("http://localhost:11434/v1", "llama3")
+
+
+def test_read_reasoning_from_part_uses_model_dump_payload() -> None:
+    class Message:
+        content = '{"move_type": "drop", "column": 2}'
+
+        @staticmethod
+        def model_dump() -> dict[str, object]:
+            return {
+                "content": '{"move_type": "drop", "column": 2}',
+                "reasoning": "Hidden in raw payload",
+            }
+
+    assert _read_reasoning_from_part(Message()) == "Hidden in raw payload"
 
 
 def test_read_reasoning_from_part_supports_reasoning_content() -> None:
@@ -240,19 +314,24 @@ def test_read_reasoning_from_part_supports_reasoning_content() -> None:
 def test_openai_client_blocking_reasoning_field_updates_thinking(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
+    class FakeMessage:
+        content = '{"move_type": "drop", "column": 4}'
+        reasoning_content = "Evaluate columns 0-7."
+
+        @staticmethod
+        def model_dump() -> dict[str, object]:
+            return {
+                "content": '{"move_type": "drop", "column": 4}',
+                "reasoning_content": "Evaluate columns 0-7.",
+            }
+
     class FakeCompletions:
         @staticmethod
         def create(**kwargs: object) -> object:
             captured.update(kwargs)
-            message = type(
-                "Message",
-                (),
-                {
-                    "reasoning_content": "Evaluate columns 0-7.",
-                    "content": '{"move_type": "drop", "column": 4}',
-                },
-            )()
-            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+            message = FakeMessage()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice]})()
 
     class FakeChat:
         completions = FakeCompletions
@@ -264,7 +343,11 @@ def test_openai_client_blocking_reasoning_field_updates_thinking(monkeypatch) ->
 
     monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
 
-    client = OpenAIClient(model="o3-mini", api_key="test-key")
+    client = OpenAIClient(
+        model="deepseek-reasoner",
+        api_key="test-key",
+        base_url="https://api.deepseek.com/v1",
+    )
     updates: list[str] = []
     content = client.complete(
         [{"role": "user", "content": "pick a move"}],
@@ -277,17 +360,30 @@ def test_openai_client_blocking_reasoning_field_updates_thinking(monkeypatch) ->
     assert parse_move(content) == Move(MoveType.DROP, 4)
 
 
-def test_openai_client_local_server_uses_blocking_not_streaming(monkeypatch) -> None:
+def test_openai_client_local_server_streams_thinking_live(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
+
+    class FakeDelta:
+        def __init__(self, content: str = "", reasoning_content: str = "") -> None:
+            self.content = content
+            self.reasoning_content = reasoning_content
+
+    class FakeChunk:
+        def __init__(self, delta: FakeDelta) -> None:
+            self.choices = [type("Choice", (), {"delta": delta})()]
 
     class FakeCompletions:
         @staticmethod
         def create(**kwargs: object) -> object:
             calls.append(dict(kwargs))
+            if kwargs.get("stream"):
+                yield FakeChunk(FakeDelta(reasoning_content="Local plan"))
+                yield FakeChunk(FakeDelta(content='{"move_type": "push", "column": 1}'))
+                return
             message = type(
                 "Message",
                 (),
-                {"content": 'Local plan{"move_type": "push", "column": 1}'},
+                {"content": '{"move_type": "push", "column": 1}'},
             )()
             return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
 
@@ -312,10 +408,112 @@ def test_openai_client_local_server_uses_blocking_not_streaming(monkeypatch) -> 
         on_thinking_update=updates.append,
     )
 
-    assert all(not call.get("stream") for call in calls)
+    assert any(call.get("stream") for call in calls)
     assert client.last_thinking == "Local plan"
-    assert updates == ["Local plan"]
+    assert updates[-1] == "Local plan"
     assert parse_move(content) == Move(MoveType.PUSH, 1)
+
+
+def test_openrouter_client_requests_reasoning_for_ministral(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs: object) -> object:
+            captured.update(kwargs)
+            message = type(
+                "Message",
+                (),
+                {
+                    "content": '[THINK]Plan[/THINK]{"move_type": "drop", "column": 0}',
+                    "reasoning": "Separate reasoning field",
+                },
+            )()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    class FakeChat:
+        completions = FakeCompletions
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None, default_headers=None) -> None:
+            del default_headers
+            self.chat = FakeChat()
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
+
+    client = OpenAIClient(
+        model="mistralai/ministral-14b-2512",
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    updates: list[str] = []
+    content = client.complete(
+        [{"role": "user", "content": "pick a move"}],
+        on_thinking_update=updates.append,
+    )
+
+    extra_body = captured.get("extra_body")
+    assert isinstance(extra_body, dict)
+    assert extra_body.get("reasoning") == {"enabled": True}
+    assert client.last_thinking in {"Separate reasoning field", "Plan", "Separate reasoning field\n\nPlan"}
+    assert parse_move(content) == Move(MoveType.DROP, 0)
+
+
+def test_openrouter_client_reads_reasoning_from_raw_http_payload(monkeypatch) -> None:
+    class FakeMessage:
+        content = '{"move_type": "push", "column": 5}'
+
+    class FakeRaw:
+        text = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"move_type": "push", "column": 5}',
+                            "reasoning": "Prefer a safe push.",
+                        }
+                    }
+                ]
+            }
+        )
+
+        @staticmethod
+        def parse() -> object:
+            message = FakeMessage()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    class FakeRawWrapper:
+        @staticmethod
+        def create(**kwargs: object) -> FakeRaw:
+            return FakeRaw()
+
+    class FakeCompletions:
+        with_raw_response = FakeRawWrapper()
+
+        @staticmethod
+        def create(**kwargs: object) -> object:
+            message = FakeMessage()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeOpenAI:
+        def __init__(self, *, api_key: str, base_url: str | None, default_headers=None) -> None:
+            del default_headers
+            self.chat = FakeChat()
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
+
+    client = OpenAIClient(
+        model="mistralai/ministral-14b-2512",
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    content = client.complete([{"role": "user", "content": "pick a move"}])
+
+    assert client.last_thinking == "Prefer a safe push."
+    assert parse_move(content) == Move(MoveType.PUSH, 5)
 
 
 def test_openrouter_client_requests_reasoning_for_reasoning_models(monkeypatch) -> None:
@@ -347,7 +545,7 @@ def test_openrouter_client_requests_reasoning_for_reasoning_models(monkeypatch) 
 
     extra_body = captured.get("extra_body")
     assert isinstance(extra_body, dict)
-    assert extra_body.get("reasoning") == {"effort": "medium"}
+    assert extra_body.get("reasoning") == {"enabled": True}
 
 
 def test_gemini_client_requests_include_thoughts_for_thinking_models(monkeypatch) -> None:
@@ -484,9 +682,9 @@ def test_openai_client_falls_back_to_blocking_when_streaming_fails(monkeypatch) 
     monkeypatch.setitem(__import__("sys").modules, "openai", type("openai", (), {"OpenAI": FakeOpenAI}))
 
     client = OpenAIClient(
-        model="gpt-4o-mini",
+        model="qwen3:8b",
         api_key="test-key",
-        base_url="https://api.openai.com/v1",
+        base_url="http://localhost:11434/v1",
     )
     updates: list[str] = []
     content = client.complete(

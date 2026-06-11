@@ -55,6 +55,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--llm-config", default="configs/tournament_llm.toml")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them.")
     parser.add_argument("--python", default=sys.executable, help="Python executable used for child scripts.")
+    parser.add_argument(
+        "--verbose-games",
+        action="store_true",
+        help="Pass --verbose-games to run_tournament.py (log every game before it starts).",
+    )
     args = parser.parse_args(argv)
 
     oracle_config = _project_path(args.oracle_config)
@@ -121,6 +126,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     if args.max_moves > 0:
         tournament_command.extend(["--max-moves", str(args.max_moves)])
+    if args.verbose_games:
+        tournament_command.append("--verbose-games")
     if args.with_llm:
         tournament_command.extend(["--llm-config", str(llm_config)])
     else:
@@ -186,6 +193,8 @@ def _run_step(step: Step, *, dry_run: bool) -> int:
     if step.command is not None:
         completed = subprocess.run(step.command, cwd=PROJECT_ROOT, check=False)
         returncode = completed.returncode
+        if returncode != 0:
+            _print_subprocess_failure(step.label, step.command, returncode)
     elif step.action is not None:
         try:
             step.action()
@@ -269,6 +278,32 @@ def _display_path(path: Path) -> str:
 
 def _format_command(command: list[str]) -> str:
     return " ".join(_quote(part) for part in command)
+
+
+def _failure_report_path(command: list[str]) -> Path | None:
+    if "--output-dir" not in command:
+        return None
+    index = command.index("--output-dir")
+    if index + 1 >= len(command):
+        return None
+    return _project_path(command[index + 1]) / "tournament_failure.json"
+
+
+def _print_subprocess_failure(label: str, command: list[str], returncode: int) -> None:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    from connect4_mcts.tournament_reporting import describe_exit_code
+
+    print(f"\nSubprocess '{label}' failed: {describe_exit_code(returncode)}", file=sys.stderr)
+    print(f"Command: {_format_command(command)}", file=sys.stderr)
+    failure_report = _failure_report_path(command)
+    if failure_report is not None and failure_report.is_file():
+        print(f"See failure report: {_display_path(failure_report)}", file=sys.stderr)
+    else:
+        print(
+            "No tournament_failure.json found — if the process was killed (OOM), there may be "
+            "no Python traceback. Re-run with --verbose-games to see the last started game.",
+            file=sys.stderr,
+        )
 
 
 def _quote(part: str) -> str:

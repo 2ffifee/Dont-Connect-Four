@@ -111,6 +111,20 @@ def test_scrollable_panel_follows_streaming_updates() -> None:
     assert "line 21" in panel.text
 
 
+def test_thinking_panel_hidden_without_cot_enabled() -> None:
+    game = object.__new__(gui.HumanVsAgentGui)
+    game.mode = "game"
+    game.config = gui.GuiConfig(agent_name="llm", llm_cot_enabled=False)
+    assert game._thinking_panel_width() == 0
+
+    game.config = gui.GuiConfig(agent_name="llm", llm_cot_enabled=True, llm_base_url="https://api.openai.com/v1")
+    game.width = 1200
+    assert game._thinking_panel_width() > 0
+
+    game.config = gui.GuiConfig(agent_name="random")
+    assert game._thinking_panel_width() == 0
+
+
 def test_scrollbar_drag_moves_content() -> None:
     pygame.font.init()
     font = pygame.font.SysFont("Arial", 18)

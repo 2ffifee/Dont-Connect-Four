@@ -315,6 +315,7 @@ class GuiConfig:
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_label: str | None = None
+    llm_cot_enabled: bool = False
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -357,13 +358,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.agent_name = "loaded"
 
     if args.llm:
-        from connect4_mcts.players.llm import create_llm_player
+        from connect4_mcts.players.llm import create_llm_player, model_exposes_thinking
 
         config.llm_model = args.llm_model
         config.llm_base_url = args.llm_base_url
         config.llm_agent = create_llm_player(args.llm_model, base_url=args.llm_base_url)
         config.llm_label = f"LLM: {args.llm_model}"
         config.agent_name = "llm"
+        config.llm_cot_enabled = model_exposes_thinking(args.llm_base_url, args.llm_model)
 
     HumanVsAgentGui(config=config).run()
     return 0
@@ -395,6 +397,8 @@ class HumanVsAgentGui:
         self.selected_move_type = MoveType.DROP
         self.message = ""
         self.llm_awaiting_rules_ack = False
+        self.llm_briefing_failed = False
+        self.llm_alert: str | None = None
         self.llm_thinking_panel = ScrollableTextPanel()
         self._agent_busy = False
         self._async_generation = 0
@@ -471,6 +475,8 @@ class HumanVsAgentGui:
             self._invalidate_async_work()
             self.mode = "setup"
             self.message = ""
+            self.llm_alert = None
+            self.llm_briefing_failed = False
             self.llm_thinking_panel.clear()
             return
 
@@ -518,28 +524,33 @@ class HumanVsAgentGui:
         kind, payload = result
 
         if kind == "briefing":
+            self.llm_alert = None
+            self.llm_briefing_failed = False
             ack = str(payload)
             self.message = f"LLM ready: {_shorten(ack, 72)}"
             thinking = getattr(self.agent, "last_thinking", None)
-            if thinking:
+            if thinking and self._thinking_panel_enabled():
                 self.llm_thinking_panel.set_text(str(thinking))
             self._maybe_schedule_agent_turn()
             return
 
         if kind == "briefing_error":
-            self.message = f"LLM rules briefing failed ({_llm_error_detail(payload, self.agent)})"
+            detail = self._report_llm_failure("LLM rules briefing failed", payload)
+            self.llm_briefing_failed = True
+            self.message = f"LLM rules briefing failed: {detail}"
             return
 
         if kind == "error":
             exc = payload
+            detail = self._report_llm_failure(f"{self._opponent_label()} error", exc)
             legal_moves = self.state.legal_moves()
             if not legal_moves:
-                self.message = f"Agent error ({_llm_error_detail(exc, self.agent)})"
+                self.message = f"Agent error: {detail}"
                 return
             move = random.choice(legal_moves)
             self.state = self.state.apply_move(move)
             name = self._opponent_label()
-            self.message = f"{name} error ({_llm_error_detail(exc, self.agent)}) - played random {format_move(move)}"
+            self.message = f"{name} error: {detail} — played random {format_move(move)}"
             self._maybe_schedule_agent_turn()
             return
 
@@ -559,7 +570,7 @@ class HumanVsAgentGui:
             name = self._opponent_label()
             self.message = f"{name}: {format_move(move)}"
 
-        if thinking:
+        if thinking and self._thinking_panel_enabled():
             self.llm_thinking_panel.set_text(str(thinking))
 
         self.state = self.state.apply_move(move)
@@ -589,7 +600,8 @@ class HumanVsAgentGui:
 
         self._agent_busy = True
         self.message = f"{self._opponent_label()} thinking..."
-        self.llm_thinking_panel.clear()
+        if self._thinking_panel_enabled():
+            self.llm_thinking_panel.clear()
         state = self.state
         agent = self.agent
         generation = self._async_generation
@@ -620,7 +632,8 @@ class HumanVsAgentGui:
         llm_color = self._llm_agent_color()
         self.llm_awaiting_rules_ack = True
         self.message = "Sending rules to LLM..."
-        self.llm_thinking_panel.clear()
+        if self._thinking_panel_enabled():
+            self.llm_thinking_panel.clear()
         agent = self.agent
         generation = self._async_generation
 
@@ -655,6 +668,8 @@ class HumanVsAgentGui:
         self.selected_move_type = MoveType.DROP
         self.mode = "game"
         self.message = ""
+        self.llm_briefing_failed = False
+        self.llm_alert = None
         self.llm_thinking_panel.clear()
         self.layout = self._compute_board_layout()
         if self._needs_llm_rules_briefing():
@@ -670,6 +685,8 @@ class HumanVsAgentGui:
 
     def _llm_rules_gate_active(self) -> bool:
         if not self._needs_llm_rules_briefing():
+            return False
+        if self.llm_briefing_failed:
             return False
         if self.llm_awaiting_rules_ack:
             return True
@@ -771,8 +788,11 @@ class HumanVsAgentGui:
         )
 
         remember_endpoint(base_url)
+        from connect4_mcts.players.llm import model_exposes_thinking
+
         self.config.llm_label = f"LLM: {model}"
         self.config.agent_name = "llm"
+        self.config.llm_cot_enabled = model_exposes_thinking(client.base_url, model)
         self.message = f"LLM ready: {model}"
 
     def _notify_llm(self, success: bool, text: str) -> None:
@@ -814,8 +834,23 @@ class HumanVsAgentGui:
         if rects["start"].collidepoint(position):
             self._start_game()
 
+    def _thinking_panel_enabled(self) -> bool:
+        return (
+            self.mode == "game"
+            and self.config.agent_name == "llm"
+            and not self.config.two_player
+            and self.config.llm_cot_enabled
+        )
+
+    def _cot_streams_live(self) -> bool:
+        if not self._thinking_panel_enabled():
+            return False
+        from connect4_mcts.players.llm import cot_streams_live
+
+        return cot_streams_live(self.config.llm_base_url, self.config.llm_model or "")
+
     def _poll_llm_thinking(self) -> None:
-        if self.config.agent_name != "llm" or self.mode != "game":
+        if not self._thinking_panel_enabled() or not self._cot_streams_live():
             return
         if not self._agent_busy and not self.llm_awaiting_rules_ack:
             return
@@ -824,12 +859,14 @@ class HumanVsAgentGui:
             self.llm_thinking_panel.set_text(str(thinking))
 
     def _thinking_panel_placeholder(self) -> str | None:
+        if not self._cot_streams_live():
+            return None
         if self._agent_busy or self.llm_awaiting_rules_ack:
             return "Waiting for response..."
         return None
 
     def _handle_wheel(self, delta_y: int) -> None:
-        if self.mode != "game" or self.config.agent_name != "llm":
+        if not self._thinking_panel_enabled():
             return
         if not self.llm_thinking_panel.rect.collidepoint(pygame.mouse.get_pos()):
             return
@@ -840,7 +877,7 @@ class HumanVsAgentGui:
         )
 
     def _handle_thinking_panel_mouse_down(self, position: tuple[int, int]) -> bool:
-        if self.mode != "game" or self.config.agent_name != "llm":
+        if not self._thinking_panel_enabled():
             return False
         return self.llm_thinking_panel.handle_mouse_down(
             position,
@@ -849,7 +886,7 @@ class HumanVsAgentGui:
         )
 
     def _handle_thinking_panel_mouse_motion(self, position: tuple[int, int]) -> None:
-        if self.mode != "game" or self.config.agent_name != "llm":
+        if not self._thinking_panel_enabled():
             return
         self.llm_thinking_panel.handle_mouse_motion(
             position,
@@ -864,7 +901,7 @@ class HumanVsAgentGui:
         self.selected_move_type = MoveType.PUSH if self.selected_move_type is MoveType.DROP else MoveType.DROP
 
     def _thinking_panel_width(self) -> int:
-        if self.config.agent_name != "llm" or self.mode != "game":
+        if not self._thinking_panel_enabled():
             return 0
         max_panel = max(THINKING_PANEL_MIN_WIDTH, (self.width - 2 * MARGIN) // 3)
         return min(THINKING_PANEL_WIDTH, max_panel)
@@ -902,11 +939,22 @@ class HumanVsAgentGui:
         self._draw_thinking_panel()
         self._draw_footer()
 
+    def _report_llm_failure(self, title: str, exc: Exception) -> str:
+        from connect4_mcts.players.llm import format_llm_api_error, is_concerning_llm_error
+
+        detail = format_llm_api_error(exc, agent=self.agent)
+        self.llm_alert = detail
+        if is_concerning_llm_error(exc):
+            _notify(False, title, detail)
+        return detail
+
     def _draw_header(self) -> None:
         title = self.large_font.render("Don't Connect 4", True, TEXT)
         self.screen.blit(title, (MARGIN, 22))
 
-        if self._llm_rules_gate_active():
+        if self.llm_alert:
+            status_line = self.llm_alert
+        elif self._llm_rules_gate_active():
             status_line = "Waiting for LLM to acknowledge the rules..."
         elif self._agent_busy:
             status_line = f"{self._opponent_label()} thinking..."
@@ -914,7 +962,8 @@ class HumanVsAgentGui:
             status_line = gui_status_message(
                 self.state, self.config.human, self.config.agent_name, self.config.two_player
             )
-        status = self.font.render(status_line, True, TEXT)
+        status_color = ERROR if self.llm_alert else TEXT
+        status = self.font.render(_shorten(status_line, 96), True, status_color)
         self.screen.blit(status, (MARGIN, 62))
 
     def _draw_controls(self) -> None:
@@ -996,7 +1045,7 @@ class HumanVsAgentGui:
             self.screen.blit(label, label.get_rect(center=(x, self.layout.top + self.layout.height + 22)))
 
     def _draw_thinking_panel(self) -> None:
-        if self.config.agent_name != "llm":
+        if not self._thinking_panel_enabled():
             return
         self.llm_thinking_panel.draw(
             self.screen,
@@ -1009,6 +1058,9 @@ class HumanVsAgentGui:
         if self.state.status is GameStatus.FINISHED:
             text = result_text(self.state.result)
             color = TEXT
+        elif self.llm_alert:
+            text = self.llm_alert
+            color = ERROR
         elif self._llm_rules_gate_active():
             text = "Waiting for LLM to acknowledge the rules..."
             color = MUTED_TEXT
@@ -1389,12 +1441,9 @@ def _short_error(exc: Exception, max_length: int = 200) -> str:
 
 
 def _llm_error_detail(exc: Exception, agent: Agent) -> str:
-    text = _short_error(exc)
-    client = getattr(agent, "client", None)
-    debug = getattr(client, "last_completion_debug", None)
-    if debug:
-        return f"{text} | {debug}"
-    return text
+    from connect4_mcts.players.llm import format_llm_api_error
+
+    return format_llm_api_error(exc, agent=agent)
 
 
 def _shorten(text: str, max_length: int = 22) -> str:

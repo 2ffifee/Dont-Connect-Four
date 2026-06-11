@@ -29,6 +29,27 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Literal, Protocol, runtime_checkable
 
+from connect4_mcts.cot_profiles import (
+    CoTProfile,
+    CoTStrategy,
+    cot_streams_live,
+    extract_inline_thinking_tags,
+    extract_reasoning_details,
+    extract_thinking_for_strategy,
+    flatten_assistant_content,
+    gemini_supports_visible_thoughts,
+    gemini_thinking_extra_body,
+    model_exposes_thinking,
+    normalize_thinking_text,
+    openrouter_should_request_reasoning,
+    prefers_blocking_completion,
+    resolve_cot_profile,
+    uses_structured_reasoning,
+    _part_payload,
+    _read_reasoning_from_object,
+)
+
+_extract_reasoning_details = extract_reasoning_details
 from connect4_mcts.game import COLUMNS, ROWS, GameState, Move, MoveType, Player
 from connect4_mcts.players.base import MoveSelectionError
 
@@ -53,6 +74,71 @@ def _log_llm_debug(message: str, *args: object) -> None:
 
 def _log_llm_warning(message: str, *args: object) -> None:
     logger.warning("[llm] " + message, *args)
+
+
+def is_concerning_llm_error(exc: Exception) -> bool:
+    """Return whether an LLM failure should be surfaced prominently in the GUI."""
+    text = str(exc).lower()
+    markers = (
+        "429",
+        "quota",
+        "rate limit",
+        "resource_exhausted",
+        "billing",
+        "401",
+        "403",
+        "authentication",
+        "invalid api key",
+        "unauthorized",
+        "timeout",
+        "timed out",
+        "connection error",
+        "connection refused",
+        "service unavailable",
+        "503",
+        "502",
+        "500",
+        "overloaded",
+    )
+    return any(marker in text for marker in markers)
+
+
+def format_llm_api_error(exc: Exception, *, agent: object | None = None) -> str:
+    """Return a short, user-facing summary of an LLM API failure."""
+    text = str(exc).strip() or exc.__class__.__name__
+    lowered = text.lower()
+
+    if "429" in text or "quota" in lowered or "resource_exhausted" in lowered:
+        model_match = re.search(r"model:\s*([\w./:-]+)", text, re.IGNORECASE)
+        model_hint = f" ({model_match.group(1)})" if model_match else ""
+        if "free_tier" in lowered or "limit: 0" in lowered:
+            return f"API quota exceeded{model_hint} — free tier limit reached. Try another model or provider."
+        return f"API rate limit / quota exceeded{model_hint}. Retry later or switch model."
+
+    if any(marker in lowered for marker in ("401", "403", "unauthorized", "invalid api key", "authentication")):
+        return "API authentication failed — check your API key and provider."
+
+    if any(marker in lowered for marker in ("timeout", "timed out")):
+        return "LLM request timed out — try again or use a faster model."
+
+    if any(marker in lowered for marker in ("connection error", "connection refused", "connect")):
+        return "Could not reach the LLM server — check URL and network."
+
+    if any(marker in lowered for marker in ("503", "502", "500", "overloaded", "service unavailable")):
+        return "LLM provider temporarily unavailable — retry in a moment."
+
+    message_match = re.search(r"'message':\s*'([^']{1,240})'", text)
+    if message_match:
+        return message_match.group(1)
+
+    if len(text) > 240:
+        text = text[:237] + "..."
+
+    client = getattr(agent, "client", None) if agent is not None else None
+    debug = getattr(client, "last_completion_debug", None)
+    if debug:
+        return f"{text} | {debug}"
+    return text
 
 
 @runtime_checkable
@@ -109,8 +195,10 @@ Fair-turn rule:
 
 When it is your turn:
 - Choose exactly one move from the provided list of legal moves.
-- Respond with ONLY a JSON object, no prose, in the form:
+- You may reason first in [THINK]...[/THINK] tags (optional).
+- Then respond with a JSON object in the form:
   {"move_type": "drop" | "push", "column": <integer 0-7>}
+- Put no other prose outside the optional [THINK] block and the JSON object.
 """
 
 
@@ -179,93 +267,38 @@ def render_turn(state: GameState, legal_moves: Sequence[Move], include_line_coun
     parts.extend(f"  - {_move_label(move)}" for move in legal_moves)
     parts.append("")
     parts.append(
-        'Reply with ONLY a JSON object like {"move_type": "drop", "column": 3} '
-        "choosing one of the legal moves above."
+        'Reply with an optional [THINK]...[/THINK] reasoning block, then a JSON object like '
+        '{"move_type": "drop", "column": 3} choosing one of the legal moves above.'
     )
     return "\n".join(parts)
 
 
-_THINKING_TAG_PATTERNS = (
-    re.compile(r"<\s*think\s*>(.*?)\s*<\s*/\s*think\s*>", re.DOTALL | re.IGNORECASE),
-    re.compile(r"<\s*thought\s*>(.*?)\s*<\s*/\s*thought\s*>", re.DOTALL | re.IGNORECASE),
-    re.compile(r"<\s*redacted_thinking\s*>(.*?)\s*<\s*/\s*redacted_thinking\s*>", re.DOTALL | re.IGNORECASE),
-    re.compile(r"<\s*thinking\s*>(.*?)\s*<\s*/\s*thinking\s*>", re.DOTALL | re.IGNORECASE),
-    re.compile(r"<\s*reasoning\s*>(.*?)\s*<\s*/\s*reasoning\s*>", re.DOTALL | re.IGNORECASE),
-)
-
-_STRUCTURED_REASONING_MODEL_MARKERS = (
-    "o1-",
-    "o1/",
-    "/o1",
-    "o3-",
-    "o3/",
-    "/o3",
-    "o4-",
-    "o4/",
-    "/o4",
-    "deepseek-r",
-    "deepseek-reasoner",
-    "deepseek-reason",
-    "qwen3",
-    "qwq",
-    ":thinking",
-    "/thinking",
-    "thinking-",
-    "-thinking",
-    "/r1",
-    "r1-",
-    "reasoner",
-    "gpt-5",
-)
+_read_reasoning_from_part = _read_reasoning_from_object
 
 
-def uses_structured_reasoning(model: str) -> bool:
-    """Return whether a model likely exposes CoT via API reasoning fields."""
-    name = model.lower().removeprefix("models/")
-    return any(marker in name for marker in _STRUCTURED_REASONING_MODEL_MARKERS)
+def _debug_log_assistant_message(message: object, *, raw_message: dict[str, object] | None = None) -> None:
+    if not llm_debug_enabled():
+        return
 
+    content = getattr(message, "content", None) or (raw_message or {}).get("content") or ""
+    preview = str(content).replace("\n", "\\n")
+    if len(preview) > 400:
+        preview = preview[:397] + "..."
+    _log_llm_debug("assistant content preview (%d chars): %s", len(str(content)), preview)
 
-def prefers_blocking_completion(base_url: str | None, model: str) -> bool:
-    """Return whether to skip streaming and wait for one full response.
-
-    Local servers and providers/models with structured reasoning fields are
-    handled in blocking mode. CoT is still published once the full reply is
-    available (live streaming is optional and mainly used for cloud tag-based
-    output).
-    """
-    from connect4_mcts.llm_settings import is_local_endpoint, match_endpoint_preset
-
-    preset = match_endpoint_preset(base_url)
-    if preset.provider_id == "gemini":
-        return True
-    if preset.local or is_local_endpoint(base_url):
-        return True
-    return uses_structured_reasoning(model)
-
-
-def _read_reasoning_from_part(part: object) -> str | None:
-    """Extract chain-of-thought text from a message or stream delta object."""
-    for attr in ("reasoning_content", "reasoning", "thinking"):
-        value = getattr(part, attr, None)
-        if value:
-            text = _normalize_thinking_text(str(value))
-            if text:
-                return text
-
-    model_dump = getattr(part, "model_dump", None)
-    if callable(model_dump):
-        try:
-            data = model_dump()
-        except Exception:  # noqa: BLE001 - best-effort introspection only
-            data = None
-        if isinstance(data, dict):
-            for key in ("reasoning_content", "reasoning", "thinking"):
-                value = data.get(key)
-                if value:
-                    text = _normalize_thinking_text(str(value))
-                    if text:
-                        return text
-    return None
+    for label, blob in (
+        ("message", _part_payload(message)),
+        ("raw", raw_message),
+    ):
+        if not isinstance(blob, dict):
+            continue
+        reasoning_keys = {
+            key: blob.get(key)
+            for key in ("reasoning", "reasoning_content", "reasoning_details", "thinking")
+            if blob.get(key) is not None
+        }
+        if reasoning_keys:
+            _log_llm_debug("%s reasoning keys: %s", label, reasoning_keys)
 
 
 _FENCE_MARKER_PATTERN = re.compile(r"^[`'\"]{3,}(?:json|JSON)?\s*$")
@@ -276,23 +309,7 @@ _FENCED_JSON_BLOCK = re.compile(
 _MOVE_JSON_PATTERN = re.compile(r'\{[^{}]*"move_type"', re.DOTALL)
 
 
-def _normalize_thinking_text(text: str | None) -> str | None:
-    """Drop markdown fence markers and other non-reasoning noise from CoT text."""
-    if not text:
-        return None
-    cleaned = text.strip()
-    if not cleaned:
-        return None
-    if _FENCE_MARKER_PATTERN.fullmatch(cleaned):
-        return None
-
-    cleaned = re.sub(r"^[`'\"]{3,}(?:json|JSON)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"[`'\"]{3,}\s*$", "", cleaned)
-    cleaned = re.sub(r"\n[`'\"]{3,}(?:json|JSON)?\s*$", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.strip()
-    if not cleaned or _FENCE_MARKER_PATTERN.fullmatch(cleaned):
-        return None
-    return cleaned
+_normalize_thinking_text = normalize_thinking_text
 
 
 def _extract_move_json_remainder(text: str) -> str:
@@ -316,20 +333,9 @@ def extract_thinking(text: str) -> tuple[str | None, str]:
     if not text:
         return None, ""
 
-    thinking_parts: list[str] = []
-    remainder = text
-    for pattern in _THINKING_TAG_PATTERNS:
-        while True:
-            match = pattern.search(remainder)
-            if not match:
-                break
-            segment = _normalize_thinking_text(match.group(1))
-            if segment:
-                thinking_parts.append(segment)
-            remainder = pattern.sub("", remainder, count=1).strip()
-
-    if thinking_parts:
-        return "\n\n".join(thinking_parts), _extract_move_json_remainder(remainder)
+    tagged, remainder = extract_inline_thinking_tags(text)
+    if tagged:
+        return tagged, _extract_move_json_remainder(remainder)
 
     fenced = _FENCED_JSON_BLOCK.match(text.strip())
     if fenced:
@@ -680,31 +686,7 @@ class MockLLMClient:
 
 _LOCAL_API_KEY_PLACEHOLDER = "ollama"
 _GOOGLE_GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
-_GEMINI_THINKING_MODEL_MARKERS = ("gemini-2.5", "gemini-3", "gemini-3.5")
-
-
-def gemini_supports_visible_thoughts(model: str) -> bool:
-    """Return whether we should ask Gemini to include thought summaries."""
-    name = model.lower().removeprefix("models/")
-    return any(marker in name for marker in _GEMINI_THINKING_MODEL_MARKERS)
-
-
-def _gemini_thinking_extra_body() -> dict[str, object]:
-    """Build ``extra_body`` for the OpenAI Python SDK against Gemini.
-
-    The SDK merges the ``extra_body`` argument into the HTTP JSON body. Gemini
-    expects a nested ``extra_body.google.thinking_config`` object, so we wrap
-    the Google fields one level down (see Gemini OpenAI compatibility docs).
-    """
-    return {
-        "extra_body": {
-            "google": {
-                "thinking_config": {
-                    "include_thoughts": True,
-                }
-            }
-        }
-    }
+_gemini_thinking_extra_body = gemini_thinking_extra_body
 
 
 def _gemini_thinking_config(params: dict[str, object]) -> dict[str, object] | None:
@@ -855,8 +837,10 @@ class OpenAIClient:
         if default_headers:
             client_kwargs["default_headers"] = default_headers
         self._client = OpenAI(**client_kwargs)
+        self.cot_profile: CoTProfile = resolve_cot_profile(resolved_base, model)
         self.last_thinking: str | None = None
         self.last_completion_debug: str | None = None
+        self._last_raw_choice_message: dict[str, object] | None = None
 
     def _set_completion_debug(self, summary: str) -> None:
         self.last_completion_debug = summary
@@ -889,18 +873,16 @@ class OpenAIClient:
         call_timeout = self.timeout if timeout is _USE_CLIENT_TIMEOUT else timeout
         param_variants = self._completion_param_variants(params)
         errors: list[Exception] = []
-        use_streaming = (
-            on_thinking_update is not None
-            and not prefers_blocking_completion(self.base_url, self.model)
-        )
+        use_streaming = on_thinking_update is not None and self.cot_profile.streams_live
 
         _log_llm_debug(
-            "complete provider=%s model=%s variants=%d streaming=%s blocking_reason=%s timeout=%s",
+            "complete provider=%s model=%s cot=%s variants=%d streaming=%s blocking=%s timeout=%s",
             self.provider,
             self.model,
+            self.cot_profile.strategy.value,
             len(param_variants),
             use_streaming,
-            prefers_blocking_completion(self.base_url, self.model),
+            self.cot_profile.blocking,
             call_timeout,
         )
 
@@ -979,7 +961,7 @@ class OpenAIClient:
                 raise
             response = self._create_completion(adapted, timeout)
 
-        return self._finalize_message(response.choices[0].message, on_thinking_update)
+        return self._finalize_message(response.choices[0].message, on_thinking_update, response=response)
 
     def _publish_thinking(
         self,
@@ -1015,6 +997,15 @@ class OpenAIClient:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
+            if llm_debug_enabled():
+                delta_dump = _part_payload(delta) or {}
+                delta_keys = {
+                    key: delta_dump.get(key)
+                    for key in ("content", "reasoning", "reasoning_content", "reasoning_details", "thinking")
+                    if delta_dump.get(key) is not None
+                }
+                if delta_keys:
+                    _log_llm_debug("stream delta keys: %s", delta_keys)
             reasoning = _read_reasoning_from_part(delta)
             if reasoning:
                 reasoning_parts.append(reasoning)
@@ -1027,59 +1018,105 @@ class OpenAIClient:
                     self._publish_thinking(thinking, on_thinking_update)
 
         content = "".join(content_parts)
+        thinking: str | None = None
         if reasoning_parts:
-            self._publish_thinking("".join(reasoning_parts).strip() or None, on_thinking_update)
-        elif content:
-            thinking, _ = extract_thinking(content)
-            self._publish_thinking(thinking, on_thinking_update)
+            thinking = "".join(reasoning_parts).strip() or None
+        tagged_thinking, _ = extract_thinking(content)
+        if tagged_thinking:
+            if thinking and tagged_thinking not in thinking:
+                thinking = f"{thinking.strip()}\n\n{tagged_thinking.strip()}".strip()
+            elif not thinking:
+                thinking = tagged_thinking
+        self._publish_thinking(thinking, on_thinking_update)
         return content
 
     def _finalize_message(
         self,
         message: object,
         on_thinking_update: Callable[[str], None] | None,
+        *,
+        response: object | None = None,
     ) -> str:
-        content = message.content or ""
-        reasoning = _read_reasoning_from_part(message)
-        if llm_debug_enabled():
-            attrs = {
-                name: getattr(message, name)
-                for name in ("content", "reasoning_content", "reasoning", "thinking", "role", "refusal")
-                if getattr(message, name, None)
-            }
-            _log_llm_debug("message fields: %s", attrs)
+        raw_message: dict[str, object] | None = getattr(self, "_last_raw_choice_message", None)
+        if response is not None and raw_message is None:
+            choice_dump = _part_payload(response.choices[0])
+            if isinstance(choice_dump, dict):
+                nested = choice_dump.get("message")
+                if isinstance(nested, dict):
+                    raw_message = nested
+
+        raw_content = message.content
+        if not raw_content and raw_message is not None:
+            raw_content = raw_message.get("content")
+        content = flatten_assistant_content(raw_content)
+
+        _debug_log_assistant_message(message, raw_message=raw_message)
+
+        thinking = extract_thinking_for_strategy(
+            self.cot_profile.strategy,
+            message=message,
+            raw_message=raw_message,
+            content=content,
+        )
         tagged_thinking, tagged_remainder = extract_thinking(content)
-        if reasoning:
-            thinking = reasoning
-            if tagged_thinking and tagged_thinking not in reasoning:
-                thinking = _normalize_thinking_text(f"{reasoning.strip()}\n\n{tagged_thinking.strip()}")
-            else:
-                thinking = reasoning
-            self._publish_thinking(thinking, on_thinking_update)
-            return tagged_remainder or _extract_move_json_remainder(content)
-        self._publish_thinking(tagged_thinking, on_thinking_update)
+        if thinking is None:
+            thinking = tagged_thinking
+        elif tagged_thinking and tagged_thinking not in thinking:
+            thinking = _normalize_thinking_text(f"{thinking.strip()}\n\n{tagged_thinking.strip()}")
+
+        self._publish_thinking(thinking, on_thinking_update)
         return tagged_remainder or _extract_move_json_remainder(content)
 
     def _apply_provider_params(self, params: dict[str, object]) -> dict[str, object]:
-        """Add provider-specific request fields."""
+        """Add provider-specific request fields from the resolved CoT profile."""
         merged = dict(params)
+        profile = self.cot_profile
         extra_body: dict[str, object] = {}
 
-        if self.provider == "gemini" and gemini_supports_visible_thoughts(self.model):
-            extra_body.update(_gemini_thinking_extra_body())
+        if profile.request_gemini_thoughts:
+            extra_body.update(gemini_thinking_extra_body())
 
-        if (
-            getattr(self, "endpoint_preset", None) is not None
-            and self.endpoint_preset.provider_id == "openrouter"
-            and uses_structured_reasoning(self.model)
-        ):
-            extra_body["reasoning"] = {"effort": "medium"}
+        if profile.request_openrouter_reasoning:
+            extra_body["reasoning"] = {"enabled": True}
+
+        effort = profile.request_mistral_reasoning_effort
+        if effort is not None:
+            merged["reasoning_effort"] = effort
 
         if extra_body:
             merged["extra_body"] = extra_body
         return merged
 
     def _create_completion(self, params: dict[str, object], timeout: float | None) -> object:
+        self._last_raw_choice_message = None
+        use_raw_openrouter = self.cot_profile.use_openrouter_raw_response
+        if use_raw_openrouter:
+            completions = self._client.chat.completions
+            raw_api = getattr(completions, "with_raw_response", None)
+            if raw_api is not None:
+                if callable(raw_api):
+                    raw_api = raw_api()
+                create = getattr(raw_api, "create", None)
+            else:
+                create = None
+            if create is not None:
+                if timeout is None:
+                    raw = create(**params)
+                else:
+                    raw = create(timeout=timeout, **params)
+                try:
+                    payload = json.loads(raw.text)
+                except json.JSONDecodeError:
+                    return raw.parse()
+                choices = payload.get("choices")
+                if isinstance(choices, list) and choices:
+                    first = choices[0]
+                    if isinstance(first, dict):
+                        message = first.get("message")
+                        if isinstance(message, dict):
+                            self._last_raw_choice_message = message
+                return raw.parse()
+
         if timeout is None:
             return self._client.chat.completions.create(**params)
         return self._client.chat.completions.create(timeout=timeout, **params)
