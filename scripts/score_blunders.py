@@ -45,9 +45,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-positions", type=int, default=0, help="Maximum scored rows; 0 means all selected rows.")
     parser.add_argument("--sample-every", type=int, default=1, help="Score every Nth move row.")
     parser.add_argument(
-        "--cache-only",
+        "--run-search",
         action="store_true",
-        help="Do not run new oracle search; use only values already cached in the oracle tree.",
+        help=(
+            "Run new MCTS simulations for positions missing from the oracle tree "
+            "(default: lookup-only from the saved pickle)."
+        ),
     )
     parser.add_argument("--progress-every", type=int, default=100, help="Print progress every N scored positions.")
     args = parser.parse_args(argv)
@@ -63,17 +66,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = _resolve_output_path(args.input_dir, args.output, "blunders.csv")
     summary_path = _resolve_summary_path(output_path, args.summary_output)
 
-    oracle = load_player(args.oracle)
+    oracle = load_player(args.oracle, inference_only=not args.run_search)
     if not hasattr(oracle, "evaluate"):
         raise SystemExit(f"oracle does not expose evaluate(...): {args.oracle}")
 
     rows, evaluated, cache_hits = score_moves(
         oracle,
-        _read_jsonl(moves_path),
+        _iter_jsonl(moves_path),
         threshold=args.threshold,
         max_positions=args.max_positions,
         sample_every=args.sample_every,
-        run_search=not args.cache_only,
+        run_search=args.run_search,
         progress_every=args.progress_every,
     )
     summary_rows = summarize_blunders(rows)
@@ -96,13 +99,14 @@ def score_moves(
     threshold: float = 0.3,
     max_positions: int = 0,
     sample_every: int = 1,
-    run_search: bool = True,
+    run_search: bool = False,
     progress_every: int = 100,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    cache: dict[GameState, SearchEvaluation] = {}
+    evaluation_cache: dict[tuple[Any, ...], SearchEvaluation] = {}
     rows: list[dict[str, Any]] = []
     evaluated = 0
     cache_hits = 0
+    initial_tree_size = _oracle_tree_size(oracle)
 
     for source_index, move_row in enumerate(moves):
         if source_index % sample_every != 0:
@@ -112,19 +116,47 @@ def score_moves(
 
         state = state_from_payload(move_row["state_before"])
         chosen = move_from_payload(move_row)
-        evaluation = cache.get(state)
+        cache_key = _state_cache_key(move_row["state_before"])
+        evaluation = evaluation_cache.get(cache_key)
         if evaluation is None:
-            evaluation = oracle.evaluate(state, run_search=run_search)
-            cache[state] = evaluation
+            evaluation = oracle.evaluate(state, run_search=run_search, retain_tree=False)
+            evaluation_cache[cache_key] = evaluation
             evaluated += 1
         else:
             cache_hits += 1
 
         rows.append(_score_row(move_row, chosen, evaluation, threshold))
         if progress_every > 0 and len(rows) % progress_every == 0:
-            print(f"  scored {len(rows)} moves ({evaluated} oracle evaluations, {cache_hits} cache hits)", flush=True)
+            tree_growth = _oracle_tree_size(oracle) - initial_tree_size
+            growth_note = f", oracle tree +{tree_growth} nodes" if tree_growth else ""
+            print(
+                f"  scored {len(rows)} moves ({evaluated} oracle lookups, {cache_hits} repeated states{growth_note})",
+                flush=True,
+            )
 
     return rows, evaluated, cache_hits
+
+
+def _state_cache_key(payload: dict[str, Any]) -> tuple[Any, ...]:
+    protected = payload.get("protected_segments", [])
+    return (
+        tuple(payload["board"]),
+        str(payload["current_player"]),
+        str(payload["first_player"]),
+        str(payload.get("status", "")),
+        int(payload["move_count"]),
+        tuple(tuple(segment) for segment in protected),
+    )
+
+
+def _oracle_tree_size(oracle: Any) -> int:
+    tree_size = getattr(oracle, "tree_size", None)
+    if isinstance(tree_size, int):
+        return tree_size
+    tree = getattr(oracle, "tree", None)
+    if isinstance(tree, dict):
+        return len(tree)
+    return 0
 
 
 def summarize_blunders(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -168,6 +200,8 @@ def state_from_payload(payload: dict[str, Any]) -> GameState:
         status=GameStatus(str(payload["status"])),
         move_count=int(payload["move_count"]),
         result=None,
+        red_line_total=int(payload.get("red_line_total", 0)),
+        yellow_line_total=int(payload.get("yellow_line_total", 0)),
         protected_segments=protected_segments,
     )
 
@@ -240,13 +274,11 @@ def _resolve_summary_path(output_path: str, summary_path: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(output_path)), "blunder_summary.csv")
 
 
-def _read_jsonl(path: str) -> list[dict[str, Any]]:
-    rows = []
+def _iter_jsonl(path: str) -> Iterable[dict[str, Any]]:
     with open(path, encoding="utf-8") as file:
         for line in file:
             if line.strip():
-                rows.append(json.loads(line))
-    return rows
+                yield json.loads(line)
 
 
 def _write_csv(path: str, rows: Iterable[dict[str, Any]]) -> None:

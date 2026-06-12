@@ -316,6 +316,7 @@ class GuiConfig:
     llm_api_key: str | None = None
     llm_label: str | None = None
     llm_cot_enabled: bool = False
+    enable_undo: bool = False
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -349,11 +350,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         depth=args.depth,
         two_player=args.two_player,
+        enable_undo=True,
     )
     if args.load:
         from connect4_mcts.training import load_player
 
-        config.loaded_agent = load_player(args.load)
+        config.loaded_agent = load_player(args.load, inference_only=True)
         config.loaded_label = os.path.basename(args.load)
         config.agent_name = "loaded"
 
@@ -373,7 +375,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 class HumanVsRandomGui:
     def __init__(self, human: Player = Player.RED, seed: int | None = None) -> None:
-        self._delegate = HumanVsAgentGui(config=GuiConfig(human=human, agent_name="random", seed=seed))
+        self._delegate = HumanVsAgentGui(
+            config=GuiConfig(human=human, agent_name="random", seed=seed, enable_undo=True)
+        )
 
     def run(self) -> None:
         self._delegate.run()
@@ -404,6 +408,7 @@ class HumanVsAgentGui:
         self._async_generation = 0
         self._async_lock = threading.Lock()
         self._async_result: tuple[str, object] | None = None
+        self._undo_stack: list[GameState] | None = None
         self.layout = self._compute_board_layout()
 
     def run(self) -> None:
@@ -454,6 +459,8 @@ class HumanVsAgentGui:
                 self._start_game()
         elif key == pygame.K_SPACE:
             self._toggle_move_type()
+        elif key == pygame.K_u:
+            self._undo()
         elif key == pygame.K_r:
             self._reset()
 
@@ -467,6 +474,9 @@ class HumanVsAgentGui:
             return
         if self._push_button_rect().collidepoint(position):
             self.selected_move_type = MoveType.PUSH
+            return
+        if self._undo_button_rect().collidepoint(position):
+            self._undo()
             return
         if self._reset_button_rect().collidepoint(position):
             self._reset()
@@ -501,9 +511,15 @@ class HumanVsAgentGui:
         self.message = ""
 
         if self.config.two_player:
+            if self._undo_stack is not None:
+                self._undo_stack.append(self.state)
             return
 
-        if self.state.status is not GameStatus.FINISHED and self.state.current_player is not self.config.human:
+        if self.state.status is GameStatus.FINISHED:
+            self._push_undo_point_if_needed()
+            return
+
+        if self.state.current_player is not self.config.human:
             self._schedule_agent_turn()
 
     def _invalidate_async_work(self) -> None:
@@ -551,6 +567,7 @@ class HumanVsAgentGui:
             self.state = self.state.apply_move(move)
             name = self._opponent_label()
             self.message = f"{name} error: {detail} — played random {format_move(move)}"
+            self._push_undo_point_if_needed()
             self._maybe_schedule_agent_turn()
             return
 
@@ -574,6 +591,7 @@ class HumanVsAgentGui:
             self.llm_thinking_panel.set_text(str(thinking))
 
         self.state = self.state.apply_move(move)
+        self._push_undo_point_if_needed()
         self._maybe_schedule_agent_turn()
 
     def _opponent_label(self) -> str:
@@ -660,9 +678,67 @@ class HumanVsAgentGui:
     def _reset(self) -> None:
         self._start_game()
 
+    def _undo_history_enabled(self) -> bool:
+        return self.config.enable_undo
+
+    def _push_undo_point_if_needed(self) -> None:
+        """Record a checkpoint when it is the human's turn again (single-player)."""
+        if not self._undo_history_enabled() or self._undo_stack is None:
+            return
+        if self.config.two_player:
+            return
+        if self._undo_stack and self.state == self._undo_stack[-1]:
+            return
+        self._undo_stack.append(self.state)
+
+    def _can_undo(self) -> bool:
+        if not self._undo_history_enabled() or self.mode != "game" or not self._undo_stack:
+            return False
+        if self.config.two_player:
+            return len(self._undo_stack) > 1
+        if self.state != self._undo_stack[-1]:
+            return True
+        return len(self._undo_stack) > 1
+
+    def _undo(self) -> None:
+        if not self._can_undo():
+            return
+
+        self._invalidate_async_work()
+        if self.config.two_player:
+            self._undo_stack.pop()
+            self.state = self._undo_stack[-1]
+        elif self.state != self._undo_stack[-1]:
+            self.state = self._undo_stack[-1]
+        else:
+            self._undo_stack.pop()
+            self.state = self._undo_stack[-1]
+
+        self.message = ""
+        self.llm_alert = None
+        self.llm_thinking_panel.clear()
+        self._sync_agent_after_undo()
+        if (
+            not self.config.two_player
+            and self.state.status is not GameStatus.FINISHED
+            and self.state.current_player is not self.config.human
+        ):
+            self._schedule_agent_turn()
+
+    def _sync_agent_after_undo(self) -> None:
+        if self.config.two_player or self.config.agent_name != "llm":
+            return
+        rules_ok = getattr(self.agent, "rules_acknowledged", False)
+        begin_new_game = getattr(self.agent, "begin_new_game", None)
+        if callable(begin_new_game):
+            begin_new_game()
+        if rules_ok and self.state.move_count > 0:
+            self.agent.rules_acknowledged = True
+
     def _start_game(self) -> None:
         self._invalidate_async_work()
         self.state = GameState.new(first_player=Player.RED)
+        self._undo_stack = [self.state] if self._undo_history_enabled() else None
         self.agent = self._make_agent()
         self._reset_llm_conversation()
         self.selected_move_type = MoveType.DROP
@@ -731,7 +807,7 @@ class HumanVsAgentGui:
         from connect4_mcts.training import load_player
 
         try:
-            agent = load_player(path)
+            agent = load_player(path, inference_only=True)
         except Exception:  # noqa: BLE001 - surface any load failure to the user
             self.message = "Failed to load player"
             return
@@ -969,6 +1045,7 @@ class HumanVsAgentGui:
     def _draw_controls(self) -> None:
         self._draw_button(self._drop_button_rect(), "Drop", self.selected_move_type is MoveType.DROP)
         self._draw_button(self._push_button_rect(), "Push", self.selected_move_type is MoveType.PUSH)
+        self._draw_button(self._undo_button_rect(), "Undo", self._can_undo())
         self._draw_button(self._reset_button_rect(), "Reset", False)
         self._draw_button(self._menu_button_rect(), "Menu", False)
 
@@ -1069,32 +1146,35 @@ class HumanVsAgentGui:
             lowered = self.message.lower()
             color = ERROR if "error" in lowered or "illegal" in lowered or "fail" in lowered else MUTED_TEXT
         else:
-            text = "Space toggles move type. R resets."
+            text = "Space toggles move type. U undoes. R resets."
             color = MUTED_TEXT
 
         footer = self.small_font.render(text, True, color)
         self.screen.blit(footer, footer.get_rect(center=(self.width // 2, footer_y)))
 
     def _control_row(self) -> tuple[int, int]:
-        total_width = 4 * BUTTON_WIDTH + 3 * BUTTON_GAP
+        total_width = 5 * BUTTON_WIDTH + 4 * BUTTON_GAP
         left = self.width - MARGIN - total_width
         return left, 30
 
-    def _drop_button_rect(self) -> pygame.Rect:
+    def _control_button_rect(self, index: int) -> pygame.Rect:
         left, top = self._control_row()
-        return pygame.Rect(left, top, BUTTON_WIDTH, BUTTON_HEIGHT)
+        return pygame.Rect(left + index * (BUTTON_WIDTH + BUTTON_GAP), top, BUTTON_WIDTH, BUTTON_HEIGHT)
+
+    def _drop_button_rect(self) -> pygame.Rect:
+        return self._control_button_rect(0)
 
     def _push_button_rect(self) -> pygame.Rect:
-        left, top = self._control_row()
-        return pygame.Rect(left + (BUTTON_WIDTH + BUTTON_GAP), top, BUTTON_WIDTH, BUTTON_HEIGHT)
+        return self._control_button_rect(1)
+
+    def _undo_button_rect(self) -> pygame.Rect:
+        return self._control_button_rect(2)
 
     def _reset_button_rect(self) -> pygame.Rect:
-        left, top = self._control_row()
-        return pygame.Rect(left + 2 * (BUTTON_WIDTH + BUTTON_GAP), top, BUTTON_WIDTH, BUTTON_HEIGHT)
+        return self._control_button_rect(3)
 
     def _menu_button_rect(self) -> pygame.Rect:
-        left, top = self._control_row()
-        return pygame.Rect(left + 3 * (BUTTON_WIDTH + BUTTON_GAP), top, BUTTON_WIDTH, BUTTON_HEIGHT)
+        return self._control_button_rect(4)
 
     def _setup_rects(self) -> dict[str, object]:
         center_x = self.width // 2

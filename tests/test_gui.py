@@ -69,7 +69,95 @@ def test_main_passes_initial_gui_config(monkeypatch) -> None:
     monkeypatch.setattr(gui, "HumanVsAgentGui", FakeGui)
 
     assert gui.main(["--human", "yellow", "--agent", "minimax", "--depth", "2", "--seed", "9"]) == 0
-    assert configs == [gui.GuiConfig(human=Player.YELLOW, agent_name="minimax", seed=9, depth=2)]
+    assert configs == [
+        gui.GuiConfig(human=Player.YELLOW, agent_name="minimax", seed=9, depth=2, enable_undo=True)
+    ]
+
+
+def test_undo_in_multiplayer_reverts_one_move(monkeypatch) -> None:
+    game = object.__new__(gui.HumanVsAgentGui)
+    game.mode = "game"
+    game.config = gui.GuiConfig(two_player=True, enable_undo=True)
+    game.state = GameState.new()
+    game._undo_stack = [game.state]
+    game._agent_busy = False
+    game._async_generation = 0
+    game.message = ""
+    game.llm_alert = None
+    game.llm_thinking_panel = gui.ScrollableTextPanel()
+    monkeypatch.setattr(game, "_invalidate_async_work", lambda: None)
+    monkeypatch.setattr(game, "_sync_agent_after_undo", lambda: None)
+
+    game._apply_human_move(Move(MoveType.DROP, 0))
+    assert game.state.move_count == 1
+    assert len(game._undo_stack) == 2
+
+    game._apply_human_move(Move(MoveType.DROP, 1))
+    assert game.state.move_count == 2
+
+    game._undo()
+    assert game.state.move_count == 1
+    assert game.state.board[5][0] is Player.RED
+    assert game.state.board[5][1] is None
+
+    game._undo()
+    assert game.state.move_count == 0
+    assert not game._can_undo()
+
+
+def test_undo_in_single_player_returns_before_last_human_move(monkeypatch) -> None:
+    game = object.__new__(gui.HumanVsAgentGui)
+    game.mode = "game"
+    game.config = gui.GuiConfig(human=Player.RED, agent_name="random", enable_undo=True)
+    game.state = GameState.new()
+    game._undo_stack = [game.state]
+    game._agent_busy = False
+    game._async_generation = 0
+    game.message = ""
+    game.llm_alert = None
+    game.llm_thinking_panel = gui.ScrollableTextPanel()
+    game.agent = object()
+
+    monkeypatch.setattr(game, "_schedule_agent_turn", lambda: None)
+    monkeypatch.setattr(game, "_invalidate_async_work", lambda: None)
+    monkeypatch.setattr(game, "_sync_agent_after_undo", lambda: None)
+
+    game._apply_human_move(Move(MoveType.DROP, 0))
+    assert game.state.move_count == 1
+    assert game.state.current_player is Player.YELLOW
+    assert game._can_undo()
+
+    game._undo()
+    assert game.state.move_count == 0
+    assert game.state.current_player is Player.RED
+
+    game.state = game.state.apply_move(Move(MoveType.DROP, 0))
+    game.state = game.state.apply_move(Move(MoveType.DROP, 1))
+    game._push_undo_point_if_needed()
+    assert game.state.move_count == 2
+    assert game.state.current_player is Player.RED
+
+    game._apply_human_move(Move(MoveType.DROP, 2))
+    assert game.state.move_count == 3
+    assert game._can_undo()
+
+    game._undo()
+    assert game.state.move_count == 2
+    assert game.state.current_player is Player.RED
+
+
+def test_apply_human_move_skips_undo_stack_when_disabled() -> None:
+    game = object.__new__(gui.HumanVsAgentGui)
+    game.mode = "game"
+    game.config = gui.GuiConfig(human=Player.RED, agent_name="random", two_player=True)
+    game.state = GameState.new()
+    game._undo_stack = None
+    game.message = ""
+
+    game._apply_human_move(Move(MoveType.DROP, 0))
+
+    assert game._undo_stack is None
+    assert game.state.move_count == 1
 
 
 def test_human_move_schedules_agent_turn(monkeypatch) -> None:

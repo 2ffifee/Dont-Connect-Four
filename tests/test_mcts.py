@@ -165,6 +165,27 @@ def test_search_evaluation_blunder_and_regret() -> None:
     assert evaluation.is_blunder(losing, threshold=0.3)
 
 
+def test_cache_only_choose_move_does_not_grow_tree() -> None:
+    player = MCTSPlayer(iterations=50, seed=3, simulation_mode="cache_only")
+    player.search(GameState.new())
+    before = player.tree_size
+
+    player.choose_move(GameState.new())
+
+    assert player.tree_size == before
+
+
+def test_evaluate_without_retain_tree_does_not_grow_persistent_tree() -> None:
+    state = GameState.new()
+    player = MCTSPlayer(iterations=50, seed=3)
+    before = player.tree_size
+
+    evaluation = player.evaluate(state, retain_tree=False)
+
+    assert player.tree_size == before
+    assert evaluation.best_move in state.legal_moves()
+
+
 def test_evaluate_rejects_state_without_moves() -> None:
     state = GameState(
         board=GameState.new().board,

@@ -183,15 +183,17 @@ GOAL (THIS IS INVERTED - READ TWICE):
   opponent into completing theirs.
 
 Fair-turn rule:
-- If the player who moved first completes a line, the second player gets exactly
-  one more move.
-- During that response move, and for the rest of the game after a tied
-  response, moves that would break any existing four-in-a-row segment already on
-  the board are illegal (push cannot be used to dismantle an existing line).
-- After that move: if line COUNTS are unequal, the game ends and the player with
-  fewer segments wins.
-- If that move leaves EQUAL line counts for both players, the game continues
-  with those existing segments locked in place.
+- If the first player completes one of THEIR OWN lines on their move, the
+  second player must make exactly one more move.
+- This rule does NOT apply if that same move also completes a line for the
+  opponent.
+- Completed segments are counted cumulatively: breaking a line on the board does
+  not reduce totals, and rebuilding the same segment later counts again.
+- After the response move: if cumulative line totals are unequal, the game ends
+  and the player with fewer segments wins.
+- If totals are equal, the game continues and the fair-turn rule can trigger
+  again the next time the first player completes their own line.
+- Lines may be broken at any time; only column-full restrictions apply.
 
 When it is your turn:
 - Choose exactly one move from the provided list of legal moves.

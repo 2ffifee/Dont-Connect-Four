@@ -8,13 +8,25 @@ optimized to:
 * check legality in O(1) instead of materializing ``legal_moves()``;
 * rebuild only the affected board cells (sharing the immutable row tuples that
   do not change);
-* detect a finishing line **incrementally** from the cells touched by the move
-  when the board had no lines before that move; once lines exist and are
-  protected, new lines may still appear without breaking locked segments;
-* count all lines (the expensive full scan) only when a terminal state is
-  actually reached, i.e. to build the :class:`GameResult`;
+* detect newly completed four-in-a-row segments incrementally by diffing the
+  board before and after the move;
 * construct the successor state without re-running ``__post_init__`` validation
   (the successor is guaranteed valid by construction).
+
+Line scoring
+------------
+Each distinct four-in-a-row segment counts as one line. A run of length ``n``
+(``n >= 4``) contributes ``n - 3`` segments. Completed segments are recorded
+cumulatively: destroying a line on the board does not reduce a player's total,
+and rebuilding the same segment at the same coordinates counts again.
+
+Fair-turn rule
+--------------
+If the first player completes one of their own lines on their move, the second
+player must make exactly one more move. That rule is skipped when the move also
+completes a line for the opponent. After the response move the cumulative line
+totals decide whether the game continues (equal) or ends (fewer lines wins).
+The rule resets after a continuation.
 """
 
 from __future__ import annotations
@@ -62,11 +74,7 @@ class GameResult:
     @classmethod
     def from_board(cls, board: Board) -> "GameResult":
         counts = _line_counts(board)
-        return cls(
-            winner=_winner_from_counts(counts),
-            red_lines=counts[Player.RED],
-            yellow_lines=counts[Player.YELLOW],
-        )
+        return cls.from_line_counts(counts)
 
     @classmethod
     def from_line_counts(cls, line_counts: dict[Player, int]) -> "GameResult":
@@ -113,8 +121,6 @@ def empty_board() -> Board:
     return tuple(tuple(None for _ in range(COLUMNS)) for _ in range(ROWS))
 
 
-# Pre-built, shareable move objects so the hot ``legal_moves`` path does not
-# allocate new ``Move`` instances on every call.
 _DROP_MOVES = tuple(Move(MoveType.DROP, column) for column in range(COLUMNS))
 _PUSH_MOVES = tuple(Move(MoveType.PUSH, column) for column in range(COLUMNS))
 
@@ -130,6 +136,8 @@ class GameState:
     status: GameStatus = GameStatus.ONGOING
     move_count: int = 0
     result: GameResult | None = None
+    red_line_total: int = 0
+    yellow_line_total: int = 0
     protected_segments: frozenset[LineSegment] = frozenset()
 
     @classmethod
@@ -143,30 +151,14 @@ class GameState:
     def legal_moves(self) -> tuple[Move, ...]:
         if self.status is GameStatus.FINISHED:
             return ()
-
-        candidates = self._moves_into_open_columns()
-        if not self.protected_segments:
-            return candidates
-        return tuple(
-            move
-            for move in candidates
-            if _move_preserves_segments(
-                self.board, move, self.protected_segments, self.current_player
-            )
-        )
+        return self._moves_into_open_columns()
 
     def is_legal_move(self, move: Move) -> bool:
         if self.status is GameStatus.FINISHED:
             return False
         if not 0 <= move.column < COLUMNS:
             return False
-        if self.board[0][move.column] is not None:
-            return False
-        if self.protected_segments and not _move_preserves_segments(
-            self.board, move, self.protected_segments, self.current_player
-        ):
-            return False
-        return True
+        return self.board[0][move.column] is None
 
     def _moves_into_open_columns(self) -> tuple[Move, ...]:
         top_row = self.board[0]
@@ -178,13 +170,17 @@ class GameState:
         return tuple(moves)
 
     def count_lines(self, player: Player) -> int:
+        """Count four-in-a-row segments currently visible on the board."""
         if not isinstance(player, Player):
             raise ValueError("player must be a Player")
-
         return _count_lines(self.board, player)
 
     def line_counts(self) -> dict[Player, int]:
-        return _line_counts(self.board)
+        """Return cumulative line totals (segments ever completed)."""
+        return {
+            Player.RED: self.red_line_total,
+            Player.YELLOW: self.yellow_line_total,
+        }
 
     def apply_move(self, move: Move) -> "GameState":
         if not self.is_legal_move(move):
@@ -192,17 +188,49 @@ class GameState:
                 f"illegal move: {move.move_type.value} in column {move.column}"
             )
 
+        old_board = self.board
         column = move.column
         mover = self.current_player
         if move.move_type is MoveType.DROP:
-            next_board, affected = _apply_drop(self.board, column, mover)
+            next_board, _ = _apply_drop(old_board, column, mover)
         elif move.move_type is MoveType.PUSH:
-            next_board, affected = _apply_push(self.board, column, mover)
+            next_board, _ = _apply_push(old_board, column, mover)
         else:
             raise IllegalMoveError(f"unsupported move type: {move.move_type}")
 
-        next_status, result, protected = self._status_and_result(next_board, mover, affected)
-        return self._successor(next_board, mover.opponent, next_status, result, protected)
+        formed_segments = _newly_formed_segments(old_board, next_board)
+        red_total = self.red_line_total
+        yellow_total = self.yellow_line_total
+        for segment in formed_segments:
+            owner = _segment_owner(next_board, segment)
+            if owner is Player.RED:
+                red_total += 1
+            else:
+                yellow_total += 1
+
+        own_formed = any(_segment_owner(next_board, segment) is mover for segment in formed_segments)
+        opponent_formed = any(
+            _segment_owner(next_board, segment) is mover.opponent for segment in formed_segments
+        )
+
+        next_status, result = self._status_and_result(
+            next_board,
+            mover,
+            red_total,
+            yellow_total,
+            own_formed=own_formed,
+            opponent_formed=opponent_formed,
+        )
+        display_segments = _all_line_segments(next_board)
+        return self._successor(
+            next_board,
+            mover.opponent,
+            next_status,
+            result,
+            red_total,
+            yellow_total,
+            display_segments,
+        )
 
     def __post_init__(self) -> None:
         if len(self.board) != ROWS:
@@ -218,6 +246,9 @@ class GameState:
 
         if self.move_count < 0:
             raise ValueError("move_count cannot be negative")
+
+        if self.red_line_total < 0 or self.yellow_line_total < 0:
+            raise ValueError("line totals cannot be negative")
 
         if not isinstance(self.current_player, Player):
             raise ValueError("current_player must be a Player")
@@ -237,29 +268,48 @@ class GameState:
         if self.status is not GameStatus.FINISHED and self.result is not None:
             raise ValueError("unfinished game cannot have a result")
 
+        if (
+            self.move_count == 0
+            and self.red_line_total == 0
+            and self.yellow_line_total == 0
+        ):
+            counts = _line_counts(self.board)
+            if counts[Player.RED] or counts[Player.YELLOW]:
+                object.__setattr__(self, "red_line_total", counts[Player.RED])
+                object.__setattr__(self, "yellow_line_total", counts[Player.YELLOW])
+
     def _status_and_result(
         self,
         board: Board,
         player_making_move: Player,
-        affected: tuple[tuple[int, int], ...],
-    ) -> tuple[GameStatus, GameResult | None, frozenset[LineSegment]]:
-        if self.status is GameStatus.FAIR_TURN:
-            counts = _line_counts(board)
-            if counts[Player.RED] == counts[Player.YELLOW]:
-                if _is_board_full(board):
-                    return GameStatus.FINISHED, GameResult.from_board(board), frozenset()
-                return GameStatus.ONGOING, None, _ongoing_protected(board, self.protected_segments)
-            return GameStatus.FINISHED, GameResult.from_board(board), frozenset()
+        red_total: int,
+        yellow_total: int,
+        *,
+        own_formed: bool,
+        opponent_formed: bool,
+    ) -> tuple[GameStatus, GameResult | None]:
+        totals = {Player.RED: red_total, Player.YELLOW: yellow_total}
 
-        has_any_line = _line_exists_through(board, affected)
-        if has_any_line and player_making_move is self.first_player:
-            return GameStatus.FAIR_TURN, None, _all_line_segments(board)
-        if has_any_line or _is_board_full(board):
-            result = GameResult.from_board(board)
-            if result.winner is None and not _is_board_full(board):
-                return GameStatus.ONGOING, None, _ongoing_protected(board, self.protected_segments)
-            return GameStatus.FINISHED, result, frozenset()
-        return GameStatus.ONGOING, None, _ongoing_protected(board, self.protected_segments)
+        if self.status is GameStatus.FAIR_TURN:
+            if red_total == yellow_total:
+                if _is_board_full(board):
+                    return GameStatus.FINISHED, GameResult.from_line_counts(totals)
+                return GameStatus.ONGOING, None
+            return GameStatus.FINISHED, GameResult.from_line_counts(totals)
+
+        if (
+            player_making_move is self.first_player
+            and own_formed
+            and not opponent_formed
+        ):
+            return GameStatus.FAIR_TURN, None
+
+        if own_formed or opponent_formed or _is_board_full(board):
+            if red_total == yellow_total and not _is_board_full(board):
+                return GameStatus.ONGOING, None
+            return GameStatus.FINISHED, GameResult.from_line_counts(totals)
+
+        return GameStatus.ONGOING, None
 
     def _successor(
         self,
@@ -267,10 +317,10 @@ class GameState:
         current_player: Player,
         status: GameStatus,
         result: GameResult | None,
+        red_line_total: int,
+        yellow_line_total: int,
         protected_segments: frozenset[LineSegment],
     ) -> "GameState":
-        # Build the successor without re-running ``__post_init__``: it is valid
-        # by construction and this avoids per-move validation overhead.
         successor = object.__new__(GameState)
         object.__setattr__(successor, "board", board)
         object.__setattr__(successor, "current_player", current_player)
@@ -278,6 +328,8 @@ class GameState:
         object.__setattr__(successor, "status", status)
         object.__setattr__(successor, "move_count", self.move_count + 1)
         object.__setattr__(successor, "result", result)
+        object.__setattr__(successor, "red_line_total", red_line_total)
+        object.__setattr__(successor, "yellow_line_total", yellow_line_total)
         object.__setattr__(successor, "protected_segments", protected_segments)
         return successor
 
@@ -299,8 +351,6 @@ def _apply_drop(board: Board, column: int, mover: Player) -> tuple[Board, tuple[
 
 
 def _apply_push(board: Board, column: int, mover: Player) -> tuple[Board, tuple[tuple[int, int], ...]]:
-    # A push inserts a token at the bottom of the column, shifting the existing
-    # tokens in that column up by one. Only ``column`` changes in each row.
     new_rows = []
     for row_index in range(ROWS):
         value = mover if row_index == ROWS - 1 else board[row_index + 1][column]
@@ -309,38 +359,6 @@ def _apply_push(board: Board, column: int, mover: Player) -> tuple[Board, tuple[
 
     affected = tuple((row_index, column) for row_index in range(ROWS))
     return tuple(new_rows), affected
-
-
-def _line_exists_through(board: Board, cells: tuple[tuple[int, int], ...]) -> bool:
-    """Return whether any four-in-a-row passes through one of ``cells``.
-
-    Uses a run-length count in both directions from each affected cell, so it is
-    independent of which player owns the cell.
-    """
-    for row, column in cells:
-        cell = board[row][column]
-        if cell is None:
-            continue
-
-        for row_step, column_step in _DIRECTIONS:
-            count = 1
-
-            r, c = row + row_step, column + column_step
-            while 0 <= r < ROWS and 0 <= c < COLUMNS and board[r][c] is cell:
-                count += 1
-                r += row_step
-                c += column_step
-
-            r, c = row - row_step, column - column_step
-            while 0 <= r < ROWS and 0 <= c < COLUMNS and board[r][c] is cell:
-                count += 1
-                r -= row_step
-                c -= column_step
-
-            if count >= 4:
-                return True
-
-    return False
 
 
 def _is_board_full(board: Board) -> bool:
@@ -380,37 +398,15 @@ def _all_line_segments(board: Board) -> frozenset[LineSegment]:
     return frozenset(segments)
 
 
-def _segments_preserved(board: Board, segments: frozenset[LineSegment]) -> bool:
-    for segment in segments:
-        player = board[segment[0][0]][segment[0][1]]
-        if player is None:
-            return False
-        for row, column in segment:
-            if board[row][column] is not player:
-                return False
-    return True
+def _newly_formed_segments(old_board: Board, new_board: Board) -> frozenset[LineSegment]:
+    return _all_line_segments(new_board) - _all_line_segments(old_board)
 
 
-def _move_preserves_segments(
-    board: Board,
-    move: Move,
-    segments: frozenset[LineSegment],
-    mover: Player,
-) -> bool:
-    if not segments:
-        return True
-    if move.move_type is MoveType.DROP:
-        next_board, _ = _apply_drop(board, move.column, mover)
-    else:
-        next_board, _ = _apply_push(board, move.column, mover)
-    return _segments_preserved(next_board, segments)
-
-
-def _ongoing_protected(board: Board, previous: frozenset[LineSegment]) -> frozenset[LineSegment]:
-    segments = _all_line_segments(board)
-    if segments:
-        return segments
-    return previous
+def _segment_owner(board: Board, segment: LineSegment) -> Player:
+    player = board[segment[0][0]][segment[0][1]]
+    if player is None:
+        raise ValueError("line segment must belong to a player")
+    return player
 
 
 def _winner_from_counts(counts: dict[Player, int]) -> Player | None:

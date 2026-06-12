@@ -4,15 +4,17 @@ import json
 import pytest
 
 import scripts.score_blunders as score_blunders
-from connect4_mcts.game import Move, MoveType, Player
-from connect4_mcts.players.mcts import SearchEvaluation
+from connect4_mcts.game import GameState, Move, MoveType, Player
+from connect4_mcts.players.mcts import MCTSPlayer, SearchEvaluation
+from connect4_mcts.training import freeze_player_for_inference
 
 
 class FakeOracle:
     def __init__(self) -> None:
         self.calls = 0
+        self.simulation_mode = "cache_only"
 
-    def evaluate(self, state, run_search: bool = True) -> SearchEvaluation:
+    def evaluate(self, state, run_search: bool = True, *, retain_tree: bool = True) -> SearchEvaluation:
         self.calls += 1
         assert run_search is False
         best = Move(MoveType.DROP, 0)
@@ -28,7 +30,11 @@ class FakeOracle:
 
 def test_score_blunders_writes_move_and_summary_outputs(monkeypatch, tmp_path) -> None:
     oracle = FakeOracle()
-    monkeypatch.setattr(score_blunders, "load_player", lambda path: oracle)
+    monkeypatch.setattr(
+        score_blunders,
+        "load_player",
+        lambda path, inference_only=False: oracle,
+    )
     input_dir = tmp_path / "tournament"
     input_dir.mkdir()
     moves_path = input_dir / "moves.jsonl"
@@ -40,7 +46,6 @@ def test_score_blunders_writes_move_and_summary_outputs(monkeypatch, tmp_path) -
             "fake-oracle.pkl",
             "--input-dir",
             str(input_dir),
-            "--cache-only",
             "--threshold",
             "0.3",
         ]
@@ -69,6 +74,17 @@ def test_score_blunders_writes_move_and_summary_outputs(monkeypatch, tmp_path) -
     assert by_agent["uct"]["blunders"] == "0"
     assert by_agent["llm"]["blunders"] == "1"
     assert float(by_agent["llm"]["blunder_rate"]) == pytest.approx(1.0)
+
+
+def test_cache_only_player_does_not_grow_tree_on_choose_move() -> None:
+    player = MCTSPlayer(iterations=50, seed=1)
+    player.search(GameState.new())
+    before = player.tree_size
+
+    freeze_player_for_inference(player)
+    player.choose_move(GameState.new())
+
+    assert player.tree_size == before
 
 
 def test_state_from_payload_restores_game_state() -> None:

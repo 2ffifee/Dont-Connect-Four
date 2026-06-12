@@ -278,13 +278,29 @@ def train_lgr(
     )
 
 
+def freeze_player_for_inference(player: Agent) -> Agent:
+    """Use a trained MCTS player as a frozen lookup table without new simulations."""
+    simulation_mode = getattr(player, "simulation_mode", None)
+    if simulation_mode is not None:
+        player.simulation_mode = "cache_only"
+    return player
+
+
 def save_player(player: Agent, path: str | os.PathLike[str]) -> None:
     """Persist a trained player (tree and learned memory included) to ``path``."""
     with open(os.fspath(path), "wb") as file:
         pickle.dump(player, file, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def load_player(path: str | os.PathLike[str]) -> Any:
-    """Load a player previously stored with :func:`save_player`."""
+def load_player(path: str | os.PathLike[str], *, inference_only: bool = False) -> Any:
+    """Load a player previously stored with :func:`save_player`.
+
+    With ``inference_only=True`` MCTS players are switched to ``cache_only``
+    mode so tournament play and oracle scoring read the saved tree without
+    running new simulations.
+    """
     with open(os.fspath(path), "rb") as file:
-        return pickle.load(file)
+        player = pickle.load(file)
+    if inference_only:
+        freeze_player_for_inference(player)
+    return player

@@ -93,7 +93,7 @@ def _load_entries(config: dict[str, Any], llm_config: dict[str, Any] | None) -> 
             path = os.path.join(output_dir, f"{player_id}.pkl")
             if not os.path.exists(path):
                 raise FileNotFoundError(f"missing trained player pickle: {path}")
-            agent = load_player(path)
+            agent = load_player(path, inference_only=True)
             est_ram = estimate_tree_ram_gb(agent.tree_size, bytes_per_node=bytes_per_node)
             del agent
 
@@ -123,7 +123,7 @@ def _instantiate_agent(
             raise ValueError(f"unknown builtin agent: {builtin}")
     elif entry.kind == "mcts":
         output_dir = str(defaults.get("output_dir", "models/tournament"))
-        agent = load_player(os.path.join(output_dir, f"{entry.player_id}.pkl"))
+        agent = load_player(os.path.join(output_dir, f"{entry.player_id}.pkl"), inference_only=True)
     elif entry.kind == "llm":
         model_entry = entry.entry
         base_url = str(model_entry.get("base_url", "") or "") or None
@@ -336,6 +336,8 @@ def _serialize_state(state: GameState) -> dict[str, Any]:
         "first_player": state.first_player.value,
         "status": state.status.value,
         "move_count": state.move_count,
+        "red_line_total": state.red_line_total,
+        "yellow_line_total": state.yellow_line_total,
         "protected_segments": [
             [[row, column] for row, column in segment]
             for segment in sorted(state.protected_segments)

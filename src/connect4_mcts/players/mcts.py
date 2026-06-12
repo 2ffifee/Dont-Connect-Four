@@ -35,6 +35,7 @@ LOSS_REWARD = 0.0
 
 RolloutPolicy = str  # "random" | "lgr"
 FinalMoveRule = str  # "robust" | "max_value"
+SimulationMode = str  # "search" | "cache_only"
 
 
 @dataclass(slots=True)
@@ -152,6 +153,10 @@ class MCTSPlayer:
     tree:
         Persistent transposition table mapping game states to their statistics.
         This is the grown search tree and is preserved on save/load.
+    simulation_mode:
+        ``"search"`` runs MCTS simulations on each call. ``"cache_only"`` treats
+        the player as a frozen decision table: moves and evaluations are read
+        only from the saved tree without new rollouts.
     """
 
     iterations: int = 200
@@ -163,6 +168,7 @@ class MCTSPlayer:
     final_move: FinalMoveRule = "robust"
     max_rollout_moves: int | None = None
     seed: int | None = None
+    simulation_mode: SimulationMode = "search"
     tree: dict[GameState, _Node] = field(default_factory=dict)
     _rng: random.Random = field(init=False, repr=False, compare=False)
 
@@ -177,6 +183,8 @@ class MCTSPlayer:
             raise ValueError("rollout_policy must be 'random' or 'lgr'")
         if self.final_move not in {"robust", "max_value"}:
             raise ValueError("final_move must be 'robust' or 'max_value'")
+        if self.simulation_mode not in {"search", "cache_only"}:
+            raise ValueError("simulation_mode must be 'search' or 'cache_only'")
         if self.max_rollout_moves is not None and self.max_rollout_moves < 1:
             raise ValueError("max_rollout_moves must be at least 1 when set")
         if self.rollout_policy == "lgr" and self.lgr_memory is None:
@@ -188,19 +196,24 @@ class MCTSPlayer:
         """Number of states currently stored in the persistent tree."""
         return len(self.tree)
 
+    @property
+    def uses_cache_only(self) -> bool:
+        return self.simulation_mode == "cache_only"
+
     def choose_move(self, state: GameState) -> Move:
-        """Grow the tree from ``state`` and return the greedy best move."""
+        """Return the greedy best move, optionally growing the tree first."""
         legal_moves = state.legal_moves()
         if not legal_moves:
             raise MoveSelectionError("cannot choose a move when no legal moves are available")
         if len(legal_moves) == 1:
             return legal_moves[0]
 
-        self.search(state)
+        if not self.uses_cache_only:
+            self.search(state)
         return self._best_move(state)
 
     def sample_move(self, state: GameState, temperature: float = 1.0) -> Move:
-        """Grow the tree from ``state`` and sample a move (used in self-play).
+        """Sample a move, optionally growing the tree first (used in self-play).
 
         Moves are sampled proportionally to ``visits ** (1 / temperature)`` so
         that training games explore many lines instead of always following the
@@ -213,12 +226,19 @@ class MCTSPlayer:
         if len(legal_moves) == 1:
             return legal_moves[0]
 
-        self.search(state)
+        if not self.uses_cache_only:
+            self.search(state)
         if temperature <= 0:
             return self._best_move(state)
         return self._sample_move(state, temperature)
 
-    def evaluate(self, root_state: GameState, run_search: bool = True) -> SearchEvaluation:
+    def evaluate(
+        self,
+        root_state: GameState,
+        run_search: bool = True,
+        *,
+        retain_tree: bool = True,
+    ) -> SearchEvaluation:
         """Search ``root_state`` and report the root value and per-move values.
 
         Intended for use as a reference/oracle engine (e.g. for the Blunder Rate
@@ -229,15 +249,31 @@ class MCTSPlayer:
         With ``run_search=False`` no new iterations are run and only the
         statistics already cached in the tree are reported, which is useful for
         reusing a pre-built oracle tree.
+
+        With ``retain_tree=False`` the search budget is spent in a temporary
+        tree that is discarded afterwards. This prevents scoring thousands of
+        foreign tournament positions from growing an already large oracle tree
+        in memory.
         """
         legal_moves = root_state.legal_moves()
         if not legal_moves:
             raise MoveSelectionError("cannot evaluate a state with no legal moves")
 
-        if run_search:
-            self.search(root_state)
-        root = self._node(root_state)
+        if self.uses_cache_only:
+            return self._evaluation_from_tree(root_state, legal_moves)
 
+        if run_search:
+            if retain_tree:
+                self.search(root_state)
+                return self._evaluation_from_tree(root_state, legal_moves)
+            ephemeral = self._ephemeral_player()
+            ephemeral.search(root_state)
+            return ephemeral._evaluation_from_tree(root_state, legal_moves)
+
+        return self._evaluation_from_tree(root_state, legal_moves)
+
+    def _evaluation_from_tree(self, root_state: GameState, legal_moves: list[Move]) -> SearchEvaluation:
+        root = self._node(root_state)
         move_values: dict[Move, float] = {}
         move_visits: dict[Move, int] = {}
         for move, child_state in root.children.items():
@@ -247,8 +283,6 @@ class MCTSPlayer:
                 move_visits[move] = child.visits
 
         if not move_values:
-            # No move was simulated (e.g. iterations exhausted on a single
-            # forced branch); fall back to a neutral, uninformative estimate.
             fallback = legal_moves[0]
             return SearchEvaluation(
                 player_to_move=root_state.current_player,
@@ -265,6 +299,21 @@ class MCTSPlayer:
             best_move=best_move,
             move_values=move_values,
             move_visits=move_visits,
+        )
+
+    def _ephemeral_player(self) -> MCTSPlayer:
+        """Return a throwaway player with the same hyperparameters but no tree."""
+        return MCTSPlayer(
+            iterations=self.iterations,
+            exploration=self.exploration,
+            fpu=self.fpu,
+            power_mean_p=self.power_mean_p,
+            rollout_policy=self.rollout_policy,
+            lgr_memory=self.lgr_memory,
+            final_move=self.final_move,
+            max_rollout_moves=self.max_rollout_moves,
+            seed=self.seed,
+            tree={},
         )
 
     def search(self, root_state: GameState) -> None:
