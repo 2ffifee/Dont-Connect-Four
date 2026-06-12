@@ -80,3 +80,106 @@ builtin = "random"
     metadata = json.loads((output_dir / "run_metadata.json").read_text(encoding="utf-8"))
     assert metadata["players"] == ["random-a", "random-b"]
     assert metadata["games_per_pair"] == 1
+
+    checkpoint = json.loads((output_dir / "tournament_checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "complete"
+    assert checkpoint["completed_pairs"] == 1
+
+
+def test_run_tournament_resume_continues_from_checkpoint(tmp_path) -> None:
+    config_path = tmp_path / "tiny_tournament.toml"
+    output_dir = tmp_path / "results"
+    config_path.write_text(
+        """
+[defaults]
+output_dir = "unused"
+bytes_per_node = 2867.0
+
+[[players]]
+id = "random-a"
+kind = "builtin"
+builtin = "random"
+
+[[players]]
+id = "random-b"
+kind = "builtin"
+builtin = "random"
+
+[[players]]
+id = "random-c"
+kind = "builtin"
+builtin = "random"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = run_tournament.main(
+        [
+            "--config",
+            str(config_path),
+            "--games-per-pair",
+            "1",
+            "--base-seed",
+            "11",
+            "--no-llm",
+            "--output-dir",
+            str(output_dir),
+            "--max-moves",
+            "200",
+        ]
+    )
+    assert result == 0
+
+    with (output_dir / "games.csv").open(newline="", encoding="utf-8") as file:
+        full_games = list(csv.DictReader(file))
+    assert len(full_games) == 3
+
+    checkpoint = json.loads((output_dir / "tournament_checkpoint.json").read_text(encoding="utf-8"))
+    checkpoint["status"] = "in_progress"
+    checkpoint["completed_pairs"] = 1
+    (output_dir / "tournament_checkpoint.json").write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
+
+    first_pair_id = full_games[0]["pair_id"]
+    partial_games = [row for row in full_games if row["pair_id"] == first_pair_id]
+    partial_pairs = [row for row in csv.DictReader((output_dir / "pair_summary.csv").open(encoding="utf-8")) if row["pair_id"] == first_pair_id]
+    partial_moves = []
+    with (output_dir / "moves.jsonl").open(encoding="utf-8") as file:
+        for line in file:
+            row = json.loads(line)
+            if row["pair_id"] == first_pair_id:
+                partial_moves.append(row)
+
+    with (output_dir / "games.csv").open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=partial_games[0].keys())
+        writer.writeheader()
+        writer.writerows(partial_games)
+    with (output_dir / "pair_summary.csv").open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=partial_pairs[0].keys())
+        writer.writeheader()
+        writer.writerows(partial_pairs)
+    with (output_dir / "moves.jsonl").open("w", encoding="utf-8") as file:
+        for row in partial_moves:
+            file.write(json.dumps(row) + "\n")
+
+    result = run_tournament.main(
+        [
+            "--config",
+            str(config_path),
+            "--games-per-pair",
+            "1",
+            "--base-seed",
+            "11",
+            "--no-llm",
+            "--output-dir",
+            str(output_dir),
+            "--max-moves",
+            "200",
+            "--resume",
+        ]
+    )
+    assert result == 0
+
+    with (output_dir / "games.csv").open(newline="", encoding="utf-8") as file:
+        resumed_games = list(csv.DictReader(file))
+    assert len(resumed_games) == 3
+    assert (output_dir / "tournament_checkpoint.json").read_text(encoding="utf-8").count('"status": "complete"') == 1

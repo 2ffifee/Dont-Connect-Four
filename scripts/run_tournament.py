@@ -44,6 +44,17 @@ from connect4_mcts.players.minimax import MinimaxPlayer
 from connect4_mcts.players.random import RandomPlayer
 from connect4_mcts.runner import GameRunnerError, prepare_agents_for_game
 from connect4_mcts.tournament_config import load_llm_tournament_entries
+from connect4_mcts.tournament_progress import (
+    build_checkpoint_payload,
+    can_resume_tournament,
+    flush_tournament_progress,
+    load_checkpoint,
+    load_saved_tournament_rows,
+    tournament_is_complete,
+    validate_checkpoint,
+    write_csv as _progress_write_csv,
+    write_json as _progress_write_json,
+)
 from connect4_mcts.tournament_reporting import (
     TournamentFailureContext,
     format_failure_banner,
@@ -445,6 +456,65 @@ def _pair_summary_row(left: str, right: str, games: tuple[SimulatedGame, ...], g
     }
 
 
+def _standings_rows_from_metrics(
+    game_rows: Sequence[dict[str, Any]],
+    player_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    wins = {player_id: 0 for player_id in player_ids}
+    move_counts = {player_id: 0 for player_id in player_ids}
+    decision_time_seconds = {player_id: 0.0 for player_id in player_ids}
+
+    for row in game_rows:
+        winner = str(row.get("winner_agent", "") or "")
+        if winner:
+            if winner in wins:
+                wins[winner] += 1
+
+        red_agent = str(row["red_agent"])
+        yellow_agent = str(row["yellow_agent"])
+        red_decisions = int(row.get("red_decisions", 0) or 0)
+        yellow_decisions = int(row.get("yellow_decisions", 0) or 0)
+        if red_agent in move_counts:
+            move_counts[red_agent] += red_decisions
+            decision_time_seconds[red_agent] += float(row.get("red_total_decision_seconds", 0.0) or 0.0)
+        if yellow_agent in move_counts:
+            move_counts[yellow_agent] += yellow_decisions
+            decision_time_seconds[yellow_agent] += float(row.get("yellow_total_decision_seconds", 0.0) or 0.0)
+
+    rows: list[dict[str, Any]] = []
+    for player_id in player_ids:
+        player_games = [
+            row
+            for row in game_rows
+            if row["red_agent"] == player_id or row["yellow_agent"] == player_id
+        ]
+        draws = sum(1 for row in player_games if not str(row.get("winner_agent", "") or ""))
+        total = len(player_games)
+        player_wins = wins.get(player_id, 0)
+        losses = total - player_wins - draws
+        moves = move_counts.get(player_id, 0)
+        avg_decision = decision_time_seconds.get(player_id, 0.0) / moves if moves else 0.0
+        rows.append(
+            {
+                "player_id": player_id,
+                "games": total,
+                "wins": player_wins,
+                "losses": losses,
+                "draws": draws,
+                "win_rate": player_wins / total if total else 0.0,
+                "loss_rate": losses / total if total else 0.0,
+                "draw_rate": draws / total if total else 0.0,
+                "moves": moves,
+                "avg_decision_seconds": avg_decision,
+            }
+        )
+
+    rows.sort(key=lambda row: (row["wins"], row["draws"], -row["avg_decision_seconds"]), reverse=True)
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return rows
+
+
 def _standings_rows(games: tuple[SimulatedGame, ...], player_ids: Sequence[str]) -> list[dict[str, Any]]:
     overall = summarize_games(games, agent_names=tuple(player_ids))
     rows: list[dict[str, Any]] = []
@@ -521,6 +591,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Print one line before each individual game (useful when diagnosing hangs or crashes).",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from tournament_checkpoint.json and saved metric files in --output-dir.",
+    )
     args = parser.parse_args(argv)
 
     if args.games_per_pair < 1:
@@ -555,18 +630,60 @@ def main(argv: Sequence[str] | None = None) -> int:
     if max_ram > 0:
         print(f"Largest MCTS tree: est. RAM ~{max_ram:.2f} GB (two agents loaded per game).")
 
-    all_games: list[SimulatedGame] = []
+    llm_config_path = None if llm_config is None else args.llm_config
+    total_pairs = len(entries) * (len(entries) - 1) // 2
+    pair_ids: list[str] = []
+    for i, left in enumerate(entries):
+        for j in range(i + 1, len(entries)):
+            pair_ids.append(f"{left.player_id}_vs_{entries[j].player_id}")
+
+    if args.resume and tournament_is_complete(args.output_dir):
+        print(f"Tournament already complete in {args.output_dir}; nothing to do.")
+        return 0
+
     all_game_rows: list[dict[str, Any]] = []
     all_move_rows: list[dict[str, Any]] = []
     pair_summaries: list[dict[str, Any]] = []
+    start_pair_index = 0
 
-    total_pairs = len(entries) * (len(entries) - 1) // 2
+    if args.resume and can_resume_tournament(args.output_dir):
+        checkpoint = load_checkpoint(args.output_dir)
+        if checkpoint is None:
+            raise SystemExit("resume requested but tournament_checkpoint.json is missing")
+        try:
+            validate_checkpoint(
+                checkpoint,
+                config_path=args.config,
+                base_seed=args.base_seed,
+                games_per_pair=args.games_per_pair,
+                player_ids=player_ids,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"cannot resume tournament: {exc}") from exc
+        saved_games, saved_moves, saved_pairs = load_saved_tournament_rows(args.output_dir)
+        all_game_rows = [dict(row) for row in saved_games]
+        all_move_rows = saved_moves
+        pair_summaries = [dict(row) for row in saved_pairs]
+        start_pair_index = int(checkpoint.get("completed_pairs", 0))
+        print(
+            f"Resuming tournament from pair {start_pair_index + 1}/{total_pairs} "
+            f"({len(all_game_rows)} games saved).",
+            flush=True,
+        )
+    elif args.resume:
+        print("No in-progress tournament checkpoint found; starting from scratch.", flush=True)
+
+    os.makedirs(args.output_dir, exist_ok=True)
     pair_index = 0
     try:
         for i, left in enumerate(entries):
             for j in range(i + 1, len(entries)):
                 right = entries[j]
                 pair_id = f"{left.player_id}_vs_{right.player_id}"
+                if pair_index < start_pair_index:
+                    pair_index += 1
+                    continue
+
                 print(
                     f"\nPair {pair_index + 1}/{total_pairs}: {left.player_id} vs {right.player_id}",
                     flush=True,
@@ -646,7 +763,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     all_move_rows.extend(move_rows)
                     pair_games.append(game)
-                    all_games.append(game)
                 pair_cache.clear()
 
                 pair_summary = _pair_summary_row(
@@ -663,15 +779,51 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flush=True,
                 )
                 pair_index += 1
+                flush_tournament_progress(
+                    args.output_dir,
+                    game_rows=all_game_rows,
+                    move_rows=all_move_rows,
+                    pair_summaries=pair_summaries,
+                    checkpoint=build_checkpoint_payload(
+                        config_path=args.config,
+                        llm_config_path=llm_config_path,
+                        base_seed=args.base_seed,
+                        games_per_pair=args.games_per_pair,
+                        player_ids=player_ids,
+                        completed_pairs=pair_index,
+                        total_pairs=total_pairs,
+                        pair_ids=pair_ids,
+                        status="in_progress",
+                    ),
+                )
     except Exception:
         print(
             f"\nTournament aborted after completing {pair_index}/{total_pairs} pairings.",
             file=sys.stderr,
             flush=True,
         )
+        if pair_index > start_pair_index:
+            flush_tournament_progress(
+                args.output_dir,
+                game_rows=all_game_rows,
+                move_rows=all_move_rows,
+                pair_summaries=pair_summaries,
+                checkpoint=build_checkpoint_payload(
+                    config_path=args.config,
+                    llm_config_path=llm_config_path,
+                    base_seed=args.base_seed,
+                    games_per_pair=args.games_per_pair,
+                    player_ids=player_ids,
+                    completed_pairs=pair_index,
+                    total_pairs=total_pairs,
+                    pair_ids=pair_ids,
+                    status="in_progress",
+                ),
+            )
+            print(f"Progress saved to {args.output_dir} (resume with --resume).", file=sys.stderr, flush=True)
         raise
 
-    standings = _standings_rows(tuple(all_games), player_ids)
+    standings = _standings_rows_from_metrics(all_game_rows, player_ids)
 
     print("\nStandings (wins across all pairings):")
     for row in standings:
@@ -692,11 +844,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             "standings": "standings.csv",
         },
     }
-    _write_csv(os.path.join(args.output_dir, "games.csv"), all_game_rows)
+    _progress_write_csv(os.path.join(args.output_dir, "games.csv"), all_game_rows)
     _write_jsonl(os.path.join(args.output_dir, "moves.jsonl"), all_move_rows)
-    _write_csv(os.path.join(args.output_dir, "pair_summary.csv"), pair_summaries)
-    _write_csv(os.path.join(args.output_dir, "standings.csv"), standings)
-    _write_json(os.path.join(args.output_dir, "run_metadata.json"), metadata)
+    _progress_write_csv(os.path.join(args.output_dir, "pair_summary.csv"), pair_summaries)
+    _progress_write_csv(os.path.join(args.output_dir, "standings.csv"), standings)
+    _progress_write_json(os.path.join(args.output_dir, "run_metadata.json"), metadata)
+    flush_tournament_progress(
+        args.output_dir,
+        game_rows=all_game_rows,
+        move_rows=all_move_rows,
+        pair_summaries=pair_summaries,
+        checkpoint=build_checkpoint_payload(
+            config_path=args.config,
+            llm_config_path=llm_config_path,
+            base_seed=args.base_seed,
+            games_per_pair=args.games_per_pair,
+            player_ids=player_ids,
+            completed_pairs=pair_index,
+            total_pairs=total_pairs,
+            pair_ids=pair_ids,
+            status="complete",
+        ),
+    )
     print(f"\nSaved tournament metrics to {args.output_dir}")
 
     legacy_payload = {

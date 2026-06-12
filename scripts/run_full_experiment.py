@@ -25,9 +25,20 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from connect4_mcts.experiment_pipeline import (
+    load_pipeline_state,
+    mark_stage_complete,
+    parse_skip_stages,
+    stages_to_skip,
+)
+from connect4_mcts.tournament_progress import can_resume_tournament
+
 
 @dataclass(frozen=True, slots=True)
 class Step:
+    stage_id: str | None
     label: str
     command: list[str] | None = None
     action: Callable[[], None] | None = None
@@ -60,11 +71,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Pass --verbose-games to run_tournament.py (log every game before it starts).",
     )
+    parser.add_argument(
+        "--skip-stage",
+        "--skip-etap",
+        action="append",
+        dest="skip_stage",
+        default=[],
+        metavar="STAGE",
+        help=(
+            "Skip a pipeline stage (repeatable, comma-separated). "
+            "Stages: train-oracle, prepare-tournament-oracle, train-tournament-players, "
+            "run-tournament, analyze-tournament, score-blunders. "
+            "Aliases: oracle, prepare-oracle, players, tournament, analyze, blunders."
+        ),
+    )
+    parser.add_argument(
+        "--resume-pipeline",
+        action="store_true",
+        help="Skip stages already marked complete in output-dir/experiment_pipeline.json.",
+    )
     args = parser.parse_args(argv)
 
     oracle_config = _project_path(args.oracle_config)
     tournament_config = _project_path(args.config)
     output_dir = _project_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     llm_config = _project_path(args.llm_config)
     oracle_path = _oracle_output_path(oracle_config)
     tournament_defaults, tournament_players = _tournament_config(tournament_config)
@@ -75,28 +106,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     if threshold is None:
         threshold = _oracle_blunder_threshold(oracle_config)
 
+    try:
+        explicit_skip = parse_skip_stages(args.skip_stage)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    pipeline_state = load_pipeline_state(output_dir)
+    skip_stages = stages_to_skip(
+        explicit_skip=explicit_skip,
+        resume_pipeline=args.resume_pipeline,
+        state=pipeline_state,
+    )
+    if args.skip_training:
+        skip_stages.update({"train-oracle", "train-tournament-players"})
+    if args.skip_oracle_training:
+        skip_stages.add("train-oracle")
+    if args.skip_player_training:
+        skip_stages.add("train-tournament-players")
+    if args.skip_blunders:
+        skip_stages.add("score-blunders")
+
     steps: list[Step] = []
-    skip_oracle_training = args.skip_training or args.skip_oracle_training
-    skip_player_training = args.skip_training or args.skip_player_training
+    skip_oracle_training = "train-oracle" in skip_stages
+    skip_player_training = "train-tournament-players" in skip_stages
 
     if not skip_oracle_training:
         command = [args.python, "scripts/train_oracle.py", "--config", str(oracle_config)]
         if args.resume_training:
             command.append("--resume")
-        steps.append(Step("train oracle", command=command))
+        steps.append(Step("train-oracle", "train oracle", command=command))
+    else:
+        print("Skipping stage: train-oracle")
 
     if tournament_oracle is not None:
         play_iterations = int(_player_get(tournament_oracle, tournament_defaults, "play_iterations", 1000))
-        steps.append(
-            Step(
-                "prepare tournament oracle",
-                action=lambda: _prepare_tournament_oracle(oracle_path, tournament_oracle_path, play_iterations),
-                dry_run_text=(
-                    f"<internal> copy {_display_path(oracle_path)} -> "
-                    f"{_display_path(tournament_oracle_path)} with iterations={play_iterations}"
-                ),
+        if "prepare-tournament-oracle" in skip_stages:
+            print("Skipping stage: prepare-tournament-oracle")
+        else:
+            steps.append(
+                Step(
+                    "prepare-tournament-oracle",
+                    "prepare tournament oracle",
+                    action=lambda: _prepare_tournament_oracle(oracle_path, tournament_oracle_path, play_iterations),
+                    dry_run_text=(
+                        f"<internal> copy {_display_path(oracle_path)} -> "
+                        f"{_display_path(tournament_oracle_path)} with iterations={play_iterations}"
+                    ),
+                )
             )
-        )
 
     if not skip_player_training:
         command = [args.python, "scripts/train_tournament_grid.py", "--config", str(tournament_config)]
@@ -110,35 +167,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.resume_training:
             command.append("--resume")
         if train_ids:
-            steps.append(Step("train tournament players", command=command))
-
-    tournament_command = [
-        args.python,
-        "scripts/run_tournament.py",
-        "--config",
-        str(tournament_config),
-        "--games-per-pair",
-        str(args.games_per_pair),
-        "--base-seed",
-        str(args.base_seed),
-        "--output-dir",
-        str(output_dir),
-    ]
-    if args.max_moves > 0:
-        tournament_command.extend(["--max-moves", str(args.max_moves)])
-    if args.verbose_games:
-        tournament_command.append("--verbose-games")
-    if args.with_llm:
-        tournament_command.extend(["--llm-config", str(llm_config)])
+            steps.append(Step("train-tournament-players", "train tournament players", command=command))
     else:
-        tournament_command.append("--no-llm")
-    steps.append(Step("run tournament", command=tournament_command))
+        print("Skipping stage: train-tournament-players")
 
-    steps.append(
-        Step("analyze tournament", command=[args.python, "scripts/analyze_tournament.py", "--input-dir", str(output_dir)])
-    )
+    if "run-tournament" in skip_stages:
+        print("Skipping stage: run-tournament")
+    else:
+        tournament_command = [
+            args.python,
+            "scripts/run_tournament.py",
+            "--config",
+            str(tournament_config),
+            "--games-per-pair",
+            str(args.games_per_pair),
+            "--base-seed",
+            str(args.base_seed),
+            "--output-dir",
+            str(output_dir),
+        ]
+        if args.max_moves > 0:
+            tournament_command.extend(["--max-moves", str(args.max_moves)])
+        if args.verbose_games:
+            tournament_command.append("--verbose-games")
+        if args.with_llm:
+            tournament_command.extend(["--llm-config", str(llm_config)])
+        else:
+            tournament_command.append("--no-llm")
+        if args.resume_pipeline and can_resume_tournament(output_dir):
+            tournament_command.append("--resume")
+        steps.append(Step("run-tournament", "run tournament", command=tournament_command))
 
-    if not args.skip_blunders:
+    if "analyze-tournament" in skip_stages:
+        print("Skipping stage: analyze-tournament")
+    else:
+        steps.append(
+            Step(
+                "analyze-tournament",
+                "analyze tournament",
+                command=[args.python, "scripts/analyze_tournament.py", "--input-dir", str(output_dir)],
+            )
+        )
+
+    if "score-blunders" in skip_stages:
+        print("Skipping stage: score-blunders")
+    else:
         blunder_command = [
             args.python,
             "scripts/score_blunders.py",
@@ -155,7 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         if args.blunder_max_positions > 0:
             blunder_command.extend(["--max-positions", str(args.blunder_max_positions)])
-        steps.append(Step("score blunders", command=blunder_command))
+        steps.append(Step("score-blunders", "score blunders", command=blunder_command))
 
     print("Full experiment pipeline:")
     print(f"  oracle config     : {_display_path(oracle_config)}")
@@ -163,11 +236,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  output dir        : {_display_path(output_dir)}")
     print(f"  oracle pickle     : {_display_path(oracle_path)}")
     print(f"  llm contestants   : {'yes' if args.with_llm else 'no'}")
+    if skip_stages:
+        ordered = [stage for stage in skip_stages if stage]
+        print(f"  skipped stages    : {', '.join(sorted(ordered))}")
+    if args.resume_pipeline and pipeline_state.completed_stages:
+        print(f"  pipeline resume   : {', '.join(pipeline_state.completed_stages)}")
     print()
 
     total_start = time.perf_counter()
     for step in steps:
-        if _run_step(step, dry_run=args.dry_run) != 0:
+        if _run_step(step, dry_run=args.dry_run, output_dir=output_dir) != 0:
             return 1
 
     if args.dry_run:
@@ -179,7 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _run_step(step: Step, *, dry_run: bool) -> int:
+def _run_step(step: Step, *, dry_run: bool, output_dir: Path) -> int:
     print(f"==> {step.label}")
     if step.command is not None:
         print(_format_command(step.command))
@@ -208,6 +286,9 @@ def _run_step(step: Step, *, dry_run: bool) -> int:
     if returncode != 0:
         print(f"\nStep failed after {elapsed:.1f} min: {step.label}", file=sys.stderr)
         return returncode
+    if step.stage_id is not None:
+        state_path = mark_stage_complete(output_dir, step.stage_id)
+        print(f"Pipeline checkpoint updated: {_display_path(state_path)}")
     print(f"<== {step.label} done in {elapsed:.1f} min\n")
     return 0
 
