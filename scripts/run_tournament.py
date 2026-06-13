@@ -1,23 +1,20 @@
-"""Round-robin tournament for agents defined in TOML configs.
+"""Round-robin tournament for agents defined in a TOML experiment config.
 
 Each pair plays ``games_per_pair`` games. Game ``i`` uses seed
-``base_seed + offset`` where ``offset`` is unique per pairing and game index, so
-there is no need for duplicate players with different evaluation seeds.
+``base_seed + offset`` where ``offset`` is unique per pairing and game index.
 
-The script writes report-oriented outputs to ``--output-dir``:
+Outputs under ``output_dir`` (from config, overridable via CLI):
 
 * ``games.csv`` - one row per game;
-* ``moves.jsonl`` - one JSON object per move, including the state before the
-  move for later oracle/Blunder Rate scoring;
+* ``moves.jsonl`` - one JSON object per move (state before move for blunder scoring);
 * ``pair_summary.csv`` - one row per matchup;
 * ``standings.csv`` - aggregate standings per player;
 * ``run_metadata.json`` - config and run metadata.
 
 Usage::
 
-    python scripts/run_tournament.py --games-per-pair 10 --base-seed 0
-    python scripts/run_tournament.py --llm-config configs/tournament_llm.toml
-    python scripts/run_tournament.py --no-llm
+    python scripts/run_tournament.py --config configs/experiments/main_final.toml
+    python scripts/run_tournament.py --config configs/experiments/smoke.toml --games-per-pair 2
 """
 
 from __future__ import annotations
@@ -28,7 +25,6 @@ import json
 import os
 import sys
 import time
-import tomllib
 import traceback
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -36,14 +32,18 @@ from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from connect4_mcts.experiment_config import (
+    ORACLE_TAG,
+    ExperimentConfig,
+    PlayerSpec,
+    instantiate_player,
+    load_experiment_config,
+    player_kind,
+)
 from connect4_mcts.experiments import SimulatedGame, TimedMoveRecord, summarize_games
 from connect4_mcts.game import GameState, GameStatus, IllegalMoveError, Move, Player
 from connect4_mcts.players.base import Agent
-from connect4_mcts.players.llm import create_llm_player
-from connect4_mcts.players.minimax import MinimaxPlayer
-from connect4_mcts.players.random import RandomPlayer
 from connect4_mcts.runner import GameRunnerError, prepare_agents_for_game
-from connect4_mcts.tournament_config import load_llm_tournament_entries
 from connect4_mcts.tournament_progress import (
     build_checkpoint_payload,
     can_resume_tournament,
@@ -60,86 +60,42 @@ from connect4_mcts.tournament_reporting import (
     format_failure_banner,
     write_failure_report,
 )
-from connect4_mcts.training import estimate_tree_ram_gb, load_player
 
 
 LLM_COUNTER_FIELDS = ("requests", "unparseable", "illegal", "fallbacks", "moves")
+CACHEABLE_TYPES = frozenset({"uct", "fpu", "lgr", "pmbp", "llm"})
 
 
 @dataclass(frozen=True, slots=True)
 class TournamentEntry:
-    player_id: str
-    kind: str
-    entry: dict[str, Any]
-    est_ram_gb: float
+    spec: PlayerSpec
 
 
-def _load_entries(config: dict[str, Any], llm_config: dict[str, Any] | None) -> list[TournamentEntry]:
-    defaults = config.get("defaults", {})
-    output_dir = str(defaults.get("output_dir", "models/tournament"))
-    bytes_per_node = float(defaults.get("bytes_per_node", 2867.0))
-    loaded: list[TournamentEntry] = []
+def _tournament_players(config: ExperimentConfig) -> tuple[PlayerSpec, ...]:
+    """Return players that participate in the round-robin (excludes ORACLE-only evaluators)."""
+    return tuple(player for player in config.players if ORACLE_TAG not in player.tags)
 
-    raw_entries = list(config.get("players", []))
-    if llm_config is not None:
-        raw_entries.extend(load_llm_tournament_entries(llm_config))
 
-    for entry in raw_entries:
-        player_id = str(entry["id"])
-        kind = str(entry.get("kind", "mcts"))
-        est_ram = 0.0
-
-        if kind == "mcts":
-            path = os.path.join(output_dir, f"{player_id}.pkl")
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"missing trained player pickle: {path}")
-            agent = load_player(path, inference_only=True)
-            est_ram = estimate_tree_ram_gb(agent.tree_size, bytes_per_node=bytes_per_node)
-            del agent
-
-        loaded.append(TournamentEntry(player_id=player_id, kind=kind, entry=entry, est_ram_gb=est_ram))
-
-    return loaded
+def _load_entries(config: ExperimentConfig) -> list[TournamentEntry]:
+    players = _tournament_players(config)
+    if not players:
+        raise ValueError("experiment config must define at least one non-ORACLE player for the tournament")
+    return [TournamentEntry(spec=player) for player in players]
 
 
 def _instantiate_agent(
     entry: TournamentEntry,
-    defaults: dict[str, Any],
     game_seed: int,
     *,
     agent_cache: dict[str, Agent],
 ) -> Agent:
-    cached = agent_cache.get(entry.player_id)
+    cached = agent_cache.get(entry.spec.id)
     if cached is not None:
         return cached
 
-    if entry.kind == "builtin":
-        builtin = str(entry.entry.get("builtin", "random"))
-        if builtin == "random":
-            agent: Agent = RandomPlayer(seed=game_seed)
-        elif builtin == "minimax":
-            agent = MinimaxPlayer(depth=int(entry.entry.get("depth", 4)))
-        else:
-            raise ValueError(f"unknown builtin agent: {builtin}")
-    elif entry.kind == "mcts":
-        output_dir = str(defaults.get("output_dir", "models/tournament"))
-        agent = load_player(os.path.join(output_dir, f"{entry.player_id}.pkl"), inference_only=True)
-    elif entry.kind == "llm":
-        model_entry = entry.entry
-        base_url = str(model_entry.get("base_url", "") or "") or None
-        api_key = str(model_entry.get("api_key", "") or "") or None
-        agent = create_llm_player(
-            str(model_entry["model"]),
-            api_key=api_key,
-            base_url=base_url,
-            seed=game_seed,
-            timeout=float(model_entry.get("timeout", 300.0)),
-        )
-    else:
-        raise ValueError(f"unknown player kind: {entry.kind}")
-
-    if entry.kind in {"mcts", "llm"}:
-        agent_cache[entry.player_id] = agent
+    agent = instantiate_player(entry.spec, game_seed=game_seed)
+    if entry.spec.type in CACHEABLE_TYPES:
+        agent_cache[entry.spec.id] = agent
     return agent
 
 
@@ -315,11 +271,6 @@ def _report_and_raise_game_failure(
 def _pair_seed(base_seed: int, left_index: int, right_index: int, game_index: int) -> int:
     pair_key = left_index * 1000 + right_index
     return base_seed + pair_key * 100 + game_index
-
-
-def _read_toml(path: str) -> dict[str, Any]:
-    with open(path, "rb") as config_file:
-        return tomllib.load(config_file)
 
 
 def _serialize_move(move: Move) -> dict[str, Any]:
@@ -517,50 +468,6 @@ def _standings_rows_from_metrics(
     return rows
 
 
-def _standings_rows(games: tuple[SimulatedGame, ...], player_ids: Sequence[str]) -> list[dict[str, Any]]:
-    overall = summarize_games(games, agent_names=tuple(player_ids))
-    rows: list[dict[str, Any]] = []
-    for player_id in player_ids:
-        player_games = [
-            game for game in games if game.red_agent == player_id or game.yellow_agent == player_id
-        ]
-        draws = sum(1 for game in player_games if game.winner_agent is None)
-        wins = overall.wins.get(player_id, 0)
-        total = len(player_games)
-        losses = total - wins - draws
-        rows.append(
-            {
-                "player_id": player_id,
-                "games": total,
-                "wins": wins,
-                "losses": losses,
-                "draws": draws,
-                "win_rate": wins / total if total else 0.0,
-                "loss_rate": losses / total if total else 0.0,
-                "draw_rate": draws / total if total else 0.0,
-                "moves": overall.move_counts.get(player_id, 0),
-                "avg_decision_seconds": overall.average_decision_time(player_id),
-            }
-        )
-
-    rows.sort(key=lambda row: (row["wins"], row["draws"], -row["avg_decision_seconds"]), reverse=True)
-    for rank, row in enumerate(rows, start=1):
-        row["rank"] = rank
-    return rows
-
-
-def _write_csv(path: str, rows: Iterable[dict[str, Any]]) -> None:
-    row_list = list(rows)
-    if not row_list:
-        return
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    fieldnames = list(row_list[0].keys())
-    with open(path, "w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(row_list)
-
-
 def _write_jsonl(path: str, rows: Iterable[dict[str, Any]]) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as output_file:
@@ -576,71 +483,48 @@ def _write_json(path: str, payload: dict[str, Any]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a round-robin tournament.")
-    parser.add_argument("--config", default="configs/tournament_grid.toml")
-    parser.add_argument(
-        "--llm-config",
-        default="configs/tournament_llm.toml",
-        help="TOML file with LLM server settings and model list (empty file section = no LLMs).",
-    )
-    parser.add_argument("--no-llm", action="store_true", help="Do not load LLM contestants.")
-    parser.add_argument("--games-per-pair", type=int, default=10)
-    parser.add_argument("--base-seed", type=int, default=0)
+    parser.add_argument("--config", default="configs/experiments/main_final.toml")
+    parser.add_argument("--games-per-pair", type=int, default=None, help="Override games_per_pair from config.")
+    parser.add_argument("--base-seed", type=int, default=None, help="Override seed from config.")
     parser.add_argument("--max-moves", type=int, default=None, help="Optional safety cap per game.")
     parser.add_argument("--output", default="", help="Optional legacy JSON summary path.")
-    parser.add_argument("--output-dir", default="results/tournament", help="Directory for tournament metric files.")
+    parser.add_argument("--output-dir", default=None, help="Override output_dir from config.")
     parser.add_argument(
         "--verbose-games",
         action="store_true",
-        help="Print one line before each individual game (useful when diagnosing hangs or crashes).",
+        help="Print one line before each individual game.",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume from tournament_checkpoint.json and saved metric files in --output-dir.",
+        help="Resume from tournament_checkpoint.json and saved metric files in output dir.",
     )
     args = parser.parse_args(argv)
 
-    if args.games_per_pair < 1:
-        raise SystemExit("--games-per-pair must be at least 1")
+    experiment = load_experiment_config(args.config)
+    games_per_pair = args.games_per_pair if args.games_per_pair is not None else experiment.games_per_pair
+    base_seed = args.base_seed if args.base_seed is not None else experiment.seed
+    output_dir = args.output_dir if args.output_dir is not None else experiment.output_dir
 
-    config = _read_toml(args.config)
+    if games_per_pair < 1:
+        raise SystemExit("games_per_pair must be at least 1")
 
-    llm_config: dict[str, Any] | None = None
-    if not args.no_llm and os.path.exists(args.llm_config):
-        llm_config = _read_toml(args.llm_config)
-        llm_count = len(llm_config.get("models", []))
-        if llm_count:
-            server = llm_config.get("server", {})
-            print(
-                f"LLM config: {args.llm_config} ({llm_count} model(s), "
-                f"base_url={server.get('base_url', '')!r})",
-                flush=True,
-            )
-        else:
-            llm_config = None
-    elif not args.no_llm:
-        print(f"No LLM config at {args.llm_config}; running without LLM players.", flush=True)
+    entries = _load_entries(experiment)
+    player_ids = [entry.spec.id for entry in entries]
+    oracle = experiment.oracle_player()
+    if oracle is not None:
+        print(f"Oracle player {oracle.id!r} (tag {ORACLE_TAG}) is excluded from round-robin; used for blunder scoring.")
 
-    defaults = config.get("defaults", {})
-    entries = _load_entries(config, llm_config)
-    player_ids = [entry.player_id for entry in entries]
-    if not entries:
-        raise SystemExit("tournament config must define at least one player")
+    print(f"Round-robin: {len(entries)} players, {games_per_pair} games/pair (online search).")
 
-    print(f"Round-robin: {len(entries)} players, {args.games_per_pair} games/pair.")
-    max_ram = max(entry.est_ram_gb for entry in entries)
-    if max_ram > 0:
-        print(f"Largest MCTS tree: est. RAM ~{max_ram:.2f} GB (two agents loaded per game).")
-
-    llm_config_path = None if llm_config is None else args.llm_config
     total_pairs = len(entries) * (len(entries) - 1) // 2
     pair_ids: list[str] = []
     for i, left in enumerate(entries):
         for j in range(i + 1, len(entries)):
-            pair_ids.append(f"{left.player_id}_vs_{entries[j].player_id}")
+            pair_ids.append(f"{left.spec.id}_vs_{entries[j].spec.id}")
 
-    if args.resume and tournament_is_complete(args.output_dir):
-        print(f"Tournament already complete in {args.output_dir}; nothing to do.")
+    if args.resume and tournament_is_complete(output_dir):
+        print(f"Tournament already complete in {output_dir}; nothing to do.")
         return 0
 
     all_game_rows: list[dict[str, Any]] = []
@@ -648,21 +532,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     pair_summaries: list[dict[str, Any]] = []
     start_pair_index = 0
 
-    if args.resume and can_resume_tournament(args.output_dir):
-        checkpoint = load_checkpoint(args.output_dir)
+    if args.resume and can_resume_tournament(output_dir):
+        checkpoint = load_checkpoint(output_dir)
         if checkpoint is None:
             raise SystemExit("resume requested but tournament_checkpoint.json is missing")
         try:
             validate_checkpoint(
                 checkpoint,
                 config_path=args.config,
-                base_seed=args.base_seed,
-                games_per_pair=args.games_per_pair,
+                base_seed=base_seed,
+                games_per_pair=games_per_pair,
                 player_ids=player_ids,
             )
         except ValueError as exc:
             raise SystemExit(f"cannot resume tournament: {exc}") from exc
-        saved_games, saved_moves, saved_pairs = load_saved_tournament_rows(args.output_dir)
+        saved_games, saved_moves, saved_pairs = load_saved_tournament_rows(output_dir)
         all_game_rows = [dict(row) for row in saved_games]
         all_move_rows = saved_moves
         pair_summaries = [dict(row) for row in saved_pairs]
@@ -675,30 +559,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.resume:
         print("No in-progress tournament checkpoint found; starting from scratch.", flush=True)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     pair_index = 0
     try:
         for i, left in enumerate(entries):
             for j in range(i + 1, len(entries)):
                 right = entries[j]
-                pair_id = f"{left.player_id}_vs_{right.player_id}"
+                pair_id = f"{left.spec.id}_vs_{right.spec.id}"
                 if pair_index < start_pair_index:
                     pair_index += 1
                     continue
 
                 print(
-                    f"\nPair {pair_index + 1}/{total_pairs}: {left.player_id} vs {right.player_id}",
+                    f"\nPair {pair_index + 1}/{total_pairs}: {left.spec.id} vs {right.spec.id}",
                     flush=True,
                 )
                 pair_cache: dict[str, Agent] = {}
                 pair_games: list[SimulatedGame] = []
-                for game_index in range(args.games_per_pair):
-                    seed = _pair_seed(args.base_seed, i, j, game_index)
+                for game_index in range(games_per_pair):
+                    seed = _pair_seed(base_seed, i, j, game_index)
                     swap = game_index % 2 == 1
                     red_entry = right if swap else left
                     yellow_entry = left if swap else right
-                    red = _instantiate_agent(red_entry, defaults, seed, agent_cache=pair_cache)
-                    yellow = _instantiate_agent(yellow_entry, defaults, seed + 1, agent_cache=pair_cache)
+                    red = _instantiate_agent(red_entry, seed, agent_cache=pair_cache)
+                    yellow = _instantiate_agent(yellow_entry, seed + 1, agent_cache=pair_cache)
 
                     red_counters_before = _agent_counters(red)
                     yellow_counters_before = _agent_counters(yellow)
@@ -709,8 +593,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     game_id = f"{pair_id}_g{game_index:04d}"
                     if args.verbose_games:
                         print(
-                            f"  game {game_index + 1}/{args.games_per_pair}: {game_id} "
-                            f"seed={seed} red={red_entry.player_id} yellow={yellow_entry.player_id}",
+                            f"  game {game_index + 1}/{games_per_pair}: {game_id} "
+                            f"seed={seed} red={red_entry.spec.id} yellow={yellow_entry.spec.id}",
                             flush=True,
                         )
                     try:
@@ -720,8 +604,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             pair_index=pair_index,
                             game_index=game_index,
                             seed=seed,
-                            red_agent_name=red_entry.player_id,
-                            yellow_agent_name=yellow_entry.player_id,
+                            red_agent_name=red_entry.spec.id,
+                            yellow_agent_name=yellow_entry.spec.id,
                             red=red,
                             yellow=yellow,
                             max_moves=args.max_moves,
@@ -729,18 +613,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except Exception as exc:
                         _report_and_raise_game_failure(
                             exc,
-                            output_dir=args.output_dir,
+                            output_dir=output_dir,
                             pair_index=pair_index,
                             pair_total=total_pairs,
                             pair_id=pair_id,
-                            left_player=left.player_id,
-                            right_player=right.player_id,
+                            left_player=left.spec.id,
+                            right_player=right.spec.id,
                             game_index=game_index,
-                            games_per_pair=args.games_per_pair,
+                            games_per_pair=games_per_pair,
                             game_id=game_id,
                             seed=seed,
-                            red_agent=red_entry.player_id,
-                            yellow_agent=yellow_entry.player_id,
+                            red_agent=red_entry.spec.id,
+                            yellow_agent=yellow_entry.spec.id,
                         )
 
                     red_counters = _counter_delta(red_counters_before, _agent_counters(red))
@@ -753,8 +637,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             pair_index=pair_index,
                             game_index=game_index,
                             seed=seed,
-                            red_kind=red_entry.kind,
-                            yellow_kind=yellow_entry.kind,
+                            red_kind=player_kind(red_entry.spec),
+                            yellow_kind=player_kind(yellow_entry.spec),
                             red_counters=red_counters,
                             yellow_counters=yellow_counters,
                             red_tree_size_before=red_tree_before,
@@ -768,29 +652,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pair_cache.clear()
 
                 pair_summary = _pair_summary_row(
-                    left.player_id,
-                    right.player_id,
+                    left.spec.id,
+                    right.spec.id,
                     tuple(pair_games),
-                    args.games_per_pair,
+                    games_per_pair,
                 )
                 pair_summaries.append(pair_summary)
                 print(
-                    f"  result {left.player_id:>16} vs {right.player_id:<16} | "
+                    f"  result {left.spec.id:>16} vs {right.spec.id:<16} | "
                     f"{pair_summary['left_wins']} - {pair_summary['right_wins']} "
                     f"(draws {pair_summary['draws']})",
                     flush=True,
                 )
                 pair_index += 1
                 flush_tournament_progress(
-                    args.output_dir,
+                    output_dir,
                     game_rows=all_game_rows,
                     move_rows=all_move_rows,
                     pair_summaries=pair_summaries,
                     checkpoint=build_checkpoint_payload(
                         config_path=args.config,
-                        llm_config_path=llm_config_path,
-                        base_seed=args.base_seed,
-                        games_per_pair=args.games_per_pair,
+                        base_seed=base_seed,
+                        games_per_pair=games_per_pair,
                         player_ids=player_ids,
                         completed_pairs=pair_index,
                         total_pairs=total_pairs,
@@ -806,15 +689,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if pair_index > start_pair_index:
             flush_tournament_progress(
-                args.output_dir,
+                output_dir,
                 game_rows=all_game_rows,
                 move_rows=all_move_rows,
                 pair_summaries=pair_summaries,
                 checkpoint=build_checkpoint_payload(
                     config_path=args.config,
-                    llm_config_path=llm_config_path,
-                    base_seed=args.base_seed,
-                    games_per_pair=args.games_per_pair,
+                    base_seed=base_seed,
+                    games_per_pair=games_per_pair,
                     player_ids=player_ids,
                     completed_pairs=pair_index,
                     total_pairs=total_pairs,
@@ -822,7 +704,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     status="in_progress",
                 ),
             )
-            print(f"Progress saved to {args.output_dir} (resume with --resume).", file=sys.stderr, flush=True)
+            print(f"Progress saved to {output_dir} (resume with --resume).", file=sys.stderr, flush=True)
         raise
 
     standings = _standings_rows_from_metrics(all_game_rows, player_ids)
@@ -833,12 +715,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     metadata = {
         "config": args.config,
-        "llm_config": None if llm_config is None else args.llm_config,
         "players": player_ids,
-        "games_per_pair": args.games_per_pair,
-        "base_seed": args.base_seed,
+        "oracle_player": None if oracle is None else oracle.id,
+        "games_per_pair": games_per_pair,
+        "base_seed": base_seed,
         "max_moves": args.max_moves,
-        "output_dir": args.output_dir,
+        "mcts_mode": "online_search",
+        "output_dir": output_dir,
         "files": {
             "games": "games.csv",
             "moves": "moves.jsonl",
@@ -846,21 +729,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "standings": "standings.csv",
         },
     }
-    _progress_write_csv(os.path.join(args.output_dir, "games.csv"), all_game_rows)
-    _write_jsonl(os.path.join(args.output_dir, "moves.jsonl"), all_move_rows)
-    _progress_write_csv(os.path.join(args.output_dir, "pair_summary.csv"), pair_summaries)
-    _progress_write_csv(os.path.join(args.output_dir, "standings.csv"), standings)
-    _progress_write_json(os.path.join(args.output_dir, "run_metadata.json"), metadata)
+    _progress_write_csv(os.path.join(output_dir, "games.csv"), all_game_rows)
+    _write_jsonl(os.path.join(output_dir, "moves.jsonl"), all_move_rows)
+    _progress_write_csv(os.path.join(output_dir, "pair_summary.csv"), pair_summaries)
+    _progress_write_csv(os.path.join(output_dir, "standings.csv"), standings)
+    _progress_write_json(os.path.join(output_dir, "run_metadata.json"), metadata)
     flush_tournament_progress(
-        args.output_dir,
+        output_dir,
         game_rows=all_game_rows,
         move_rows=all_move_rows,
         pair_summaries=pair_summaries,
         checkpoint=build_checkpoint_payload(
             config_path=args.config,
-            llm_config_path=llm_config_path,
-            base_seed=args.base_seed,
-            games_per_pair=args.games_per_pair,
+            base_seed=base_seed,
+            games_per_pair=games_per_pair,
             player_ids=player_ids,
             completed_pairs=pair_index,
             total_pairs=total_pairs,
@@ -868,17 +750,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             status="complete",
         ),
     )
-    print(f"\nSaved tournament metrics to {args.output_dir}")
+    print(f"\nSaved tournament metrics to {output_dir}")
 
-    legacy_payload = {
-        "players": player_ids,
-        "games_per_pair": args.games_per_pair,
-        "base_seed": args.base_seed,
-        "llm_config": None if llm_config is None else args.llm_config,
-        "standings": standings,
-        "pairs": pair_summaries,
-    }
     if args.output:
+        legacy_payload = {
+            "players": player_ids,
+            "games_per_pair": games_per_pair,
+            "base_seed": base_seed,
+            "standings": standings,
+            "pairs": pair_summaries,
+        }
         _write_json(args.output, legacy_payload)
         print(f"Saved legacy summary to {args.output}")
 

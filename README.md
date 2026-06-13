@@ -11,13 +11,18 @@ Dostepne sa dwa typy ruchow:
 - `drop` - klasyczne wrzucenie zetonu do kolumny,
 - `push` - wlozenie zetonu od spodu niezapelnionej kolumny; pozostale zetony w tej kolumnie przesuwaja sie o jedno pole w gore.
 
-Obowiazuje sprawiedliwosc turowa: jesli segment czterech zetonow pojawi sie po ruchu gracza rozpoczynajacego, drugi gracz dostaje jeszcze jeden ruch. Ten ruch (oraz wszystkie kolejne po remisie liczby segmentow) **nie moze naruszac** juz istniejacych segmentow czterech zetonow — nie mozna ich rozwalic push'em. Jesli po tym ruchu obaj gracze maja **ta sama liczbe** segmentow, gra toczy sie dalej z zablokowanymi segmentami. W przeciwnym razie wygrywa gracz z mniejsza liczba segmentow.
+Obowiazuje **natychmiastowa porażka właściciela linii**: gdy w ruchu powstaje segment
+czterech zetonow w rzędzie, **przegrywa gracz, do którego należy ten segment** — niezależnie
+od tego, kto wykonał ruch. Jesli w jednym ruchu powstaja linie obu graczy, wynik to **remis**.
+Jesli nie powstaje nowa linia, gra trwa dalej az do zapelnienia planszy; wtedy wygrywa gracz
+z mniejsza **skumulowana** liczba segmentow (zniszczenie linii na planszy nie zmniejsza
+wczesniej naliczonego wyniku).
 
-Remis: gdy liczba segmentow jest rowna, gra toczy sie dalej (albo konczy sie remisem, gdy plansza jest pelna).
+Remis: rowna liczba segmentow po zapelnieniu planszy albo obie linie w jednym ruchu.
 
 ## Zakres implementacji
 
-- rdzen gry: plansza 6x8, wariant suicide, ruchy drop i push, sprawiedliwosc turowa,
+- rdzen gry: plansza 6x8, wariant suicide, ruchy drop i push, natychmiastowa porażka właściciela linii,
 - gracze bazowi: random oraz heurystyczny,
 - gracze MCTS/UCT i wybrane modyfikacje,
 - proste GUI do rozgrywek czlowiek-komputer,
@@ -27,7 +32,10 @@ Remis: gdy liczba segmentow jest rowna, gra toczy sie dalej (albo konczy sie rem
 
 ```text
 src/connect4_mcts/   kod projektu
+configs/             pliki TOML eksperymentow (turniej, wyrocznia ORACLE)
+scripts/             skrypty turnieju i pipeline
 tests/               testy automatyczne
+notebooks/           analiza wynikow turnieju
 ```
 
 
@@ -79,7 +87,7 @@ Dostepni gracze:
 - `lgr` - UCT z polityka Last Good Reply w rolloutach,
 - `pmbp` - UCT z Power-Mean Backpropagation.
 
-Parametr `--depth` steruje glebokoscia przeszukiwania minimaxa. Wieksza wartosc zwykle oznacza silniejsza gre, ale istotnie zwieksza czas decyzji. Na start praktyczne sa wartosci `2` lub `3`. Gracze MCTS uruchamiani z CLI/eksperymentow korzystaja z domyslnego budzetu iteracji; pelna kontrole nad hiperparametrami daja funkcje treningowe (ponizej).
+Parametr `--depth` steruje glebokoscia przeszukiwania minimaxa. Wieksza wartosc zwykle oznacza silniejsza gre, ale istotnie zwieksza czas decyzji. Na start praktyczne sa wartosci `2` lub `3`. Gracze MCTS uruchamiani z CLI/GUI/eksperymentow wykonuja **swieze symulacje przed kazdym ruchem** (domyslny budzet iteracji); pelna kontrole nad hiperparametrami daja pliki konfiguracyjne eksperymentow (ponizej) oraz modul treningowy (legacy).
 
 Gra czlowiek kontra losowy agent:
 
@@ -124,10 +132,8 @@ GUI uruchamia ekran wyboru ustawien. W aplikacji mozna wybrac:
 
 - tryb gry: `Single` (czlowiek kontra agent) albo `2 Players` (dwoch ludzi lokalnie),
 - kolor czlowieka: `Red` albo `Yellow`,
-- przeciwnika: `Random` albo `Minimax`,
-- `Load player...` - wczytanie wytrenowanego gracza MCTS z pliku pickle (otwiera okno wyboru pliku),
-- `Play vs LLM...` - gra przeciwko modelowi jezykowemu (zob. nizej),
-- glebokosc minimaxa.
+- przeciwnika: `Random`, `Minimax`, warianty MCTS (`UCT`, `FPU`, `LGR`, `PMBp`) albo `Play vs LLM...`,
+- dla Minimax: glebokosc; dla MCTS: iteracje na ruch, exploration C oraz parametry wariantu (FPU / power-mean p); dla LLM: temperatura i opcjonalnie max tokens; dla Random: opcjonalny seed,
 
 Okno jest skalowalne - plansza oraz menu sa wysrodkowane i dopasowuja sie do rozmiaru okna.
 
@@ -137,10 +143,10 @@ Start z domyslnymi ustawieniami:
 python -m connect4_mcts.gui
 ```
 
-Start z wybranym przeciwnikiem i kolorem:
+Start z wybranym przeciwnikiem MCTS i kolorem:
 
 ```bash
-python -m connect4_mcts.gui --agent minimax --human yellow --depth 3 --seed 1
+python -m connect4_mcts.gui --agent uct --human yellow --iterations 400 --seed 1
 ```
 
 Start od razu w trybie dwoch graczy:
@@ -149,13 +155,8 @@ Start od razu w trybie dwoch graczy:
 python -m connect4_mcts.gui --two-player
 ```
 
-Gra od razu przeciwko wczytanemu, wytrenowanemu graczowi:
-
-```bash
-python -m connect4_mcts.gui --load models/uct_example.pkl
-```
-
-W GUI mozna tez wczytac gracza w trakcie - na ekranie ustawien przyciskiem `Load player...` (otwiera systemowe okno wyboru pliku `.pkl`). Jezeli okno dialogowe nie jest dostepne, uzyj flagi `--load`.
+Gracze MCTS w GUI uruchamiaja swieze symulacje przed kazdym ruchem (`--agent`
+`uct`/`fpu`/`lgr`/`pmbp`, `--iterations`). Nie trzeba wczytywac pliku pickle.
 
 ### Gra przeciwko LLM w GUI
 
@@ -223,18 +224,13 @@ Wynik zawiera:
 - srednia liczbe ruchow na partie,
 - sredni czas decyzji kazdego agenta.
 
-## Trenowanie i zapisywanie graczy MCTS
+## Trenowanie i zapisywanie graczy MCTS (legacy)
 
-Gracz MCTS (`MCTSPlayer`) utrzymuje **trwale drzewo przeszukiwania** (tablice
-transpozycji) wspoldzielone miedzy ruchami i grami. Wytrenowany gracz to taki,
-ktory ma juz w jakims stopniu zbudowane drzewo - jego ksztalt zalezy od
-hiperparametrow danego algorytmu. Trening polega na **rozgrywaniu przez gracza
-gier z samym soba**, co rozbudowuje wspolne drzewo (a dla LGR takze pamiec
-odpowiedzi).
+Modul `connect4_mcts.training` nadal udostepnia API do **self-play i zapisu drzewa**
+w plikach `.pkl`. Turniej i pelny pipeline eksperymentow **nie wymagaja treningu** —
+gracze MCTS sa budowani online z parametrow w pliku TOML (patrz ponizej).
 
-Funkcje treningowe z modulu `connect4_mcts.training` zwracaja gotowe obiekty
-graczy (implementujace `choose_move`), ktore dzialaja bezposrednio z mechanizmem
-gry (`play_game`, CLI, GUI, eksperymenty):
+Funkcje treningowe zwracaja gotowe obiekty graczy (implementujace `choose_move`):
 
 ```python
 from connect4_mcts import (
@@ -275,72 +271,123 @@ python scripts/train_example_player.py --algorithm uct --selfplay-games 40
 
 Najwazniejsze opcje skryptu: `--algorithm {uct,fpu,lgr,pmbp}`, `--output`,
 `--iterations`, `--selfplay-games`, `--selfplay-iterations`, `--max-rollout-moves`
-(limit dlugosci rolloutu, przyspiesza trening) oraz `--seed`. Tak zapisany plik
-mozna wczytac w GUI (`Load player...` lub `--load`).
+oraz `--seed`.
 
-### Wyrocznia do metryki Blunder Rate
-
-Osobny skrypt `scripts/train_oracle.py` buduje neutralny silnik referencyjny
-(wyrocznie) uzywany do metryki Blunder Rate. Wyrocznia to **czysty UCT**
-(`power_mean_p = 1`, bez FPU/LGR), aby nie faworyzowac zadnej z badanych
-modyfikacji. Jej trwale drzewo transpozycji jest rozbudowywane przez self-play i
-pelni potem role cache wartosci przy ocenianiu pozycji turniejowych.
-
-Konfiguracja znajduje sie w `configs/oracle.toml` (wypelniona zaproponowanymi
-wartosciami: limit pamieci `16 GB` ~= 5,1 mln wezlow, budzet budowania 1000
-iteracji/ruch, budzet oceny 20000 iteracji/pozycje, prog blundera 0.3).
+Osobne skrypty legacy (nie sa czescia domyslnego pipeline eksperymentow):
 
 ```bash
-python scripts/train_oracle.py                       # uzywa configs/oracle.toml
 python scripts/train_oracle.py --config configs/oracle.toml
-python scripts/train_oracle.py --resume              # dorozbuduj istniejace drzewo
+python scripts/train_tournament_grid.py --config configs/tournament_grid.toml
 ```
 
-Trening zatrzymuje sie po osiagnieciu limitu pamieci (przeliczonego na liczbe
-wezlow), liczby gier albo limitu czasu, zapisujac po drodze checkpointy. Po
-optymalizacji rdzenia gry przeszukiwanie osiaga ~4000 iteracji/s (zob.
-"Wydajnosc rdzenia"), wiec zapelnienie pelnego drzewa 16 GB nalezy uruchamiac
-na mocniejszej maszynie.
+## Konfiguracja eksperymentow
 
-### Pelny eksperyment bez LLM
+Eksperymenty turniejowe opisuje **jeden plik TOML**. Globalnie ustawiasz tylko:
 
-Skrypt `scripts/run_full_experiment.py` uruchamia caly wewnetrzny pipeline bez
-LLM-ow:
+- `seed` — bazowe ziarno losowosci,
+- `output_dir` — katalog wynikow turnieju,
+- `games_per_pair` — liczba partii na kazda pare graczy w round-robin,
+- opcjonalnie `blunder_threshold`, `blunder_sample_every` — parametry metryki Blunder Rate.
 
-1. trening wyroczni z `configs/oracle.toml`,
-2. przygotowanie tej samej wyroczni jako zawodnika turniejowego `oracle`,
-3. trening pozostalych graczy MCTS z `configs/experiments/main_final.toml`,
-4. turniej round-robin,
-5. agregacje CSV,
-6. Blunder Rate wzgledem wytrenowanej wyroczni.
+Kazdy uczestnik to wpis `[[players]]` z polem `type`:
+
+| `type` | Opis | Typowe hiperparametry |
+|--------|------|------------------------|
+| `random` | losowy legalny ruch | opcjonalny `seed` |
+| `minimax` | minimax z heurystyka | `depth` |
+| `uct`, `fpu`, `lgr`, `pmbp` | MCTS online | `iterations`, `exploration`, `fpu`, `power_mean_p` |
+| `llm` | model jezykowy | `model`, `base_url`, opcjonalny `api_key`, `temperature`, `max_tokens`, `timeout` |
+
+Gracz z tagiem **`ORACLE`** sluzy wylacznie do oceny blunderow (nie gra w turnieju).
+Moze byc co najwyzej jeden taki gracz. Jesli go nie ma, etap Blunder Rate jest pomijany.
+
+Przyklad (`configs/experiments/main_final.toml`):
+
+```toml
+seed = 0
+output_dir = "results/main_final"
+games_per_pair = 10
+blunder_threshold = 0.3
+
+[[players]]
+id = "random"
+type = "random"
+
+[[players]]
+id = "uct"
+type = "uct"
+iterations = 1000
+exploration = 1.414
+
+[[players]]
+id = "oracle"
+type = "uct"
+tags = ["ORACLE"]
+iterations = 20000
+exploration = 1.0
+
+[[players]]
+id = "llm-local"
+type = "llm"
+model = "llama3"
+base_url = "http://localhost:11434/v1"
+temperature = 0.7
+```
+
+Gotowe presety:
+
+- `configs/experiments/main_final.toml` — pelny turniej algorytmow,
+- `configs/experiments/smoke.toml` — szybki test lokalny,
+- `configs/experiments/llm_small.toml` — porownanie z LLM.
+
+Ladowanie i budowa graczy z configu (modul `connect4_mcts.experiment_config`):
+
+```python
+from connect4_mcts.experiment_config import load_experiment_config, instantiate_player
+
+config = load_experiment_config("configs/experiments/smoke.toml")
+for spec in config.players:
+    agent = instantiate_player(spec, game_seed=config.seed)
+```
+
+Stary format (`kind`, `builtin`, `algorithm`, `play_iterations`) jest nadal akceptowany
+dla kompatybilnosci wstecznej.
+
+### Pelny pipeline eksperymentu
+
+Skrypt `scripts/run_full_experiment.py` uruchamia trzy etapy:
+
+1. **turniej round-robin** (`run_tournament.py`) — kazda para gra `games_per_pair` partii,
+2. **agregacja CSV** (`analyze_tournament.py`),
+3. **Blunder Rate** (`score_blunders.py`) — tylko gdy w configu jest gracz z tagiem `ORACLE`.
 
 Domyslny pelny run:
 
 ```bash
 python scripts/run_full_experiment.py
+python scripts/run_full_experiment.py --config configs/experiments/smoke.toml
 ```
 
-Przed dlugim uruchomieniem mozna wypisac dokladne komendy bez wykonywania:
+Przed dlugim uruchomieniem mozna wypisac komendy bez wykonywania:
 
 ```bash
 python scripts/run_full_experiment.py --dry-run
 ```
 
-Jesli modele sa juz wytrenowane i trzeba powtorzyc tylko turniej, analize oraz
-Blunder Rate:
+Pominiecie etapow (np. powtorzenie tylko analizy):
 
 ```bash
-python scripts/run_full_experiment.py --skip-training
+python scripts/run_full_experiment.py --skip-stage tournament,blunders
+python scripts/run_full_experiment.py --resume-pipeline   # pomija juz ukonczone etapy
 ```
 
 Najwazniejsze opcje:
 
-- `--resume-training` - kontynuuje trening z istniejacych plikow `.pkl`,
-- `--games-per-pair N` - liczba partii dla kazdej pary graczy,
-- `--output-dir results/main_final` - katalog wynikow czytany pozniej w notebooku,
-- `--blunder-max-positions N` - ogranicza liczbe ocenianych ruchow przy probnym runie,
-- `--config PATH` - inny config turnieju, np. smoke albo ablation,
-- `--oracle-config PATH` - inny config wyroczni.
+- `--config PATH` — plik eksperymentu (domyslnie `configs/experiments/main_final.toml`),
+- `--output-dir`, `--games-per-pair`, `--base-seed` — nadpisuja wartosci z configu,
+- `--skip-blunders` — wymusza pominięcie Blunder Rate,
+- `--blunder-max-positions N` — limit ocenianych ruchow przy probnym runie,
+- `--verbose-games` — loguje kazda partie przed startem (diagnoza zawieszen).
 
 Po zakonczeniu pelnego runu notebook `notebooks/tournament_results_analysis.ipynb`
 powinien wskazywac na ten sam katalog:
@@ -348,6 +395,39 @@ powinien wskazywac na ten sam katalog:
 ```python
 RESULTS_DIR = PROJECT_ROOT / "results" / "main_final"
 ```
+
+### Turniej round-robin
+
+Skrypt `scripts/run_tournament.py` czyta config eksperymentu, buduje graczy online
+(bez plikow `.pkl`) i zapisuje m.in. `games.csv`, `moves.jsonl`, `standings.csv`:
+
+```bash
+python scripts/run_tournament.py --config configs/experiments/main_final.toml
+python scripts/run_tournament.py --config configs/experiments/smoke.toml --games-per-pair 2
+python scripts/run_tournament.py --config configs/experiments/main_final.toml --resume
+```
+
+Nadpisanie parametrow globalnych z CLI: `--output-dir`, `--games-per-pair`, `--base-seed`.
+Plik `moves.jsonl` zawiera stan przed kazdym ruchem — sluzy do pozniejszej oceny blunderow.
+
+### Wyrocznia i Blunder Rate
+
+Wyrocznia to gracz MCTS (zwykle czysty `uct`) oznaczony tagiem `ORACLE` w tym samym
+pliku configu co turniej. Skrypt `scripts/score_blunders.py` odczytuje `moves.jsonl`,
+dla kazdej wybranej pozycji uruchamia `evaluate()` wyroczni w trybie online i liczy regret:
+
+```bash
+python scripts/score_blunders.py \
+  --config configs/experiments/main_final.toml \
+  --input-dir results/main_final
+```
+
+Prog blundera (`--threshold`) i probkowanie ruchow (`--sample-every`) domyslnie biora
+wartosci z configu. Wyniki: `blunders.csv`, `blunder_summary.csv`.
+
+Neutralna wyrocznia to UCT bez FPU/LGR (`power_mean_p = 1`), zeby nie faworyzowac
+zadnej z badanych modyfikacji. Typowy budzet oceny to `iterations = 20000` w wpisie
+`ORACLE` (silniejsza maszyna); uczestnicy turnieju moga miec nizszy budzet, np. `1000`.
 
 ### Ocena pozycji (wartosc korzenia i ruchow)
 
@@ -365,7 +445,7 @@ ev.move_visits[move]                     # liczba symulacji wspierajacych dany r
 ev.regret_of(move)                       # o ile dany ruch jest gorszy od najlepszego
 ev.is_blunder(move, threshold=0.3)       # czy ruch jest blunderem
 
-# Reuzycie gotowego drzewa wyroczni bez ponownego przeszukiwania:
+# Reuzycie juz zbudowanego drzewa bez ponownego przeszukiwania (np. po self-play):
 ev = oracle.evaluate(state, run_search=False)
 ```
 
@@ -388,7 +468,7 @@ zoptymalizowane bez zmiany zachowania (zweryfikowane na 30000 losowych partiach)
 - budowa stanu nastepnego bez ponownej walidacji `__post_init__`.
 
 Efekt: przeszukiwanie UCT przyspieszylo z ~100 do ~4000 iteracji/s (rzedu 40x),
-co skraca zarowno ocene w turnieju, jak i budowanie drzewa wyroczni.
+co skraca ocene pozycji w turnieju i przy ocenie Blunder Rate.
 
 ### Gracze oparci na LLM
 
@@ -420,10 +500,9 @@ game = play_game(red=llm, yellow=oracle)
 print("nielegalne odpowiedzi:", f"{llm.illegal_move_rate:.0%}")
 ```
 
-W eksperymentach mozna uzyc nazwy `"llm"` w `create_agent`/`run_match`
-(model brany z `OPENAI_MODEL`, klucz z `OPENAI_API_KEY`, opcjonalnie
-`OPENAI_BASE_URL`). Celowo **nie** ma jej w menu GUI/CLI, zeby te tryby
-dzialaly offline.
+W eksperymentach turniejowych gracz LLM definiuje sie w pliku TOML (`type = "llm"`);
+w kodzie programowym mozna uzyc `create_llm_player` / `create_agent("llm", ...)`.
+Celowo **nie** ma typu `llm` w menu CLI (tryb offline), ale jest w GUI i configu turnieju.
 
 Przy nielegalnej/niewyparsowalnej odpowiedzi gracz ponawia zapytanie z informacja
 o bledzie, a po `max_attempts` stosuje fallback. Liczniki `requests`,

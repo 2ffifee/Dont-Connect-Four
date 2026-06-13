@@ -5,6 +5,7 @@ from connect4_mcts.players.mcts import LGRMemory, MCTSPlayer
 from connect4_mcts.training import (
     grow_player_to_memory_cap,
     load_player,
+    load_player_for_play,
     max_nodes_from_memory_gb,
     save_player,
     selfplay_train,
@@ -141,3 +142,15 @@ def test_save_and_load_preserves_learned_lgr_memory(tmp_path) -> None:
     assert loaded.rollout_policy == "lgr"
     assert len(loaded.lgr_memory) == len(player.lgr_memory)
     assert loaded.lgr_memory.replies == player.lgr_memory.replies
+
+
+def test_load_player_for_play_clears_tree_and_enables_search(tmp_path) -> None:
+    player = train_uct(iterations=30, selfplay_games=2, selfplay_iterations=20, seed=11)
+    path = tmp_path / "player.pkl"
+    save_player(player, path)
+
+    loaded = load_player_for_play(path, iterations=500)
+
+    assert loaded.simulation_mode == "search"
+    assert loaded.tree_size == 0
+    assert loaded.iterations == 500

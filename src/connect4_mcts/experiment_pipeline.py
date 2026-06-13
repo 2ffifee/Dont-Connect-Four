@@ -8,21 +8,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 
 PIPELINE_STAGES: tuple[str, ...] = (
-    "train-oracle",
-    "prepare-tournament-oracle",
-    "train-tournament-players",
     "run-tournament",
     "analyze-tournament",
     "score-blunders",
 )
 
 STAGE_ALIASES: dict[str, str] = {
-    "oracle": "train-oracle",
-    "prepare-oracle": "prepare-tournament-oracle",
-    "players": "train-tournament-players",
     "tournament": "run-tournament",
     "analyze": "analyze-tournament",
     "blunders": "score-blunders",

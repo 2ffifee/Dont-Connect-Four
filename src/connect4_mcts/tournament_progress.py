@@ -129,7 +129,6 @@ def flush_tournament_progress(
 def build_checkpoint_payload(
     *,
     config_path: str,
-    llm_config_path: str | None,
     base_seed: int,
     games_per_pair: int,
     player_ids: list[str],
@@ -137,13 +136,13 @@ def build_checkpoint_payload(
     total_pairs: int,
     pair_ids: list[str],
     status: str,
+    llm_config_path: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "version": CHECKPOINT_VERSION,
         "status": status,
         "updated_at": datetime.now(UTC).isoformat(),
         "config": config_path,
-        "llm_config": llm_config_path,
         "base_seed": base_seed,
         "games_per_pair": games_per_pair,
         "players": player_ids,
@@ -156,3 +155,6 @@ def build_checkpoint_payload(
             "pair_summary": "pair_summary.csv",
         },
     }
+    if llm_config_path is not None:
+        payload["llm_config"] = llm_config_path
+    return payload

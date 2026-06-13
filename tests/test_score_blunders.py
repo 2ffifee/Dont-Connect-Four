@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 import scripts.score_blunders as score_blunders
+from connect4_mcts.experiment_config import ORACLE_TAG, load_experiment_config
 from connect4_mcts.game import GameState, Move, MoveType, Player
 from connect4_mcts.players.mcts import MCTSPlayer, SearchEvaluation
 from connect4_mcts.training import freeze_player_for_inference
@@ -13,11 +14,11 @@ from connect4_mcts.training import freeze_player_for_inference
 class FakeOracle:
     def __init__(self) -> None:
         self.calls = 0
-        self.simulation_mode = "cache_only"
+        self.simulation_mode = "search"
 
     def evaluate(self, state, run_search: bool = True, *, retain_tree: bool = True) -> SearchEvaluation:
         self.calls += 1
-        assert run_search is False
+        assert run_search is True
         best = Move(MoveType.DROP, 0)
         blunder = Move(MoveType.PUSH, 1)
         return SearchEvaluation(
@@ -31,11 +32,24 @@ class FakeOracle:
 
 def test_score_blunders_writes_move_and_summary_outputs(monkeypatch, tmp_path) -> None:
     oracle = FakeOracle()
-    monkeypatch.setattr(
-        score_blunders,
-        "load_player",
-        lambda path, inference_only=False: oracle,
+    config_path = tmp_path / "experiment.toml"
+    config_path.write_text(
+        """
+seed = 0
+output_dir = "results"
+games_per_pair = 1
+blunder_threshold = 0.3
+
+[[players]]
+id = "oracle"
+type = "uct"
+tags = ["ORACLE"]
+iterations = 100
+""".strip(),
+        encoding="utf-8",
     )
+    monkeypatch.setattr(score_blunders, "instantiate_player", lambda spec, game_seed=None: oracle)
+
     input_dir = tmp_path / "tournament"
     input_dir.mkdir()
     moves_path = input_dir / "moves.jsonl"
@@ -43,12 +57,10 @@ def test_score_blunders_writes_move_and_summary_outputs(monkeypatch, tmp_path) -
 
     result = score_blunders.main(
         [
-            "--oracle",
-            "fake-oracle.pkl",
+            "--config",
+            str(config_path),
             "--input-dir",
             str(input_dir),
-            "--threshold",
-            "0.3",
         ]
     )
 
@@ -75,6 +87,34 @@ def test_score_blunders_writes_move_and_summary_outputs(monkeypatch, tmp_path) -
     assert by_agent["uct"]["blunders"] == "0"
     assert by_agent["llm"]["blunders"] == "1"
     assert float(by_agent["llm"]["blunder_rate"]) == pytest.approx(1.0)
+
+
+def test_load_experiment_config_parses_oracle_tag(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+seed = 1
+output_dir = "out"
+games_per_pair = 5
+
+[[players]]
+id = "uct"
+type = "uct"
+iterations = 500
+
+[[players]]
+id = "ref"
+type = "uct"
+tags = "ORACLE"
+iterations = 10000
+""".strip(),
+        encoding="utf-8",
+    )
+    config = load_experiment_config(config_path)
+    assert config.games_per_pair == 5
+    assert config.oracle_player() is not None
+    assert config.oracle_player().id == "ref"
+    assert ORACLE_TAG in config.oracle_player().tags
 
 
 def test_state_cache_key_is_hashable_with_nested_segments() -> None:

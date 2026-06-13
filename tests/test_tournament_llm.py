@@ -2,7 +2,6 @@ from connect4_mcts.game import GameState
 from connect4_mcts.players import MockLLMClient, RandomPlayer
 from connect4_mcts.players.llm import LLMPlayer
 from connect4_mcts.runner import play_game, prepare_agents_for_game
-from connect4_mcts.tournament_config import load_llm_tournament_entries
 
 
 def test_prepare_agents_for_game_runs_llm_rules_briefing_for_both_colors() -> None:
@@ -36,17 +35,29 @@ def test_play_game_invokes_prepare_agents_for_game() -> None:
     prepare.assert_called_once()
 
 
-def test_load_llm_tournament_entries_uses_server_defaults() -> None:
-    entries = load_llm_tournament_entries(
-        {
-            "server": {"base_url": "http://localhost:11434/v1", "api_key": "", "timeout": 120.0},
-            "models": [{"id": "test", "model": "llama3.2"}],
-        }
-    )
+def test_experiment_config_parses_llm_player(tmp_path) -> None:
+    from connect4_mcts.experiment_config import load_experiment_config
 
-    assert len(entries) == 1
-    assert entries[0]["id"] == "llm-test"
-    assert entries[0]["kind"] == "llm"
-    assert entries[0]["model"] == "llama3.2"
-    assert entries[0]["base_url"] == "http://localhost:11434/v1"
-    assert entries[0]["timeout"] == 120.0
+    config_path = tmp_path / "llm.toml"
+    config_path.write_text(
+        """
+seed = 0
+output_dir = "results"
+games_per_pair = 1
+
+[[players]]
+id = "llm-test"
+type = "llm"
+model = "llama3.2"
+base_url = "http://localhost:11434/v1"
+timeout = 120.0
+""".strip(),
+        encoding="utf-8",
+    )
+    config = load_experiment_config(config_path)
+    llm = config.players[0]
+    assert llm.id == "llm-test"
+    assert llm.type == "llm"
+    assert llm.params["model"] == "llama3.2"
+    assert llm.params["base_url"] == "http://localhost:11434/v1"
+    assert llm.params["timeout"] == 120.0

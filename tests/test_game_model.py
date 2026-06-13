@@ -215,7 +215,7 @@ def test_line_counts_include_both_players() -> None:
     }
 
 
-def test_first_player_gets_fair_turn_when_their_move_creates_a_line() -> None:
+def test_own_line_completes_immediate_loss() -> None:
     state = GameState(
         board=board_from_rows(
             "........",
@@ -231,114 +231,33 @@ def test_first_player_gets_fair_turn_when_their_move_creates_a_line() -> None:
 
     after_move = state.apply_move(Move(MoveType.DROP, 3))
 
-    assert after_move.status is GameStatus.FAIR_TURN
-    assert after_move.current_player is Player.YELLOW
-    assert after_move.result is None
+    assert after_move.status is GameStatus.FINISHED
+    assert after_move.result is not None
+    assert after_move.result.winner is Player.YELLOW
     assert after_move.line_counts()[Player.RED] == 1
     assert after_move.protected_segments
 
 
-def test_fair_turn_allows_breaking_existing_lines() -> None:
+def test_opponent_line_formed_is_immediate_loss_for_line_owner() -> None:
     state = GameState(
         board=board_from_rows(
             "........",
-            "........",
-            "........",
-            "........",
-            "........",
-            "RRR.....",
+            ".Y......",
+            "Y.......",
+            "Y.......",
+            "Y.......",
+            "Y.......",
         ),
         current_player=Player.RED,
         first_player=Player.RED,
     )
 
-    fair_turn = state.apply_move(Move(MoveType.DROP, 3))
+    after = state.apply_move(Move(MoveType.PUSH, 0))
 
-    assert Move(MoveType.PUSH, 0) in fair_turn.legal_moves()
-    broken = fair_turn.apply_move(Move(MoveType.PUSH, 0))
-    assert broken.status is GameStatus.FINISHED
-    assert broken.result is not None
-    assert broken.result.winner is Player.YELLOW
-    assert broken.line_counts()[Player.RED] == 1
-    assert broken.count_lines(Player.RED) == 0
-
-
-def test_fair_turn_move_finishes_game_and_player_with_more_lines_loses() -> None:
-    state = GameState(
-        board=board_from_rows(
-            "........",
-            "........",
-            "........",
-            "........",
-            "........",
-            "RRR.....",
-        ),
-        current_player=Player.RED,
-        first_player=Player.RED,
-    )
-
-    fair_turn = state.apply_move(Move(MoveType.DROP, 3))
-    finished = fair_turn.apply_move(Move(MoveType.DROP, 7))
-
-    assert finished.status is GameStatus.FINISHED
-    assert finished.current_player is Player.RED
-    assert finished.result.winner is Player.YELLOW
-    assert finished.result.red_lines == 1
-    assert finished.result.yellow_lines == 0
-    assert not finished.result.is_draw
-    assert finished.result.lines_for(Player.RED) == 1
-
-
-def test_fair_turn_equal_line_counts_on_full_board_finishes_game() -> None:
-    fair_turn = GameState(
-        board=board_from_rows(
-            "Y.YRYRYR",
-            "YYRRYYYY",
-            "RRRYRYRR",
-            "YYYRYYRR",
-            "YRRYRRYY",
-            "RRRYRRYR",
-        ),
-        current_player=Player.YELLOW,
-        first_player=Player.RED,
-        status=GameStatus.FAIR_TURN,
-        red_line_total=3,
-        yellow_line_total=3,
-        move_count=50,
-    )
-
-    finished = fair_turn.apply_move(Move(MoveType.PUSH, 1))
-
-    assert finished.status is GameStatus.FINISHED
-    assert finished.legal_moves() == ()
-    assert finished.result is not None
-    assert finished.line_counts() == {Player.RED: 4, Player.YELLOW: 4}
-    assert finished.result.winner is None
-
-
-def test_fair_turn_equal_line_counts_let_game_continue() -> None:
-    state = GameState(
-        board=board_from_rows(
-            "........",
-            "........",
-            "........",
-            "........",
-            "........",
-            "RRR.YYYY",
-        ),
-        current_player=Player.RED,
-        first_player=Player.RED,
-    )
-
-    fair_turn = state.apply_move(Move(MoveType.DROP, 3))
-    assert fair_turn.status is GameStatus.FAIR_TURN
-    assert fair_turn.line_counts() == {Player.RED: 1, Player.YELLOW: 1}
-
-    continued = fair_turn.apply_move(Move(MoveType.DROP, 0))
-
-    assert continued.status is GameStatus.ONGOING
-    assert continued.result is None
-    assert continued.line_counts() == {Player.RED: 1, Player.YELLOW: 1}
+    assert after.status is GameStatus.FINISHED
+    assert after.result is not None
+    assert after.result.winner is Player.RED
+    assert after.line_counts()[Player.YELLOW] == 2
 
 
 def test_count_lines_six_in_a_row_counts_as_three_segments() -> None:
@@ -358,7 +277,7 @@ def test_equal_line_counts_is_draw() -> None:
     assert _winner_from_counts({Player.RED: 3, Player.YELLOW: 3}) is None
 
 
-def test_game_continues_when_equal_line_counts_after_line() -> None:
+def test_game_continues_when_move_does_not_complete_a_line() -> None:
     state = GameState(
         board=board_from_rows(
             "........",
@@ -379,7 +298,7 @@ def test_game_continues_when_equal_line_counts_after_line() -> None:
     assert after.protected_segments
 
 
-def test_second_player_line_finishes_game_without_extra_turn() -> None:
+def test_second_player_own_line_is_immediate_loss() -> None:
     state = GameState(
         board=board_from_rows(
             "........",
@@ -414,31 +333,6 @@ def test_unfinished_game_rejects_result() -> None:
 def test_game_result_rejects_negative_line_counts() -> None:
     with pytest.raises(ValueError, match="negative"):
         GameResult(winner=None, red_lines=-1, yellow_lines=0)
-
-
-def test_fair_turn_not_triggered_when_opponent_line_formed_on_same_move() -> None:
-    state = GameState(
-        board=board_from_rows(
-            "........",
-            ".Y......",
-            "Y.......",
-            "Y.......",
-            "Y.......",
-            "Y.......",
-        ),
-        current_player=Player.RED,
-        first_player=Player.RED,
-    )
-
-    after = state.apply_move(Move(MoveType.PUSH, 0))
-
-    assert after.status is GameStatus.FINISHED
-    assert after.status is not GameStatus.FAIR_TURN
-    assert after.result is not None
-    assert after.result.winner is Player.RED
-    assert after.line_counts()[Player.YELLOW] == 2
-
-
 def test_cumulative_line_total_persists_after_line_is_broken() -> None:
     state = GameState(
         board=board_from_rows(

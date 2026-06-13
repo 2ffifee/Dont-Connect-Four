@@ -1,61 +1,34 @@
 # Small experiment for validating the tournament pipeline locally.
 #
-# Train the small MCTS pickles first:
-#   python scripts/train_tournament_grid.py --config configs/experiments/smoke.toml --resume
-#
-# Then run a tiny tournament:
-#   python scripts/run_tournament.py --config configs/experiments/smoke.toml --games-per-pair 2 --base-seed 0 --no-llm --output-dir results/smoke
+#   python scripts/run_tournament.py --config configs/experiments/smoke.toml
+#   python scripts/run_full_experiment.py --config configs/experiments/smoke.toml
 
-[defaults]
-play_iterations = 250
-build_iterations = 125
-selfplay_temperature = 1.0
-exploration = 1.4142135623730951
-power_mean_p = 1.0
-final_move = "robust"
-rollout_policy = "random"
 seed = 0
-bytes_per_node = 2867.0
-safety_fraction = 0.85
-max_selfplay_games = 6
-max_minutes = 10.0
-checkpoint_every_games = 1
-output_dir = "models/experiments/smoke"
+output_dir = "results/smoke"
+games_per_pair = 2
+blunder_threshold = 0.3
+blunder_sample_every = 1
 
 [[players]]
-id = "random"
-kind = "builtin"
-builtin = "random"
+id = "random-a"
+type = "random"
+
+[[players]]
+id = "random-b"
+type = "random"
 
 [[players]]
 id = "minimax-d2"
-kind = "builtin"
-builtin = "minimax"
+type = "minimax"
 depth = 2
 
 [[players]]
-id = "uct-m0"
-kind = "mcts"
-algorithm = "uct"
-memory_gb = 0.3
+id = "uct"
+type = "uct"
+iterations = 50
 
 [[players]]
-id = "fpu-1.0-m0"
-kind = "mcts"
-algorithm = "fpu"
-memory_gb = 0.3
-fpu = 1.0
-
-[[players]]
-id = "pmbp-2.5-m0"
-kind = "mcts"
-algorithm = "pmbp"
-memory_gb = 0.3
-power_mean_p = 2.5
-
-[[players]]
-id = "lgr-m0"
-kind = "mcts"
-algorithm = "lgr"
-memory_gb = 0.3
-rollout_policy = "lgr"
+id = "oracle"
+type = "uct"
+tags = ["ORACLE"]
+iterations = 100

@@ -15,6 +15,7 @@ import pygame
 
 from connect4_mcts.game import COLUMNS, ROWS, GameResult, GameState, GameStatus, IllegalMoveError, Move, MoveType, Player
 from connect4_mcts.players import AGENT_CHOICES, Agent, AgentName, create_agent, format_agent_name
+from connect4_mcts.players.factory import DEFAULT_EXPLORATION, DEFAULT_FPU, DEFAULT_POWER_MEAN_P
 
 
 CELL_SIZE = 72
@@ -44,6 +45,20 @@ BUTTON_GAP = 8
 SETUP_BUTTON_WIDTH = 132
 SETUP_BUTTON_HEIGHT = 42
 SETUP_BUTTON_GAP = 16
+MCTS_AGENT_NAMES = frozenset({"uct", "fpu", "lgr", "pmbp"})
+DEFAULT_MCTS_ITERATIONS = 400
+HYPER_LABEL_TO_CONTROL = 30
+HYPER_ROW_GAP = 22
+HYPER_ROW_GAP_MULTI = 28
+HYPER_SECTION_TOP_GAP = 18
+HYPER_BEFORE_START_GAP = 28
+
+
+def _hyper_row_stride(*, multi: bool) -> int:
+    return HYPER_LABEL_TO_CONTROL + SETUP_BUTTON_HEIGHT + (HYPER_ROW_GAP_MULTI if multi else HYPER_ROW_GAP)
+
+
+SETUP_BASE_BLOCK_HEIGHT = 760
 
 BACKGROUND = (245, 247, 250)
 BOARD_COLOR = (30, 91, 168)
@@ -307,9 +322,13 @@ class GuiConfig:
     agent_name: AgentName = "random"
     seed: int | None = None
     depth: int = 3
+    iterations: int = DEFAULT_MCTS_ITERATIONS
+    exploration: float = DEFAULT_EXPLORATION
+    fpu: float = DEFAULT_FPU
+    power_mean_p: float = DEFAULT_POWER_MEAN_P
+    llm_temperature: float = 1.0
+    llm_max_tokens: int | None = None
     two_player: bool = False
-    loaded_agent: Agent | None = None
-    loaded_label: str | None = None
     llm_agent: Agent | None = None
     llm_model: str | None = None
     llm_base_url: str | None = None
@@ -317,6 +336,78 @@ class GuiConfig:
     llm_label: str | None = None
     llm_cot_enabled: bool = False
     enable_undo: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SetupHyperParam:
+    key: str
+    label: str
+    step: float
+    minimum: float
+    is_int: bool = True
+    optional: bool = False
+
+
+def setup_hyperparams_for(agent_name: AgentName) -> tuple[SetupHyperParam, ...]:
+    iterations = SetupHyperParam("iterations", "MCTS iterations per move", 50, 50, True)
+    exploration = SetupHyperParam("exploration", "Exploration C", 0.1, 0.0, False)
+    if agent_name == "random":
+        return (SetupHyperParam("seed", "Random seed", 1, 0, True, optional=True),)
+    if agent_name == "minimax":
+        return (SetupHyperParam("depth", "Minimax depth", 1, 1, True),)
+    if agent_name == "uct":
+        return (iterations, exploration)
+    if agent_name == "fpu":
+        return (iterations, exploration, SetupHyperParam("fpu", "FPU value", 0.1, 0.0, False))
+    if agent_name == "lgr":
+        return (iterations, exploration)
+    if agent_name == "pmbp":
+        return (
+            iterations,
+            exploration,
+            SetupHyperParam("power_mean_p", "Power-mean p", 0.1, 0.1, False),
+        )
+    if agent_name == "llm":
+        return (
+            SetupHyperParam("llm_temperature", "LLM temperature", 0.1, 0.0, False),
+            SetupHyperParam("llm_max_tokens", "LLM max tokens", 256, 256, True, optional=True),
+        )
+    return ()
+
+
+def format_hyperparam_value(spec: SetupHyperParam, value: object) -> str:
+    if spec.optional and value is None:
+        return "Default" if spec.key == "llm_max_tokens" else "Auto"
+    if spec.is_int:
+        return str(int(value))  # type: ignore[arg-type]
+    number = float(value)  # type: ignore[arg-type]
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def adjust_hyperparam(config: GuiConfig, spec: SetupHyperParam, direction: int) -> None:
+    if direction not in {-1, 1}:
+        raise ValueError("direction must be -1 or 1")
+
+    current = getattr(config, spec.key)
+    if spec.optional and spec.is_int:
+        if current is None:
+            if direction > 0:
+                setattr(config, spec.key, int(spec.minimum) if spec.minimum else 1)
+            return
+        next_value = int(current) + direction * int(spec.step)
+        if next_value < int(spec.minimum):
+            setattr(config, spec.key, None)
+        else:
+            setattr(config, spec.key, next_value)
+        return
+
+    if spec.is_int:
+        next_value = int(current) + direction * int(spec.step)  # type: ignore[arg-type]
+        setattr(config, spec.key, max(int(spec.minimum), next_value))
+        return
+
+    next_value = float(current) + direction * spec.step  # type: ignore[arg-type]
+    setattr(config, spec.key, max(spec.minimum, round(next_value, 4)))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -332,8 +423,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--human", choices=("red", "yellow"), default="red", help="Human player color.")
     parser.add_argument("--agent", choices=AGENT_CHOICES, default="random", help="Initial opponent selection.")
     parser.add_argument("--depth", type=int, default=3, help="Search depth for minimax.")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=DEFAULT_MCTS_ITERATIONS,
+        help="MCTS search budget per move for uct/fpu/lgr/pmbp opponents.",
+    )
+    parser.add_argument("--exploration", type=float, default=DEFAULT_EXPLORATION, help="MCTS exploration constant C.")
+    parser.add_argument("--fpu", type=float, default=DEFAULT_FPU, help="FPU value for the fpu opponent.")
+    parser.add_argument(
+        "--power-mean-p",
+        type=float,
+        default=DEFAULT_POWER_MEAN_P,
+        help="Power-mean p for the pmbp opponent.",
+    )
     parser.add_argument("--two-player", action="store_true", help="Start in local two-player mode.")
-    parser.add_argument("--load", default=None, help="Path to a pickled trained player to use as opponent.")
     parser.add_argument("--llm", action="store_true", help="Use an LLM (OpenAI-compatible) opponent.")
     parser.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model name (with --llm).")
     parser.add_argument(
@@ -342,6 +446,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Base URL of an OpenAI-compatible server, e.g. http://localhost:11434/v1 (with --llm). "
         "API key is read from OPENAI_API_KEY.",
     )
+    parser.add_argument("--llm-temperature", type=float, default=1.0, help="Sampling temperature for --llm.")
+    parser.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=0,
+        help="Max completion tokens for --llm (0 = provider default).",
+    )
     args = parser.parse_args(argv)
 
     config = GuiConfig(
@@ -349,22 +460,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         agent_name=args.agent,
         seed=args.seed,
         depth=args.depth,
+        iterations=max(1, args.iterations),
+        exploration=max(0.0, args.exploration),
+        fpu=max(0.0, args.fpu),
+        power_mean_p=max(0.1, args.power_mean_p),
+        llm_temperature=max(0.0, args.llm_temperature),
+        llm_max_tokens=None if args.llm_max_tokens <= 0 else args.llm_max_tokens,
         two_player=args.two_player,
         enable_undo=True,
     )
-    if args.load:
-        from connect4_mcts.training import load_player
-
-        config.loaded_agent = load_player(args.load, inference_only=True)
-        config.loaded_label = os.path.basename(args.load)
-        config.agent_name = "loaded"
 
     if args.llm:
         from connect4_mcts.players.llm import create_llm_player, model_exposes_thinking
 
         config.llm_model = args.llm_model
         config.llm_base_url = args.llm_base_url
-        config.llm_agent = create_llm_player(args.llm_model, base_url=args.llm_base_url)
+        config.llm_agent = create_llm_player(
+            args.llm_model,
+            base_url=args.llm_base_url,
+            temperature=config.llm_temperature,
+            max_tokens=config.llm_max_tokens,
+        )
         config.llm_label = f"LLM: {args.llm_model}"
         config.agent_name = "llm"
         config.llm_cot_enabled = model_exposes_thinking(args.llm_base_url, args.llm_model)
@@ -397,7 +513,7 @@ class HumanVsAgentGui:
         self.config = config or GuiConfig()
         self.mode: ScreenMode = "setup"
         self.state = GameState.new(first_player=Player.RED)
-        self.agent: Agent = self._make_agent()
+        self.agent: Agent | None = None
         self.selected_move_type = MoveType.DROP
         self.message = ""
         self.llm_awaiting_rules_ack = False
@@ -595,8 +711,6 @@ class HumanVsAgentGui:
         self._maybe_schedule_agent_turn()
 
     def _opponent_label(self) -> str:
-        if self.config.agent_name == "loaded" and self.config.loaded_label:
-            return _shorten(self.config.loaded_label, 28)
         if self.config.agent_name == "llm" and self.config.llm_label:
             return _shorten(self.config.llm_label, 28)
         return format_agent_name(self.config.agent_name)
@@ -736,6 +850,9 @@ class HumanVsAgentGui:
             self.agent.rules_acknowledged = True
 
     def _start_game(self) -> None:
+        if self.config.agent_name == "llm" and self.config.llm_model is None:
+            self.message = "Configure an LLM opponent first"
+            return
         self._invalidate_async_work()
         self.state = GameState.new(first_player=Player.RED)
         self._undo_stack = [self.state] if self._undo_history_enabled() else None
@@ -772,14 +889,19 @@ class HumanVsAgentGui:
         return False
 
     def _make_agent(self) -> Agent:
-        if self.config.agent_name == "loaded" and self.config.loaded_agent is not None:
-            return self.config.loaded_agent
         if self.config.agent_name == "llm":
-            if self.config.llm_agent is None and self.config.llm_model is not None:
-                self.config.llm_agent = self._make_llm_agent()
-            if self.config.llm_agent is not None:
-                return self.config.llm_agent
-        return create_agent(self.config.agent_name, seed=self.config.seed, depth=self.config.depth)
+            if self.config.llm_model is None:
+                raise ValueError("LLM opponent is not configured")
+            return self._make_llm_agent()
+        return create_agent(
+            self.config.agent_name,
+            seed=self.config.seed,
+            depth=self.config.depth,
+            iterations=self.config.iterations,
+            exploration=self.config.exploration,
+            fpu=self.config.fpu,
+            power_mean_p=self.config.power_mean_p,
+        )
 
     def _make_llm_agent(self) -> Agent:
         from connect4_mcts.players.llm import create_llm_player
@@ -789,6 +911,8 @@ class HumanVsAgentGui:
             api_key=self.config.llm_api_key,
             base_url=self.config.llm_base_url,
             seed=self.config.seed,
+            temperature=self.config.llm_temperature,
+            max_tokens=self.config.llm_max_tokens,
         )
 
     def _reset_llm_conversation(self) -> None:
@@ -797,25 +921,6 @@ class HumanVsAgentGui:
         begin_new_game = getattr(self.agent, "begin_new_game", None)
         if callable(begin_new_game):
             begin_new_game()
-
-    def _load_player_from_file(self) -> None:
-        path = _prompt_player_file()
-        if not path:
-            self.message = "Load cancelled (or no file dialog)"
-            return
-
-        from connect4_mcts.training import load_player
-
-        try:
-            agent = load_player(path, inference_only=True)
-        except Exception:  # noqa: BLE001 - surface any load failure to the user
-            self.message = "Failed to load player"
-            return
-
-        self.config.loaded_agent = agent
-        self.config.loaded_label = os.path.basename(path)
-        self.config.agent_name = "loaded"
-        self.message = ""
 
     def _configure_llm_opponent(self) -> None:
         connection = _prompt_llm_connection()
@@ -856,12 +961,7 @@ class HumanVsAgentGui:
         self.config.llm_model = model
         self.config.llm_base_url = client.base_url
         self.config.llm_api_key = api_key or None
-        self.config.llm_agent = create_llm_player(
-            model,
-            api_key=api_key or None,
-            base_url=client.base_url,
-            seed=self.config.seed,
-        )
+        self.config.llm_agent = None
 
         remember_endpoint(base_url)
         from connect4_mcts.players.llm import model_exposes_thinking
@@ -895,18 +995,32 @@ class HumanVsAgentGui:
         if rects["agent_minimax"].collidepoint(position):
             self.config.agent_name = "minimax"
             return
-        if rects["load"].collidepoint(position):
-            self._load_player_from_file()
+        if rects["agent_uct"].collidepoint(position):
+            self.config.agent_name = "uct"
+            return
+        if rects["agent_fpu"].collidepoint(position):
+            self.config.agent_name = "fpu"
+            return
+        if rects["agent_lgr"].collidepoint(position):
+            self.config.agent_name = "lgr"
+            return
+        if rects["agent_pmbp"].collidepoint(position):
+            self.config.agent_name = "pmbp"
             return
         if rects["llm"].collidepoint(position):
             self._configure_llm_opponent()
             return
-        if rects["depth_minus"].collidepoint(position):
-            self.config.depth = max(1, self.config.depth - 1)
-            return
-        if rects["depth_plus"].collidepoint(position):
-            self.config.depth += 1
-            return
+        for row in rects["hyper_rows"]:
+            if row["minus"].collidepoint(position):
+                adjust_hyperparam(self.config, row["spec"], -1)
+                if self.config.agent_name == "llm":
+                    self.config.llm_agent = None
+                return
+            if row["plus"].collidepoint(position):
+                adjust_hyperparam(self.config, row["spec"], 1)
+                if self.config.agent_name == "llm":
+                    self.config.llm_agent = None
+                return
         if rects["start"].collidepoint(position):
             self._start_game()
 
@@ -1073,18 +1187,27 @@ class HumanVsAgentGui:
         self._draw_setup_label("Opponent", rects["opponent_label_y"], center_x)
         self._draw_button(rects["agent_random"], "Random", self.config.agent_name == "random")
         self._draw_button(rects["agent_minimax"], "Minimax", self.config.agent_name == "minimax")
-
-        load_label = _shorten(self.config.loaded_label) if self.config.loaded_label else "Load player..."
-        self._draw_button(rects["load"], load_label, self.config.agent_name == "loaded")
+        self._draw_button(rects["agent_uct"], "UCT", self.config.agent_name == "uct")
+        self._draw_button(rects["agent_fpu"], "FPU", self.config.agent_name == "fpu")
+        self._draw_button(rects["agent_lgr"], "LGR", self.config.agent_name == "lgr")
+        self._draw_button(rects["agent_pmbp"], "PMBp", self.config.agent_name == "pmbp")
 
         llm_label = _shorten(self.config.llm_label) if self.config.llm_label else "Play vs LLM..."
         self._draw_button(rects["llm"], llm_label, self.config.agent_name == "llm")
 
-        self._draw_setup_label("Minimax depth", rects["depth_label_y"], center_x)
-        self._draw_button(rects["depth_minus"], "-", False)
-        depth = self.font.render(str(self.config.depth), True, TEXT)
-        self.screen.blit(depth, depth.get_rect(center=rects["depth_value"].center))
-        self._draw_button(rects["depth_plus"], "+", False)
+        if not self.config.two_player:
+            if rects["hyper_section_label_y"] is not None:
+                self._draw_setup_label("Agent settings", rects["hyper_section_label_y"], center_x)
+            for row in rects["hyper_rows"]:
+                self._draw_setup_label(row["spec"].label, row["label_y"], center_x)
+                self._draw_button(row["minus"], "-", False)
+                value = self.font.render(
+                    format_hyperparam_value(row["spec"], getattr(self.config, row["spec"].key)),
+                    True,
+                    TEXT,
+                )
+                self.screen.blit(value, value.get_rect(center=row["value"].center))
+                self._draw_button(row["plus"], "+", False)
 
         self._draw_button(rects["start"], "Start", True)
 
@@ -1176,16 +1299,29 @@ class HumanVsAgentGui:
     def _menu_button_rect(self) -> pygame.Rect:
         return self._control_button_rect(4)
 
+    def _hyperparam_specs(self) -> tuple[SetupHyperParam, ...]:
+        if self.config.two_player:
+            return ()
+        return setup_hyperparams_for(self.config.agent_name)
+
     def _setup_rects(self) -> dict[str, object]:
         center_x = self.width // 2
         pair_width = 2 * SETUP_BUTTON_WIDTH + SETUP_BUTTON_GAP
         pair_left = center_x - pair_width // 2
         pair_right_left = pair_left + SETUP_BUTTON_WIDTH + SETUP_BUTTON_GAP
 
-        block_height = 700
-        top = max(16, (self.height - block_height) // 2)
+        specs = self._hyperparam_specs()
+        multi_hyper = len(specs) > 1
+        hyper_stride = _hyper_row_stride(multi=multi_hyper)
         label_to_button = 28
         row_gap = 22
+        hyper_section_height = 0
+        if specs:
+            hyper_section_height += HYPER_SECTION_TOP_GAP + label_to_button
+            hyper_section_height += len(specs) * hyper_stride
+            hyper_section_height += HYPER_BEFORE_START_GAP
+        block_height = SETUP_BASE_BLOCK_HEIGHT + hyper_section_height
+        top = max(16, (self.height - block_height) // 2)
 
         def pair(top_y: int) -> tuple[pygame.Rect, pygame.Rect]:
             left_rect = pygame.Rect(pair_left, top_y, SETUP_BUTTON_WIDTH, SETUP_BUTTON_HEIGHT)
@@ -1207,17 +1343,33 @@ class HumanVsAgentGui:
         opponent_label_y = cursor
         agent_random, agent_minimax = pair(cursor + label_to_button)
         cursor += label_to_button + SETUP_BUTTON_HEIGHT + 10
-        load = pygame.Rect(pair_left, cursor, pair_width, SETUP_BUTTON_HEIGHT)
+        agent_uct, agent_fpu = pair(cursor)
+        cursor += SETUP_BUTTON_HEIGHT + 10
+        agent_lgr, agent_pmbp = pair(cursor)
         cursor += SETUP_BUTTON_HEIGHT + 10
         llm = pygame.Rect(pair_left, cursor, pair_width, SETUP_BUTTON_HEIGHT)
         cursor += SETUP_BUTTON_HEIGHT + row_gap
 
-        depth_label_y = cursor
-        depth_top = cursor + label_to_button
-        depth_minus = pygame.Rect(center_x - 92, depth_top, 54, SETUP_BUTTON_HEIGHT)
-        depth_value = pygame.Rect(center_x - 27, depth_top, 54, SETUP_BUTTON_HEIGHT)
-        depth_plus = pygame.Rect(center_x + 38, depth_top, 54, SETUP_BUTTON_HEIGHT)
-        cursor = depth_top + SETUP_BUTTON_HEIGHT + row_gap
+        hyper_section_label_y: int | None = None
+        hyper_rows: list[dict[str, object]] = []
+        if specs:
+            cursor += HYPER_SECTION_TOP_GAP
+            hyper_section_label_y = cursor
+            cursor += label_to_button
+            for spec in specs:
+                label_y = cursor
+                control_top = cursor + HYPER_LABEL_TO_CONTROL
+                hyper_rows.append(
+                    {
+                        "spec": spec,
+                        "label_y": label_y,
+                        "minus": pygame.Rect(center_x - 92, control_top, 54, SETUP_BUTTON_HEIGHT),
+                        "value": pygame.Rect(center_x - 27, control_top, 54, SETUP_BUTTON_HEIGHT),
+                        "plus": pygame.Rect(center_x + 38, control_top, 54, SETUP_BUTTON_HEIGHT),
+                    }
+                )
+                cursor += hyper_stride
+            cursor += HYPER_BEFORE_START_GAP
 
         start = pygame.Rect(center_x - 90, cursor, 180, 50)
 
@@ -1233,39 +1385,15 @@ class HumanVsAgentGui:
             "opponent_label_y": opponent_label_y,
             "agent_random": agent_random,
             "agent_minimax": agent_minimax,
-            "load": load,
+            "agent_uct": agent_uct,
+            "agent_fpu": agent_fpu,
+            "agent_lgr": agent_lgr,
+            "agent_pmbp": agent_pmbp,
             "llm": llm,
-            "depth_label_y": depth_label_y,
-            "depth_minus": depth_minus,
-            "depth_value": depth_value,
-            "depth_plus": depth_plus,
+            "hyper_section_label_y": hyper_section_label_y,
+            "hyper_rows": hyper_rows,
             "start": start,
         }
-
-
-def _prompt_player_file() -> str | None:
-    """Open a native file dialog to pick a pickled player.
-
-    Uses tkinter (standard library). Returns ``None`` if the user cancels or no
-    dialog backend is available, in which case ``--load`` can be used instead.
-    """
-    try:
-        import tkinter
-        from tkinter import filedialog
-    except Exception:  # noqa: BLE001 - tkinter may be missing on some systems
-        return None
-
-    try:
-        root = tkinter.Tk()
-        root.withdraw()
-        path = filedialog.askopenfilename(
-            title="Load trained player",
-            filetypes=[("Pickled player", "*.pkl"), ("All files", "*.*")],
-        )
-        root.destroy()
-        return path or None
-    except Exception:  # noqa: BLE001 - dialog can fail on headless/odd setups
-        return None
 
 
 def _prompt_llm_connection() -> tuple[str, str] | None:
@@ -1562,8 +1690,6 @@ def gui_status_message(
     else:
         actor = f"{format_agent_name(agent_name)} turn"
 
-    if state.status is GameStatus.FAIR_TURN:
-        return f"{actor} - fair turn"
     return actor
 
 

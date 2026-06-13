@@ -30,6 +30,8 @@ from connect4_mcts.players import (
 from connect4_mcts.runner import GameRunnerError, MoveRecord, PlayedGame, play_game
 from connect4_mcts.training import (
     load_player,
+    load_player_for_play,
+    prepare_player_for_online_play,
     save_player,
     selfplay_train,
     train_fpu,
@@ -66,7 +68,9 @@ __all__ = [
     "SearchEvaluation",
     "empty_board",
     "load_player",
+    "load_player_for_play",
     "play_game",
+    "prepare_player_for_online_play",
     "save_player",
     "selfplay_train",
     "train_fpu",

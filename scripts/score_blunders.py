@@ -1,15 +1,15 @@
 """Score tournament moves with an oracle and compute Blunder Rate.
 
 The script reads ``moves.jsonl`` produced by ``scripts/run_tournament.py``. For
-each selected move it reconstructs the pre-move game state, asks a saved oracle
-player to evaluate the legal moves, and writes one row with the chosen move
-value, oracle best move, regret and blunder flag.
+each selected move it reconstructs the pre-move game state, runs the oracle MCTS
+player in online search mode, and writes regret / blunder flags.
+
+The oracle is defined in the experiment config as the player tagged ``ORACLE``.
 
 Usage::
 
-    python scripts/score_blunders.py --oracle models/oracle_uct.pkl --input-dir results/main_final
-    python scripts/score_blunders.py --oracle models/oracle_uct.pkl --moves results/main_final/moves.jsonl --output results/main_final/blunders.csv
-    python scripts/score_blunders.py --oracle models/oracle_uct.pkl --input-dir results/main_final --max-positions 1000 --sample-every 3
+    python scripts/score_blunders.py --config configs/experiments/main_final.toml --input-dir results/main_final
+    python scripts/score_blunders.py --config configs/experiments/main_final.toml --moves results/main_final/moves.jsonl
 """
 
 from __future__ import annotations
@@ -25,14 +25,18 @@ from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from connect4_mcts.experiment_config import load_experiment_config, instantiate_player
 from connect4_mcts.game import Board, GameState, GameStatus, Move, MoveType, Player
 from connect4_mcts.players.mcts import SearchEvaluation
-from connect4_mcts.training import load_player
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Score tournament moves with an oracle.")
-    parser.add_argument("--oracle", required=True, help="Path to a saved oracle player pickle.")
+    parser.add_argument(
+        "--config",
+        default="",
+        help="Experiment config with one player tagged ORACLE (required unless testing with mocks).",
+    )
     parser.add_argument("--input-dir", default="", help="Tournament output directory with moves.jsonl.")
     parser.add_argument("--moves", default="", help="Path to moves.jsonl. Overrides --input-dir.")
     parser.add_argument("--output", default="", help="Path to blunders.csv. Defaults to input dir.")
@@ -41,42 +45,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="",
         help="Path to blunder_summary.csv. Defaults next to --output.",
     )
-    parser.add_argument("--threshold", type=float, default=0.3, help="Regret threshold for a blunder.")
+    parser.add_argument("--threshold", type=float, default=None, help="Regret threshold; defaults to config value.")
     parser.add_argument("--max-positions", type=int, default=0, help="Maximum scored rows; 0 means all selected rows.")
-    parser.add_argument("--sample-every", type=int, default=1, help="Score every Nth move row.")
-    parser.add_argument(
-        "--run-search",
-        action="store_true",
-        help=(
-            "Run new MCTS simulations for positions missing from the oracle tree "
-            "(default: lookup-only from the saved pickle)."
-        ),
-    )
+    parser.add_argument("--sample-every", type=int, default=None, help="Score every Nth move row; defaults to config.")
     parser.add_argument("--progress-every", type=int, default=100, help="Print progress every N scored positions.")
     args = parser.parse_args(argv)
 
-    if args.threshold < 0:
+    if not args.config:
+        raise SystemExit("--config is required")
+
+    experiment = load_experiment_config(args.config)
+    oracle_spec = experiment.oracle_player()
+    if oracle_spec is None:
+        raise SystemExit("experiment config must define exactly one player with tag ORACLE for blunder scoring")
+
+    threshold = args.threshold if args.threshold is not None else experiment.blunder_threshold
+    sample_every = args.sample_every if args.sample_every is not None else experiment.blunder_sample_every
+
+    if threshold < 0:
         raise SystemExit("--threshold must be non-negative")
     if args.max_positions < 0:
         raise SystemExit("--max-positions cannot be negative")
-    if args.sample_every < 1:
+    if sample_every < 1:
         raise SystemExit("--sample-every must be at least 1")
 
     moves_path = _resolve_moves_path(args.input_dir, args.moves)
     output_path = _resolve_output_path(args.input_dir, args.output, "blunders.csv")
     summary_path = _resolve_summary_path(output_path, args.summary_output)
 
-    oracle = load_player(args.oracle, inference_only=not args.run_search)
+    oracle = instantiate_player(oracle_spec, game_seed=experiment.seed)
     if not hasattr(oracle, "evaluate"):
-        raise SystemExit(f"oracle does not expose evaluate(...): {args.oracle}")
+        raise SystemExit(
+            f"oracle player {oracle_spec.id!r} (type={oracle_spec.type!r}) does not expose evaluate(...)"
+        )
 
     rows, evaluated, cache_hits = score_moves(
         oracle,
         _iter_jsonl(moves_path),
-        threshold=args.threshold,
+        threshold=threshold,
         max_positions=args.max_positions,
-        sample_every=args.sample_every,
-        run_search=args.run_search,
+        sample_every=sample_every,
+        run_search=True,
         progress_every=args.progress_every,
     )
     summary_rows = summarize_blunders(rows)
@@ -84,6 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _write_csv(output_path, rows)
     _write_csv(summary_path, summary_rows)
 
+    print(f"Oracle player: {oracle_spec.id}")
     print(f"Scored moves: {len(rows)}")
     print(f"Oracle evaluations: {evaluated}")
     print(f"Cache hits: {cache_hits}")
@@ -99,7 +109,7 @@ def score_moves(
     threshold: float = 0.3,
     max_positions: int = 0,
     sample_every: int = 1,
-    run_search: bool = False,
+    run_search: bool = True,
     progress_every: int = 100,
 ) -> tuple[list[dict[str, Any]], int, int]:
     evaluation_cache: dict[tuple[Any, ...], SearchEvaluation] = {}
@@ -198,11 +208,14 @@ def state_from_payload(payload: dict[str, Any]) -> GameState:
         tuple((int(row), int(column)) for row, column in segment)
         for segment in payload.get("protected_segments", [])
     )
+    status_raw = str(payload["status"])
+    if status_raw == "fair_turn":
+        status_raw = "ongoing"
     return GameState(
         board=board,
         current_player=Player(str(payload["current_player"])),
         first_player=Player(str(payload["first_player"])),
-        status=GameStatus(str(payload["status"])),
+        status=GameStatus(status_raw),
         move_count=int(payload["move_count"]),
         result=None,
         red_line_total=int(payload.get("red_line_total", 0)),

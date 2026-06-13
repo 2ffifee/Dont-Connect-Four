@@ -200,6 +200,10 @@ class MCTSPlayer:
     def uses_cache_only(self) -> bool:
         return self.simulation_mode == "cache_only"
 
+    def begin_new_game(self) -> None:
+        """Clear the search tree so a new game starts with fresh online search."""
+        self.tree.clear()
+
     def choose_move(self, state: GameState) -> Move:
         """Return the greedy best move, optionally growing the tree first."""
         legal_moves = state.legal_moves()

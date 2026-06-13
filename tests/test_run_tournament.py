@@ -9,19 +9,17 @@ def test_run_tournament_writes_metric_outputs(tmp_path) -> None:
     output_dir = tmp_path / "results"
     config_path.write_text(
         """
-[defaults]
-output_dir = "unused"
-bytes_per_node = 2867.0
+seed = 7
+output_dir = "ignored"
+games_per_pair = 1
 
 [[players]]
 id = "random-a"
-kind = "builtin"
-builtin = "random"
+type = "random"
 
 [[players]]
 id = "random-b"
-kind = "builtin"
-builtin = "random"
+type = "random"
 """.strip(),
         encoding="utf-8",
     )
@@ -30,11 +28,6 @@ builtin = "random"
         [
             "--config",
             str(config_path),
-            "--games-per-pair",
-            "1",
-            "--base-seed",
-            "7",
-            "--no-llm",
             "--output-dir",
             str(output_dir),
             "--max-moves",
@@ -91,24 +84,21 @@ def test_run_tournament_resume_continues_from_checkpoint(tmp_path) -> None:
     output_dir = tmp_path / "results"
     config_path.write_text(
         """
-[defaults]
-output_dir = "unused"
-bytes_per_node = 2867.0
+seed = 11
+output_dir = "ignored"
+games_per_pair = 1
 
 [[players]]
 id = "random-a"
-kind = "builtin"
-builtin = "random"
+type = "random"
 
 [[players]]
 id = "random-b"
-kind = "builtin"
-builtin = "random"
+type = "random"
 
 [[players]]
 id = "random-c"
-kind = "builtin"
-builtin = "random"
+type = "random"
 """.strip(),
         encoding="utf-8",
     )
@@ -117,11 +107,6 @@ builtin = "random"
         [
             "--config",
             str(config_path),
-            "--games-per-pair",
-            "1",
-            "--base-seed",
-            "11",
-            "--no-llm",
             "--output-dir",
             str(output_dir),
             "--max-moves",
@@ -165,11 +150,6 @@ builtin = "random"
         [
             "--config",
             str(config_path),
-            "--games-per-pair",
-            "1",
-            "--base-seed",
-            "11",
-            "--no-llm",
             "--output-dir",
             str(output_dir),
             "--max-moves",

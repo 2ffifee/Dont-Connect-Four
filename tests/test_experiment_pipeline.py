@@ -19,8 +19,8 @@ from connect4_mcts.tournament_progress import (
 
 
 def test_parse_skip_stages_accepts_aliases_and_commas() -> None:
-    stages = parse_skip_stages(["oracle,players", "analyze"])
-    assert stages == {"train-oracle", "train-tournament-players", "analyze-tournament"}
+    stages = parse_skip_stages(["tournament,blunders", "analyze"])
+    assert stages == {"run-tournament", "score-blunders", "analyze-tournament"}
 
 
 def test_parse_skip_stages_rejects_unknown_stage() -> None:
@@ -29,7 +29,7 @@ def test_parse_skip_stages_rejects_unknown_stage() -> None:
 
 
 def test_stages_to_skip_merges_explicit_and_resume(tmp_path) -> None:
-    mark_stage_complete(tmp_path, "train-oracle")
+    mark_stage_complete(tmp_path, "run-tournament")
     state = json.loads(pipeline_state_path(tmp_path).read_text(encoding="utf-8"))
     from connect4_mcts.experiment_pipeline import PipelineState
 
@@ -40,17 +40,16 @@ def test_stages_to_skip_merges_explicit_and_resume(tmp_path) -> None:
         metadata=state["metadata"],
     )
     skipped = stages_to_skip(
-        explicit_skip={"run-tournament"},
+        explicit_skip={"analyze-tournament"},
         resume_pipeline=True,
         state=pipeline_state,
     )
-    assert skipped == {"train-oracle", "run-tournament"}
+    assert skipped == {"run-tournament", "analyze-tournament"}
 
 
 def test_tournament_checkpoint_round_trip(tmp_path) -> None:
     checkpoint = build_checkpoint_payload(
-        config_path="configs/tournament.toml",
-        llm_config_path=None,
+        config_path="configs/experiments/smoke.toml",
         base_seed=3,
         games_per_pair=2,
         player_ids=["a", "b"],
@@ -71,7 +70,7 @@ def test_tournament_checkpoint_round_trip(tmp_path) -> None:
     assert loaded is not None
     validate_checkpoint(
         loaded,
-        config_path="configs/tournament.toml",
+        config_path="configs/experiments/smoke.toml",
         base_seed=3,
         games_per_pair=2,
         player_ids=["a", "b"],

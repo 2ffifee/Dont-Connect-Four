@@ -20,13 +20,13 @@ Each distinct four-in-a-row segment counts as one line. A run of length ``n``
 cumulatively: destroying a line on the board does not reduce a player's total,
 and rebuilding the same segment at the same coordinates counts again.
 
-Fair-turn rule
+Immediate loss
 --------------
-If the first player completes one of their own lines on their move, the second
-player must make exactly one more move. That rule is skipped when the move also
-completes a line for the opponent. After the response move the cumulative line
-totals decide whether the game continues (equal) or ends (fewer lines wins).
-The rule resets after a continuation.
+If any four-in-a-row segment is completed on a move, the owner of that segment
+loses immediately (regardless of who played the move). If segments for both
+players are completed on the same move, the game is a draw. Otherwise play
+continues until the board is full (then line totals decide, with equal counts as
+a draw).
 """
 
 from __future__ import annotations
@@ -57,7 +57,6 @@ class MoveType(Enum):
 
 class GameStatus(Enum):
     ONGOING = "ongoing"
-    FAIR_TURN = "fair_turn"
     FINISHED = "finished"
 
 
@@ -208,18 +207,11 @@ class GameState:
             else:
                 yellow_total += 1
 
-        own_formed = any(_segment_owner(next_board, segment) is mover for segment in formed_segments)
-        opponent_formed = any(
-            _segment_owner(next_board, segment) is mover.opponent for segment in formed_segments
-        )
-
         next_status, result = self._status_and_result(
             next_board,
-            mover,
             red_total,
             yellow_total,
-            own_formed=own_formed,
-            opponent_formed=opponent_formed,
+            formed_segments=formed_segments,
         )
         display_segments = _all_line_segments(next_board)
         return self._successor(
@@ -281,32 +273,41 @@ class GameState:
     def _status_and_result(
         self,
         board: Board,
-        player_making_move: Player,
         red_total: int,
         yellow_total: int,
         *,
-        own_formed: bool,
-        opponent_formed: bool,
+        formed_segments: frozenset[LineSegment] | tuple[LineSegment, ...],
     ) -> tuple[GameStatus, GameResult | None]:
         totals = {Player.RED: red_total, Player.YELLOW: yellow_total}
 
-        if self.status is GameStatus.FAIR_TURN:
-            if red_total == yellow_total:
-                if _is_board_full(board):
-                    return GameStatus.FINISHED, GameResult.from_line_counts(totals)
-                return GameStatus.ONGOING, None
-            return GameStatus.FINISHED, GameResult.from_line_counts(totals)
+        if formed_segments:
+            red_line_formed = any(
+                _segment_owner(board, segment) is Player.RED for segment in formed_segments
+            )
+            yellow_line_formed = any(
+                _segment_owner(board, segment) is Player.YELLOW for segment in formed_segments
+            )
+            result = GameResult(
+                winner=None,
+                red_lines=red_total,
+                yellow_lines=yellow_total,
+            )
+            if red_line_formed and yellow_line_formed:
+                return GameStatus.FINISHED, result
+            if red_line_formed:
+                return GameStatus.FINISHED, GameResult(
+                    winner=Player.YELLOW,
+                    red_lines=red_total,
+                    yellow_lines=yellow_total,
+                )
+            if yellow_line_formed:
+                return GameStatus.FINISHED, GameResult(
+                    winner=Player.RED,
+                    red_lines=red_total,
+                    yellow_lines=yellow_total,
+                )
 
-        if (
-            player_making_move is self.first_player
-            and own_formed
-            and not opponent_formed
-        ):
-            return GameStatus.FAIR_TURN, None
-
-        if own_formed or opponent_formed or _is_board_full(board):
-            if red_total == yellow_total and not _is_board_full(board):
-                return GameStatus.ONGOING, None
+        if _is_board_full(board):
             return GameStatus.FINISHED, GameResult.from_line_counts(totals)
 
         return GameStatus.ONGOING, None

@@ -35,10 +35,10 @@ def test_render_board_shows_cells_and_column_numbers() -> None:
     assert "1 2 3 4 5 6 7 8" in rendered
 
 
-def test_status_message_marks_fair_turn() -> None:
-    state = GameState(board=GameState.new().board, current_player=Player.YELLOW, status=GameStatus.FAIR_TURN)
+def test_status_message_describes_current_player() -> None:
+    state = GameState(board=GameState.new().board, current_player=Player.YELLOW)
 
-    assert status_message(state) == "Turn: yellow (fair turn)"
+    assert status_message(state) == "Turn: yellow"
 
 
 def test_result_message_describes_winner_and_line_counts() -> None:

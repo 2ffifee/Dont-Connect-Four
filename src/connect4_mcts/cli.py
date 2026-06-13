@@ -141,8 +141,7 @@ def render_cell(cell: Player | None) -> str:
 
 
 def status_message(state: GameState) -> str:
-    fair_turn = " (fair turn)" if state.status is GameStatus.FAIR_TURN else ""
-    return f"Turn: {state.current_player.value}{fair_turn}"
+    return f"Turn: {state.current_player.value}"
 
 
 def result_message(result: GameResult | None) -> str:

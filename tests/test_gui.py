@@ -1,8 +1,10 @@
 import pygame
+import pytest
 
 import connect4_mcts.gui as gui
 from connect4_mcts.game import GameResult, GameState, GameStatus, Move, MoveType, Player
 from connect4_mcts.gui import BoardLayout, cell_center, column_from_position, format_move, gui_status_message, result_text
+from connect4_mcts.players.factory import DEFAULT_EXPLORATION, DEFAULT_FPU, DEFAULT_POWER_MEAN_P
 
 
 def test_column_from_position_returns_column_inside_board() -> None:
@@ -33,11 +35,9 @@ def test_cell_center_uses_layout_geometry() -> None:
 def test_gui_status_message_describes_turns() -> None:
     red_turn = GameState.new(first_player=Player.RED)
     yellow_turn = red_turn.apply_move(Move(MoveType.DROP, 0))
-    fair_turn = GameState(board=GameState.new().board, current_player=Player.YELLOW, status=GameStatus.FAIR_TURN)
 
     assert gui_status_message(red_turn, human=Player.RED) == "Your turn"
     assert gui_status_message(yellow_turn, human=Player.RED) == "Random turn"
-    assert gui_status_message(fair_turn, human=Player.YELLOW) == "Your turn - fair turn"
 
 
 def test_gui_status_message_uses_selected_agent_name() -> None:
@@ -70,8 +70,110 @@ def test_main_passes_initial_gui_config(monkeypatch) -> None:
 
     assert gui.main(["--human", "yellow", "--agent", "minimax", "--depth", "2", "--seed", "9"]) == 0
     assert configs == [
-        gui.GuiConfig(human=Player.YELLOW, agent_name="minimax", seed=9, depth=2, enable_undo=True)
+        gui.GuiConfig(
+            human=Player.YELLOW,
+            agent_name="minimax",
+            seed=9,
+            depth=2,
+            iterations=gui.DEFAULT_MCTS_ITERATIONS,
+            exploration=DEFAULT_EXPLORATION,
+            fpu=DEFAULT_FPU,
+            power_mean_p=DEFAULT_POWER_MEAN_P,
+            llm_temperature=1.0,
+            llm_max_tokens=None,
+            enable_undo=True,
+        )
     ]
+
+
+def test_make_agent_creates_online_mcts_player() -> None:
+    game = object.__new__(gui.HumanVsAgentGui)
+    game.config = gui.GuiConfig(agent_name="uct", iterations=100, seed=3)
+
+    agent = game._make_agent()
+
+    from connect4_mcts.players.mcts import MCTSPlayer
+
+    assert isinstance(agent, MCTSPlayer)
+    assert agent.simulation_mode == "search"
+    assert agent.iterations == 100
+    assert agent.tree_size == 0
+
+
+def test_setup_hyperparams_for_mcts_variants() -> None:
+    assert [spec.key for spec in gui.setup_hyperparams_for("uct")] == ["iterations", "exploration"]
+    assert [spec.key for spec in gui.setup_hyperparams_for("fpu")] == ["iterations", "exploration", "fpu"]
+    assert [spec.key for spec in gui.setup_hyperparams_for("llm")] == ["llm_temperature", "llm_max_tokens"]
+
+
+def test_adjust_hyperparam_updates_llm_temperature() -> None:
+    config = gui.GuiConfig(llm_temperature=1.0)
+    spec = gui.setup_hyperparams_for("llm")[0]
+
+    gui.adjust_hyperparam(config, spec, 1)
+
+    assert config.llm_temperature == pytest.approx(1.1)
+
+
+def test_make_agent_passes_mcts_hyperparameters() -> None:
+    game = object.__new__(gui.HumanVsAgentGui)
+    game.config = gui.GuiConfig(
+        agent_name="fpu",
+        iterations=120,
+        exploration=1.5,
+        fpu=0.8,
+        seed=2,
+    )
+
+    agent = game._make_agent()
+
+    from connect4_mcts.players.mcts import MCTSPlayer
+
+    assert isinstance(agent, MCTSPlayer)
+    assert agent.iterations == 120
+    assert agent.exploration == pytest.approx(1.5)
+    assert agent.fpu == pytest.approx(0.8)
+
+
+def test_make_llm_agent_uses_temperature_and_max_tokens(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_create_llm_player(model, **kwargs):
+        captured["model"] = model
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("connect4_mcts.players.llm.create_llm_player", fake_create_llm_player)
+
+    game = object.__new__(gui.HumanVsAgentGui)
+    game.config = gui.GuiConfig(
+        agent_name="llm",
+        llm_model="demo-model",
+        llm_temperature=0.7,
+        llm_max_tokens=512,
+    )
+
+    game._make_llm_agent()
+
+    assert captured["temperature"] == pytest.approx(0.7)
+    assert captured["max_tokens"] == 512
+
+
+def test_main_accepts_mcts_agent_and_iterations(monkeypatch) -> None:
+    configs = []
+
+    class FakeGui:
+        def __init__(self, config: gui.GuiConfig) -> None:
+            configs.append(config)
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(gui, "HumanVsAgentGui", FakeGui)
+
+    assert gui.main(["--agent", "fpu", "--iterations", "250", "--seed", "1"]) == 0
+    assert configs[0].agent_name == "fpu"
+    assert configs[0].iterations == 250
 
 
 def test_undo_in_multiplayer_reverts_one_move(monkeypatch) -> None:

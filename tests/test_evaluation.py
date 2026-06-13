@@ -51,7 +51,7 @@ def test_terminal_score_depends_on_winner_not_line_margin() -> None:
     assert evaluate_position(narrow_win, Player.YELLOW) == evaluate_position(larger_win, Player.YELLOW)
 
 
-def test_fair_turn_score_resolves_required_response() -> None:
+def test_own_line_completion_scores_as_immediate_loss() -> None:
     state = GameState(
         board=board_from_rows(
             "........",
@@ -65,12 +65,34 @@ def test_fair_turn_score_resolves_required_response() -> None:
         first_player=Player.RED,
     )
 
-    fair_turn = state.apply_move(Move(MoveType.DROP, 3))
+    finished = state.apply_move(Move(MoveType.DROP, 3))
 
-    assert fair_turn.status is GameStatus.FAIR_TURN
-    assert fair_turn.result is None
-    assert evaluate_position(fair_turn, Player.RED) < 0
-    assert evaluate_position(fair_turn, Player.YELLOW) > 0
+    assert finished.status is GameStatus.FINISHED
+    assert finished.result is not None
+    assert evaluate_position(finished, Player.RED) < 0
+    assert evaluate_position(finished, Player.YELLOW) > 0
+
+
+def test_forcing_opponent_line_scores_as_immediate_win() -> None:
+    state = GameState(
+        board=board_from_rows(
+            "........",
+            ".Y......",
+            "Y.......",
+            "Y.......",
+            "Y.......",
+            "Y.......",
+        ),
+        current_player=Player.RED,
+        first_player=Player.RED,
+    )
+
+    finished = state.apply_move(Move(MoveType.PUSH, 0))
+
+    assert finished.status is GameStatus.FINISHED
+    assert finished.result is not None
+    assert evaluate_position(finished, Player.RED) > 0
+    assert evaluate_position(finished, Player.YELLOW) < 0
 
 
 def test_own_three_token_window_is_worse_than_empty_position() -> None:

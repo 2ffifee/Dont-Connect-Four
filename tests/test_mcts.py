@@ -165,6 +165,16 @@ def test_search_evaluation_blunder_and_regret() -> None:
     assert evaluation.is_blunder(losing, threshold=0.3)
 
 
+def test_begin_new_game_clears_tree() -> None:
+    player = MCTSPlayer(iterations=50, seed=3)
+    player.search(GameState.new())
+    assert player.tree_size > 0
+
+    player.begin_new_game()
+
+    assert player.tree_size == 0
+
+
 def test_cache_only_choose_move_does_not_grow_tree() -> None:
     player = MCTSPlayer(iterations=50, seed=3, simulation_mode="cache_only")
     player.search(GameState.new())

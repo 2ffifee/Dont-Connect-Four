@@ -286,21 +286,59 @@ def freeze_player_for_inference(player: Agent) -> Agent:
     return player
 
 
-def save_player(player: Agent, path: str | os.PathLike[str]) -> None:
-    """Persist a trained player (tree and learned memory included) to ``path``."""
-    with open(os.fspath(path), "wb") as file:
-        pickle.dump(player, file, protocol=pickle.HIGHEST_PROTOCOL)
+def prepare_player_for_online_play(player: Agent, *, iterations: int | None = None) -> Agent:
+    """Configure an MCTS player for tournament-style online search.
+
+    Clears any tree loaded from training and runs fresh simulations on each
+    ``choose_move`` / ``evaluate`` call instead of reusing a pre-built tree.
+    """
+    simulation_mode = getattr(player, "simulation_mode", None)
+    if simulation_mode is not None:
+        player.simulation_mode = "search"
+
+    begin_new_game = getattr(player, "begin_new_game", None)
+    if callable(begin_new_game):
+        begin_new_game()
+    else:
+        tree = getattr(player, "tree", None)
+        if isinstance(tree, dict):
+            tree.clear()
+
+    if iterations is not None:
+        player_iterations = getattr(player, "iterations", None)
+        if isinstance(player_iterations, int):
+            if iterations < 1:
+                raise ValueError("iterations must be at least 1 when set")
+            player.iterations = iterations
+
+    return player
 
 
 def load_player(path: str | os.PathLike[str], *, inference_only: bool = False) -> Any:
     """Load a player previously stored with :func:`save_player`.
 
     With ``inference_only=True`` MCTS players are switched to ``cache_only``
-    mode so tournament play and oracle scoring read the saved tree without
-    running new simulations.
+    mode (lookup-only from the saved tree). Tournament scripts and oracle
+    scoring use :func:`load_player_for_play` instead.
     """
     with open(os.fspath(path), "rb") as file:
         player = pickle.load(file)
     if inference_only:
         freeze_player_for_inference(player)
     return player
+
+
+def load_player_for_play(
+    path: str | os.PathLike[str],
+    *,
+    iterations: int | None = None,
+) -> Any:
+    """Load a saved MCTS player for online tournament / evaluation play."""
+    player = load_player(path)
+    return prepare_player_for_online_play(player, iterations=iterations)
+
+
+def save_player(player: Agent, path: str | os.PathLike[str]) -> None:
+    """Persist a trained player (tree and learned memory included) to ``path``."""
+    with open(os.fspath(path), "wb") as file:
+        pickle.dump(player, file, protocol=pickle.HIGHEST_PROTOCOL)

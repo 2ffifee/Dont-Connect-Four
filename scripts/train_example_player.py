@@ -5,9 +5,8 @@ Usage (after setting up the environment)::
     python scripts/train_example_player.py
     python scripts/train_example_player.py --algorithm pmbp --selfplay-games 100
 
-The resulting ``.pkl`` file can be loaded in the GUI via the "Load player..."
-button or the ``--load`` flag, or programmatically with
-``connect4_mcts.load_player``.
+The resulting ``.pkl`` file can be loaded programmatically with
+``connect4_mcts.load_player`` / ``load_player_for_play`` (e.g. for tournaments).
 """
 
 from __future__ import annotations

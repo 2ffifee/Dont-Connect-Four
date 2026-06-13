@@ -177,22 +177,17 @@ GOAL (THIS IS INVERTED - READ TWICE):
 - At the end, count every completed four-in-a-row segment for each player.
   Overlapping segments count separately (e.g. six in a row counts as three
   segments of four). Whoever has FEWER segments WINS; whoever has MORE LOSES.
-- If both players have the SAME number of segments, the game continues (unless
-  the board is full, then it is a draw).
+- If both players have the SAME number of segments when the board is full, the
+  game is a draw.
+- If any four-in-a-row segment is completed on a move, the owner of that
+  segment loses immediately (even if the opponent played the move).
+- If both players complete a segment on the same move, the game is a draw.
 - Therefore you must AVOID completing your own lines and try to FORCE the
   opponent into completing theirs.
 
-Fair-turn rule:
-- If the first player completes one of THEIR OWN lines on their move, the
-  second player must make exactly one more move.
-- This rule does NOT apply if that same move also completes a line for the
-  opponent.
+Line counting notes:
 - Completed segments are counted cumulatively: breaking a line on the board does
   not reduce totals, and rebuilding the same segment later counts again.
-- After the response move: if cumulative line totals are unequal, the game ends
-  and the player with fewer segments wins.
-- If totals are equal, the game continues and the fair-turn rule can trigger
-  again the next time the first player completes their own line.
 - Lines may be broken at any time; only column-full restrictions apply.
 
 When it is your turn:
@@ -252,8 +247,7 @@ def render_turn(state: GameState, legal_moves: Sequence[Move], include_line_coun
         render_board(state),
         "",
         f"You are {mover.value.upper()} ({'R' if mover is Player.RED else 'Y'}) and it is your move.",
-        f"You moved {'first' if is_first else 'second'} this game"
-        + (" (fair-turn rule applies to you)." if is_first else "."),
+        f"You moved {'first' if is_first else 'second'} this game.",
     ]
 
     if include_line_counts:
@@ -409,10 +403,19 @@ def create_llm_player(
     base_url: str | None = None,
     seed: int | None = None,
     timeout: float = 300.0,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> LLMPlayer:
     """Build a fresh :class:`LLMPlayer` for a single game session."""
     return LLMPlayer(
-        create_llm_client(model=model, api_key=api_key, base_url=base_url, timeout=timeout),
+        create_llm_client(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ),
         model_label=model,
         seed=seed,
     )
