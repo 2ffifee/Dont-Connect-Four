@@ -61,6 +61,8 @@ iterations = 100
             str(config_path),
             "--input-dir",
             str(input_dir),
+            "--workers",
+            "1",
         ]
     )
 
@@ -115,6 +117,79 @@ iterations = 10000
     assert config.oracle_player() is not None
     assert config.oracle_player().id == "ref"
     assert ORACLE_TAG in config.oracle_player().tags
+
+
+def test_score_moves_parallel_workers(tmp_path) -> None:
+    (tmp_path / "config.toml").write_text(
+        """
+seed = 0
+output_dir = "out"
+games_per_pair = 1
+
+[[players]]
+id = "oracle"
+type = "uct"
+tags = ["ORACLE"]
+iterations = 20
+""".strip(),
+        encoding="utf-8",
+    )
+    oracle_spec = load_experiment_config(tmp_path / "config.toml").oracle_player()
+    assert oracle_spec is not None
+
+    state_a = {
+        "board": ["........"] * 6,
+        "current_player": "red",
+        "first_player": "red",
+        "status": "ongoing",
+        "move_count": 0,
+        "protected_segments": [],
+    }
+    state_b = {
+        "board": [
+            "........",
+            "........",
+            "........",
+            "........",
+            "........",
+            "R.......",
+        ],
+        "current_player": "yellow",
+        "first_player": "red",
+        "status": "ongoing",
+        "move_count": 1,
+        "protected_segments": [],
+    }
+    moves = [
+        {
+            "game_id": "g1",
+            "agent": "uct",
+            "move_type": "drop",
+            "column": 0,
+            "state_before": state_a,
+        },
+        {
+            "game_id": "g1",
+            "agent": "llm",
+            "move_type": "drop",
+            "column": 1,
+            "state_before": state_b,
+        },
+    ]
+    rows, evaluated, cache_hits = score_blunders.score_moves(
+        oracle=None,
+        moves=moves,
+        workers=2,
+        oracle_spec=oracle_spec,
+        game_seed=0,
+        progress_every=0,
+    )
+
+    assert len(rows) == 2
+    assert evaluated == 2
+    assert cache_hits == 0
+    assert rows[0]["agent"] == "uct"
+    assert rows[1]["agent"] == "llm"
 
 
 def test_state_cache_key_is_hashable_with_nested_segments() -> None:

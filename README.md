@@ -425,6 +425,18 @@ python scripts/score_blunders.py \
 Prog blundera (`--threshold`) i probkowanie ruchow (`--sample-every`) domyslnie biora
 wartosci z configu. Wyniki: `blunders.csv`, `blunder_summary.csv`.
 
+Ocena unikalnych pozycji jest rownolegla (domyslnie tyle workerow co rdzeni CPU):
+
+```bash
+python scripts/score_blunders.py \
+  --config configs/experiments/main_final.toml \
+  --input-dir results/main_final \
+  --workers 8
+```
+
+Uzyj `--workers 1` dla sekwencyjnej oceny (np. debug). W pelnym pipeline:
+`--blunder-workers N` przekazuje ta wartosc do `score_blunders.py`.
+
 Neutralna wyrocznia to UCT bez FPU/LGR (`power_mean_p = 1`), zeby nie faworyzowac
 zadnej z badanych modyfikacji. Typowy budzet oceny to `iterations = 20000` w wpisie
 `ORACLE` (silniejsza maszyna); uczestnicy turnieju moga miec nizszy budzet, np. `1000`.

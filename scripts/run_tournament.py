@@ -388,6 +388,34 @@ def _game_metrics_row(
     }
 
 
+def _format_game_result(
+    game: SimulatedGame,
+    *,
+    game_id: str,
+    game_index: int,
+    games_per_pair: int,
+) -> str:
+    result = game.final_state.result
+    if result is None:
+        raise ValueError("simulated game ended without result")
+
+    move_count = len(game.moves)
+    lines = f"lines red={result.red_lines} yellow={result.yellow_lines}"
+
+    if game.winner_agent is None:
+        outcome = f"draw | {game.red_agent} (red) vs {game.yellow_agent} (yellow)"
+    elif game.winner_agent == game.red_agent:
+        outcome = f"{game.red_agent} (red) beat {game.yellow_agent} (yellow)"
+    else:
+        outcome = f"{game.yellow_agent} (yellow) beat {game.red_agent} (red)"
+
+    seed_note = "" if game.seed is None else f" | seed={game.seed}"
+    return (
+        f"  game {game_index + 1}/{games_per_pair} finished: {game_id} | "
+        f"{outcome} | {move_count} moves | {lines}{seed_note}"
+    )
+
+
 def _pair_summary_row(left: str, right: str, games: tuple[SimulatedGame, ...], games_per_pair: int) -> dict[str, Any]:
     summary = summarize_games(games, agent_names=(left, right))
     left_wins = summary.wins[left]
@@ -493,6 +521,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--verbose-games",
         action="store_true",
         help="Print one line before each individual game.",
+    )
+    parser.add_argument(
+        "--game-verbose",
+        action="store_true",
+        help="Print the result of each game when it finishes.",
     )
     parser.add_argument(
         "--resume",
@@ -649,6 +682,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     all_move_rows.extend(move_rows)
                     pair_games.append(game)
+                    if args.game_verbose:
+                        print(
+                            _format_game_result(
+                                game,
+                                game_id=game_id,
+                                game_index=game_index,
+                                games_per_pair=games_per_pair,
+                            ),
+                            flush=True,
+                        )
                 pair_cache.clear()
 
                 pair_summary = _pair_summary_row(

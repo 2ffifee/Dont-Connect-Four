@@ -53,6 +53,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--blunder-max-positions", type=int, default=0, help="0 means score all selected moves.")
     parser.add_argument("--blunder-sample-every", type=int, default=None, help="Override blunder_sample_every from config.")
     parser.add_argument("--blunder-progress-every", type=int, default=100)
+    parser.add_argument(
+        "--blunder-workers",
+        type=int,
+        default=0,
+        help="Parallel oracle workers for score_blunders.py (0 = use script default).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them.")
     parser.add_argument("--python", default=sys.executable, help="Python executable used for child scripts.")
     parser.add_argument(
@@ -168,6 +174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         if args.blunder_max_positions > 0:
             blunder_command.extend(["--max-positions", str(args.blunder_max_positions)])
+        if args.blunder_workers > 0:
+            blunder_command.extend(["--workers", str(args.blunder_workers)])
         steps.append(Step("score-blunders", "score blunders", command=blunder_command))
 
     print("Full experiment pipeline:")
