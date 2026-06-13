@@ -145,7 +145,12 @@ def _state_cache_key(payload: dict[str, Any]) -> tuple[Any, ...]:
         str(payload["first_player"]),
         str(payload.get("status", "")),
         int(payload["move_count"]),
-        tuple(tuple(segment) for segment in protected),
+        int(payload.get("red_line_total", 0)),
+        int(payload.get("yellow_line_total", 0)),
+        tuple(
+            tuple((int(row), int(column)) for row, column in segment)
+            for segment in protected
+        ),
     )
 
 

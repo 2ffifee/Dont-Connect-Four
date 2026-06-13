@@ -260,7 +260,7 @@ class MCTSPlayer:
             raise MoveSelectionError("cannot evaluate a state with no legal moves")
 
         if self.uses_cache_only:
-            return self._evaluation_from_tree(root_state, legal_moves)
+            return self._evaluation_from_tree(root_state, legal_moves, read_only=True)
 
         if run_search:
             if retain_tree:
@@ -272,15 +272,22 @@ class MCTSPlayer:
 
         return self._evaluation_from_tree(root_state, legal_moves)
 
-    def _evaluation_from_tree(self, root_state: GameState, legal_moves: list[Move]) -> SearchEvaluation:
-        root = self._node(root_state)
+    def _evaluation_from_tree(
+        self,
+        root_state: GameState,
+        legal_moves: list[Move],
+        *,
+        read_only: bool = False,
+    ) -> SearchEvaluation:
+        root = self.tree.get(root_state) if read_only else self._node(root_state)
         move_values: dict[Move, float] = {}
         move_visits: dict[Move, int] = {}
-        for move, child_state in root.children.items():
-            child = self._node(child_state)
-            if child.visits > 0:
-                move_values[move] = child.value_sum / child.visits
-                move_visits[move] = child.visits
+        if root is not None:
+            for move, child_state in root.children.items():
+                child = self.tree.get(child_state) if read_only else self._node(child_state)
+                if child is not None and child.visits > 0:
+                    move_values[move] = child.value_sum / child.visits
+                    move_visits[move] = child.visits
 
         if not move_values:
             fallback = legal_moves[0]
@@ -429,13 +436,26 @@ class MCTSPlayer:
         node.power_sum += reward**self.power_mean_p
 
     def _best_move(self, root_state: GameState) -> Move:
-        root = self._node(root_state)
-        if not root.children:
-            return self._rng.choice(root_state.legal_moves())
+        if self.uses_cache_only:
+            root = self.tree.get(root_state)
+            if root is None or not root.children:
+                return self._rng.choice(root_state.legal_moves())
 
-        visited = [(move, self._node(s)) for move, s in root.children.items() if self._node(s).visits > 0]
-        if not visited:
-            return self._rng.choice(list(root.children.keys()))
+            visited = [
+                (move, child)
+                for move, child_state in root.children.items()
+                if (child := self.tree.get(child_state)) is not None and child.visits > 0
+            ]
+            if not visited:
+                return self._rng.choice(list(root.children.keys()))
+        else:
+            root = self._node(root_state)
+            if not root.children:
+                return self._rng.choice(root_state.legal_moves())
+
+            visited = [(move, self._node(s)) for move, s in root.children.items() if self._node(s).visits > 0]
+            if not visited:
+                return self._rng.choice(list(root.children.keys()))
 
         best_score = -math.inf
         best_moves: list[Move] = []

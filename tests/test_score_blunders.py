@@ -1,5 +1,6 @@
 import csv
 import json
+from typing import Any
 
 import pytest
 
@@ -76,13 +77,30 @@ def test_score_blunders_writes_move_and_summary_outputs(monkeypatch, tmp_path) -
     assert float(by_agent["llm"]["blunder_rate"]) == pytest.approx(1.0)
 
 
-def test_cache_only_player_does_not_grow_tree_on_choose_move() -> None:
+def test_state_cache_key_is_hashable_with_nested_segments() -> None:
+    payload = {
+        "board": ["........"] * 6,
+        "current_player": "red",
+        "first_player": "red",
+        "status": "ongoing",
+        "move_count": 4,
+        "red_line_total": 1,
+        "yellow_line_total": 0,
+        "protected_segments": [[[5, 0], [5, 1], [5, 2], [5, 3]]],
+    }
+    key = score_blunders._state_cache_key(payload)
+    cache: dict[tuple[Any, ...], int] = {key: 1}
+    assert cache[key] == 1
+
+
+def test_cache_only_evaluate_does_not_add_tree_nodes() -> None:
     player = MCTSPlayer(iterations=50, seed=1)
     player.search(GameState.new())
     before = player.tree_size
 
     freeze_player_for_inference(player)
-    player.choose_move(GameState.new())
+    unknown = GameState.new()
+    player.evaluate(unknown, run_search=False)
 
     assert player.tree_size == before
 
