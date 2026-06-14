@@ -11,6 +11,20 @@ blunder_threshold = 0.3
 blunder_sample_every = 1
 
 [[players]]
+id = "qwen2.5"
+type = "llm"
+model = "qwen2.5:7b"
+base_url = "http://localhost:11434/v1"
+temperature = 1
+
+[[players]]
+id = "openchat"
+type = "llm"
+model = "openchat:latest"
+base_url = "http://localhost:11434/v1"
+temperature = 1
+
+[[players]]
 id = "random"
 type = "random"
 
@@ -20,35 +34,35 @@ type = "minimax"
 depth = 4
 
 [[players]]
-id = "minimax-d6"
+id = "minimax-d3"
 type = "minimax"
-depth = 6
+depth = 3
 
 [[players]]
-id = "uct"
+id = "uct-1000-1.41"
 type = "uct"
 iterations = 1000
-exploration = 1.4142135623730951
+exploration = 1.41
 
 [[players]]
-id = "fpu-1.0"
+id = "fpu-1000-1.0"
 type = "fpu"
 iterations = 1000
 fpu = 1.0
 
 [[players]]
-id = "pmbp-2.5"
+id = "pmbp-1000-2.5"
 type = "pmbp"
 iterations = 1000
 power_mean_p = 2.5
 
 [[players]]
-id = "lgr"
+id = "lgr-1000"
 type = "lgr"
 iterations = 1000
 
 [[players]]
-id = "oracle"
+id = "uct-20000-1.0-ORACLE"
 type = "uct"
 tags = ["ORACLE"]
 iterations = 20000
