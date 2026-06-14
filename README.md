@@ -2,6 +2,23 @@
 
 Projekt badawczy dla zmodyfikowanej gry Connect4 z agentami opartymi o MCTS/UCT.
 
+**Repozytorium GitHub:** <https://github.com/2ffifee/MCTS-Modified-Connect-4->
+
+Pelny kod zrodlowy, konfiguracje eksperymentow i skrypty opisane ponizej sa publicznie dostepne w powyzszym repozytorium. Krotki start:
+
+```bash
+git clone https://github.com/2ffifee/MCTS-Modified-Connect-4-.git
+cd MCTS-Modified-Connect-4-
+chmod +x scripts/setup.sh && ./scripts/setup.sh   # Linux/macOS
+# lub: .\scripts\setup.ps1                         # Windows PowerShell
+source .venv/bin/activate                          # Linux/macOS
+python -m pytest                                   # weryfikacja instalacji
+python scripts/run_full_experiment.py              # pelny eksperyment (domyslnie main_final)
+python scripts/plot_experiment_results.py        # wykresy do raportu (po turnieju)
+```
+
+Szczegolowe instrukcje instalacji, uruchamiania CLI/GUI, turnieju i metryki Blunder Rate znajduja sie w dalszej czesci tego pliku.
+
 ## Zasady wariantu
 
 Gramy na planszy `6x8`. Celem nie jest ulozenie czterech swoich zetonow w linii, tylko unikniecie tego. Po zakonczeniu gry liczone sa wszystkie segmenty czterech zetonow w rzedzie (poziomo, pionowo, po przekatnej) dla kazdego koloru; nakladajace sie segmenty licza sie osobno (np. szesc zetonow w rzedzie to trzy segmenty). Przegrywa gracz z wieksza liczba segmentow.
@@ -394,6 +411,13 @@ powinien wskazywac na ten sam katalog:
 
 ```python
 RESULTS_DIR = PROJECT_ROOT / "results" / "main_final"
+```
+
+Wykresy do raportu LaTeX (`report/final/figures/`) generuje skrypt:
+
+```bash
+python scripts/plot_experiment_results.py
+python scripts/plot_experiment_results.py --input-dir results/main_final --output-dir report/final/figures
 ```
 
 ### Turniej round-robin
