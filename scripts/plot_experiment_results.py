@@ -523,7 +523,7 @@ def _read_human_games(path: Path) -> list[dict[str, str]]:
             if len(parts) < 3:
                 continue
             winner = parts[2].strip().upper()
-            if winner not in {"R", "Y"}:
+            if winner not in {"R", "Y", "D"}:
                 continue
             rows.append(
                 {
@@ -547,6 +547,7 @@ def _human_game_outcomes(rows: list[dict[str, str]]) -> list[dict[str, str]]:
                     "human": red,
                     "agent": _normalize_agent_id(yellow),
                     "human_won": winner == "R",
+                    "human_draw": winner == "D",
                     "human_color": "red",
                 }
             )
@@ -556,6 +557,7 @@ def _human_game_outcomes(rows: list[dict[str, str]]) -> list[dict[str, str]]:
                     "human": yellow,
                     "agent": _normalize_agent_id(red),
                     "human_won": winner == "Y",
+                    "human_draw": winner == "D",
                     "human_color": "yellow",
                 }
             )
@@ -566,14 +568,21 @@ def _plot_humans_vs_agents(rows: list[dict[str, str]], output_dir: Path, dpi: in
     from collections import defaultdict
 
     outcomes = _human_game_outcomes(rows)
-    stats: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    stats: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     for outcome in outcomes:
         stats[outcome["agent"]][1] += 1
-        stats[outcome["agent"]][0] += int(outcome["human_won"])
+        if outcome["human_draw"]:
+            stats[outcome["agent"]][2] += 1
+        elif outcome["human_won"]:
+            stats[outcome["agent"]][0] += 1
 
-    agents = sorted(stats, key=lambda agent: stats[agent][0] / stats[agent][1])
+    agents = sorted(
+        stats,
+        key=lambda agent: stats[agent][0] / max(1, stats[agent][1] - stats[agent][2]),
+    )
     labels = [_display_name(agent) for agent in agents]
-    human_rates = [stats[agent][0] / stats[agent][1] for agent in agents]
+    decisive = [max(1, stats[agent][1] - stats[agent][2]) for agent in agents]
+    human_rates = [stats[agent][0] / n for agent, n in zip(agents, decisive)]
     agent_rates = [1.0 - rate for rate in human_rates]
     colors = [_color_for_agent(agent) for agent in agents]
 
@@ -595,14 +604,19 @@ def _plot_humans_per_participant(rows: list[dict[str, str]], output_dir: Path, d
     from collections import defaultdict
 
     outcomes = _human_game_outcomes(rows)
-    stats: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    stats: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     for outcome in outcomes:
         stats[outcome["human"]][1] += 1
-        stats[outcome["human"]][0] += int(outcome["human_won"])
+        if outcome["human_draw"]:
+            stats[outcome["human"]][2] += 1
+        elif outcome["human_won"]:
+            stats[outcome["human"]][0] += 1
 
     humans = sorted(stats)
     labels = humans
-    rates = [stats[human][0] / stats[human][1] for human in humans]
+    rates = [
+        stats[human][0] / max(1, stats[human][1] - stats[human][2]) for human in humans
+    ]
 
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     ax.bar(labels, rates, color="#4daf4a", edgecolor="white", linewidth=0.6)
