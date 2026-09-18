@@ -672,32 +672,28 @@ Zaimplementowano pełny pipeline do gry w wariant \textit{Connect4} typu suicide
     \item \textbf{FPU} w tej konfiguracji ($\mathrm{FPU} = 1{,}0$) nie poprawił wyniku względem UCT w turnieju; wyższy \textit{Blunder Rate} wg wyroczni UCT-a nie jest wystarczającym dowodem gorszej gry taktycznej.
 \end{itemize}
 
-\textbf{Ograniczenia.} Po 10 partiach na parę wyniki turniejowe mają ograniczoną moc statystyczną; remisy i pojedyncze wyniki par mogłyby się zmienić przy dłuższym turnieju. Wyrocznia do \textit{Blunder Rate} jest świadomie przybliżona (UCT, skończony budżet, możliwa stronniczość) i nie zastępuje silniejszego silnika referencyjnego --- metryka nie rozstrzyga jakości ruchów między silnymi wariantami MCTS (sekcja~\ref{sec:wyrocznia}). Testy ludzkie ($n = 5$) przeprowadzono przy braku trzeźwości uczestników i bez kontroli poziomu umiejętności. Modele LLM (7B, lokalnie) nie uogólniają się na populacje graczy ani na modele językowe. MCTS w turnieju nie był trenowany self-playem przed rozgrywką.
+\textbf{Ograniczenia.} Po 10 partiach na parę wyniki turniejowe mają ograniczoną moc statystyczną; remisy i pojedyncze wyniki par mogłyby się zmienić przy dłuższym turnieju. Wyrocznia do \textit{Blunder Rate} jest świadomie przybliżona (UCT, skończony budżet, możliwa stronniczość) i nie zastępuje silniejszego silnika referencyjnego --- metryka nie rozstrzyga jakości ruchów między silnymi wariantami MCTS (sekcja~\ref{sec:wyrocznia}). Testy ludzkie ($n = 5$) przeprowadzono bez kontroli poziomu umiejętności uczestników. Modele LLM (7B, lokalnie) nie uogólniają się na populacje graczy ani na modele językowe. MCTS w turnieju nie był trenowany self-playem przed rozgrywką.
 
 \textbf{Kierunki dalszych prac} obejmowałyby zwiększenie liczby partii i liczby ziaren losowości, trening trwałego drzewa przed turniejem, głębszy minimax lub uczenie funkcji oceny, powtórzenie testów ludzkich i z LLM na większej próbie i silniejszych modelach, oraz --- w kontekście hipotezy~3 --- zbudowanie \textbf{silniejszej i bardziej bezstronnej wyroczni} do \textit{Blunder Rate} (większy budżet, niezależna od ocenianego wariantu MCTS, ewentualnie weryfikacja na podzbiorze pozycji przez człowieka).
 
 %----------------------------------------------------------------------------------------
-%	DEklaracja użycia narzędzi sztucznej inteligencji
+%	Deklaracja użycia narzędzi sztucznej inteligencji
 %----------------------------------------------------------------------------------------
 
 \section{Deklaracja użycia narzędzi sztucznej inteligencji}
-W ramach projektu modele językowe zostały wykorzystane przy:
+W ramach projektu modele językowe wykorzystano jako narzędzia pomocnicze podczas:
 \begin{itemize}
-    \item Tworzeniu GUI aplikacji
-    \item Tworzeniu kodu do obsługi gry z LLMami
-    \item TWorzeniu skryptów przeprowadzających eksperymenty
-    \item Tworzenia wykresów i tabel z wynikami
-    \item Wygenerowania bibliografii
+    \item implementacji GUI oraz integracji gry z modelami językowymi,
+    \item przygotowania skryptów przeprowadzających eksperymenty,
+    \item opracowania wykresów i tabel z wynikami,
+    \item przygotowania i formatowania roboczej bibliografii.
 \end{itemize}
-    
+
 %----------------------------------------------------------------------------------------
 %	BIBLIOGRAFIA
 %----------------------------------------------------------------------------------------
 \newpage
 \bibliographystyle{plain}
 \bibliography{bibliography}
-
-\subsection{Uwaga pokońcowa}
-W wieczór przed terminem oddania projektu, została znaleziona strategia wygrywająca dla gracza żółtego. Celem dalszych badań należałoby rozważyć wprowadzenie jakiegoś mechanizmu sprawiedliwości turowej, np. grania zawsze do wypełnienia całej planszy i zliczania linii.
 
 \end{document}
